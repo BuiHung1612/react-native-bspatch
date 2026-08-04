@@ -361,11 +361,14 @@ export function OtaProvider({
         loadingView
       ) : (
         <View style={styles.loadingContainer}>
-          <ActivityIndicator size="large" color="#FF00F5" />
-          <Text style={styles.loadingText}>{message}</Text>
-          {status === OtaStatus.DOWNLOADING || status === OtaStatus.APPLYING ? (
-            <Text style={styles.progressText}>{progress.toFixed(1)}%</Text>
-          ) : null}
+          <View style={styles.loadingCard}>
+            <ActivityIndicator size="large" color="#111111" />
+            <Text style={styles.loadingTitle}>Please wait</Text>
+            <Text style={styles.loadingText}>{message}</Text>
+            {status === OtaStatus.DOWNLOADING || status === OtaStatus.APPLYING ? (
+              <Text style={styles.progressText}>{progress.toFixed(1)}%</Text>
+            ) : null}
+          </View>
         </View>
       )}
     </OtaContext.Provider>
@@ -385,15 +388,37 @@ const styles = StyleSheet.create({
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
-    backgroundColor: '#000',
+    backgroundColor: '#F5F5F5',
+    paddingHorizontal: 24,
+  },
+  loadingCard: {
+    width: '100%',
+    maxWidth: 320,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
+    paddingHorizontal: 24,
+    paddingVertical: 28,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#E5E5E5',
+  },
+  loadingTitle: {
+    marginTop: 16,
+    color: '#111111',
+    fontSize: 18,
+    fontWeight: '600',
   },
   loadingText: {
-    marginTop: 20,
-    color: '#00FFCC',
-    fontSize: 16,
+    marginTop: 8,
+    color: '#4A4A4A',
+    fontSize: 15,
+    lineHeight: 22,
+    textAlign: 'center',
   },
   progressText: {
-    marginTop: 10,
-    color: '#fff',
+    marginTop: 20,
+    color: '#111111',
+    fontSize: 16,
+    fontWeight: '600',
   },
 });
