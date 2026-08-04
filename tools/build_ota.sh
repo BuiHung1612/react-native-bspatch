@@ -95,19 +95,61 @@ if [ "$ACTION" != "reset" ]; then
 
     if [[ "$BASE_URL" == *"github"* ]] || [[ "$BASE_URL" == *"raw.githubusercontent"* ]]; then
         echo "  Downloading remote registry from GitHub..."
-        # Add cache-busting params + Cache-Control header to bypass GitHub CDN 5-min cache
-        CACHE_BUST="?cb=$(date +%s)"
-        HTTP_CODE=$(curl -s -w "%{http_code}" -H "Cache-Control: no-cache" -o "$REGISTRY_SHARED.tmp" "$BASE_URL/$BASE_FOLDER/ota_registry.json${CACHE_BUST}" 2>/dev/null || true)
-        if [ "$HTTP_CODE" != "200" ]; then
-            HTTP_CODE=$(curl -s -w "%{http_code}" -H "Cache-Control: no-cache" -o "$REGISTRY_SHARED.tmp" "$BASE_URL/ota_registry.json${CACHE_BUST}" 2>/dev/null || true)
+
+        # Parse OWNER/REPO/BRANCH from the raw.githubusercontent URL or github.com URL
+        # e.g. https://raw.githubusercontent.com/owner/repo/branch  OR
+        #      https://github.com/owner/repo/tree/branch
+        CLEAN_URL=$(echo "$BASE_URL" | sed 's#https://raw.githubusercontent.com/##' | sed 's#https://github.com/##' | sed 's#/tree/##')
+        GH_OWNER=$(echo "$CLEAN_URL" | cut -d'/' -f1)
+        GH_REPO=$(echo  "$CLEAN_URL" | cut -d'/' -f2)
+        GH_BRANCH=$(echo "$CLEAN_URL" | cut -d'/' -f3)
+        if [[ -z "$GH_BRANCH" ]]; then GH_BRANCH="main"; fi
+
+        # Prefer GitHub CLI token for authenticated requests (higher rate limit, no cache)
+        GH_CLI_TOKEN=$(gh auth token 2>/dev/null || true)
+        GH_API_TOKEN="${GH_CLI_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
+
+        # Use GitHub Contents API — NOT raw CDN — to bypass the 5-min CDN cache.
+        # The API always returns the latest committed content.
+        REGISTRY_API_URL="https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/contents/${BASE_FOLDER}/ota_registry.json?ref=${GH_BRANCH}"
+
+        if [[ -n "$GH_API_TOKEN" ]]; then
+            API_RES=$(curl -s -w "\n---HTTP:%{http_code}" \
+                -H "Authorization: Bearer $GH_API_TOKEN" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "$REGISTRY_API_URL" 2>/dev/null || true)
+        else
+            API_RES=$(curl -s -w "\n---HTTP:%{http_code}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "$REGISTRY_API_URL" 2>/dev/null || true)
         fi
-        if [ "$HTTP_CODE" = "200" ] && [ -s "$REGISTRY_SHARED.tmp" ]; then
-            mv "$REGISTRY_SHARED.tmp" "$REGISTRY_SHARED"
-            echo "  ✓ Remote registry synced"
+
+        API_HTTP=$(echo "$API_RES" | grep -o '---HTTP:[0-9]*' | cut -d: -f2)
+        API_BODY=$(echo "$API_RES" | sed 's/---HTTP:.*//')
+
+        if [[ "$API_HTTP" = "200" ]]; then
+            # Decode base64 content returned by the API
+            echo "$API_BODY" | python3 -c "
+import sys, json, base64
+d = json.load(sys.stdin)
+content = d.get('content', '')
+# GitHub API returns base64 with newlines; strip them before decoding
+decoded = base64.b64decode(content.replace('\n', ''))
+sys.stdout.buffer.write(decoded)
+" > "$REGISTRY_SHARED.tmp" 2>/dev/null || true
+
+            if [ -s "$REGISTRY_SHARED.tmp" ]; then
+                mv "$REGISTRY_SHARED.tmp" "$REGISTRY_SHARED"
+                echo "  ✓ Remote registry synced (via GitHub API)"
+            else
+                rm -f "$REGISTRY_SHARED.tmp"
+                echo "  Notice: Remote registry empty or decode failed (starting fresh with local state)."
+            fi
         else
             rm -f "$REGISTRY_SHARED.tmp"
-            echo "  Notice: Remote registry not found on GitHub (starting fresh with local state)."
+            echo "  Notice: Remote registry not found on GitHub API (HTTP $API_HTTP — starting fresh with local state)."
         fi
+
     else
         if [[ -n "$UPCODE_USER" ]] && [[ -n "$UPCODE_PASS" ]]; then
             LOGIN_RES=$(curl -s -X "POST" "$BASE_URL/public/authen/login" \
