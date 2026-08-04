@@ -105,7 +105,7 @@ if [ "$ACTION" != "reset" ]; then
         GH_BRANCH=$(echo "$CLEAN_URL" | cut -d'/' -f3)
         if [[ -z "$GH_BRANCH" ]]; then GH_BRANCH="main"; fi
 
-        # Prefer GitHub CLI token for authenticated requests (higher rate limit, no cache)
+        # Prefer GitHub CLI token for authenticated requests (higher rate limit, no CDN cache)
         GH_CLI_TOKEN=$(gh auth token 2>/dev/null || true)
         GH_API_TOKEN="${GH_CLI_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
 
@@ -113,30 +113,39 @@ if [ "$ACTION" != "reset" ]; then
         # The API always returns the latest committed content.
         REGISTRY_API_URL="https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/contents/${BASE_FOLDER}/ota_registry.json?ref=${GH_BRANCH}"
 
+        API_HTTP_FILE=$(mktemp)
+        API_BODY_FILE=$(mktemp)
+
         if [[ -n "$GH_API_TOKEN" ]]; then
-            API_RES=$(curl -s -w "\n---HTTP:%{http_code}" \
+            curl -s -o "$API_BODY_FILE" -w "%{http_code}" \
                 -H "Authorization: Bearer $GH_API_TOKEN" \
                 -H "Accept: application/vnd.github.v3+json" \
-                "$REGISTRY_API_URL" 2>/dev/null || true)
+                "$REGISTRY_API_URL" > "$API_HTTP_FILE" 2>/dev/null || true
         else
-            API_RES=$(curl -s -w "\n---HTTP:%{http_code}" \
+            curl -s -o "$API_BODY_FILE" -w "%{http_code}" \
                 -H "Accept: application/vnd.github.v3+json" \
-                "$REGISTRY_API_URL" 2>/dev/null || true)
+                "$REGISTRY_API_URL" > "$API_HTTP_FILE" 2>/dev/null || true
         fi
 
-        API_HTTP=$(echo "$API_RES" | grep -o '---HTTP:[0-9]*' | cut -d: -f2)
-        API_BODY=$(echo "$API_RES" | sed 's/---HTTP:.*//')
+        API_HTTP=$(cat "$API_HTTP_FILE" 2>/dev/null || echo "0")
+        rm -f "$API_HTTP_FILE"
 
         if [[ "$API_HTTP" = "200" ]]; then
-            # Decode base64 content returned by the API
-            echo "$API_BODY" | python3 -c "
+            # Decode base64 content returned by the GitHub Contents API in one python3 pass
+            python3 - "$API_BODY_FILE" "$REGISTRY_SHARED.tmp" << 'PYEOF'
 import sys, json, base64
-d = json.load(sys.stdin)
-content = d.get('content', '')
-# GitHub API returns base64 with newlines; strip them before decoding
-decoded = base64.b64decode(content.replace('\n', ''))
-sys.stdout.buffer.write(decoded)
-" > "$REGISTRY_SHARED.tmp" 2>/dev/null || true
+body_file, out_file = sys.argv[1], sys.argv[2]
+try:
+    with open(body_file, 'r') as f:
+        d = json.load(f)
+    content = d.get('content', '')
+    decoded = base64.b64decode(content.replace('\n', ''))
+    with open(out_file, 'wb') as f:
+        f.write(decoded)
+except Exception as e:
+    sys.exit(1)
+PYEOF
+            rm -f "$API_BODY_FILE"
 
             if [ -s "$REGISTRY_SHARED.tmp" ]; then
                 mv "$REGISTRY_SHARED.tmp" "$REGISTRY_SHARED"
@@ -146,7 +155,7 @@ sys.stdout.buffer.write(decoded)
                 echo "  Notice: Remote registry empty or decode failed (starting fresh with local state)."
             fi
         else
-            rm -f "$REGISTRY_SHARED.tmp"
+            rm -f "$API_BODY_FILE" "$REGISTRY_SHARED.tmp"
             echo "  Notice: Remote registry not found on GitHub API (HTTP $API_HTTP — starting fresh with local state)."
         fi
 

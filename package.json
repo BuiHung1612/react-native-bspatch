@@ -1,6 +1,6 @@
 {
   "name": "react-native-bspatch",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Premium OTA Update Solution for React Native using TurboModules and bsdiff",
   "main": "lib/commonjs/index.js",
   "module": "lib/module/index.js",
