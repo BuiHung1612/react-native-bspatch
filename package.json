@@ -1,0 +1,88 @@
+{
+  "name": "react-native-bspatch",
+  "version": "1.0.3",
+  "description": "Premium OTA Update Solution for React Native using TurboModules and bsdiff",
+  "main": "lib/commonjs/index.js",
+  "module": "lib/module/index.js",
+  "types": "lib/typescript/index.d.ts",
+  "react-native": "src/index.ts",
+  "source": "src/index.ts",
+  "files": [
+    "android",
+    "ios",
+    "cpp",
+    "src",
+    "lib",
+    "tools",
+    "react-native-bspatch.podspec",
+    "README.md",
+    "LICENSE",
+    "!**/__tests__",
+    "!**/__fixtures__",
+    "!**/__mocks__"
+  ],
+  "keywords": [
+    "react-native",
+    "ota",
+    "update",
+    "bspatch",
+    "bsdiff",
+    "turbo-module",
+    "android",
+    "ios"
+  ],
+  "codegenConfig": {
+    "name": "RNBsPatchSpec",
+    "type": "modules",
+    "jsSrcsDir": "src"
+  },
+  "peerDependencies": {
+    "react": "*",
+    "react-native": "*",
+    "react-native-blob-util": "*"
+  },
+  "dependencies": {
+    "crypto-js": "^4.2.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BuiHung1612/react-native-bspatch.git"
+  },
+  "author": "Hung Bui <https://github.com/BuiHung1612>",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/BuiHung1612/react-native-bspatch/issues"
+  },
+  "homepage": "https://github.com/BuiHung1612/react-native-bspatch#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "react-native-bspatch": "./tools/build_ota.sh"
+  },
+  "scripts": {
+    "setup": "node ./tools/setup_project.js",
+    "typecheck": "tsc --noEmit",
+    "prepare": "bob build"
+  },
+  "devDependencies": {
+    "@types/crypto-js": "^4.2.2",
+    "@types/react": "^19.2.0",
+    "react-native-builder-bob": "^0.43.0",
+    "typescript": "^5.0.0"
+  },
+  "react-native-builder-bob": {
+    "source": "src",
+    "output": "lib",
+    "targets": [
+      "commonjs",
+      "module",
+      [
+        "typescript",
+        {
+          "project": "tsconfig.build.json"
+        }
+      ]
+    ]
+  }
+}

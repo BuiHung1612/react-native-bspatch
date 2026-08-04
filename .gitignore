@@ -1,0 +1,22 @@
+.DS_Store
+**/node_modules/
+
+# package managers
+/yarn.lock
+npm-debug.log*
+*.log
+
+.xcode.env.local
+.vscode
+
+# build
+.cache
+build
+coverage
+lib
+compile_commands.json
+
+**/tsconfig.tsbuildinfo
+android/.cxx
+android/.gradle
+android/.idea
