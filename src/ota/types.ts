@@ -33,6 +33,8 @@ export enum OtaStorageType {
     CUSTOM = 'CUSTOM',
     /** GitHub Releases — public or token-authenticated */
     GITHUB = 'GITHUB',
+    /** GitHub Raw repository storage */
+    GITHUB_RAW = 'GITHUB_RAW',
 }
 
 export type OtaPatch = {

@@ -26,6 +26,7 @@ import {
 } from './otaMetadata';
 import { CustomStorageProvider } from './storage/CustomStorage';
 import { GitHubReleaseStorageProvider } from './storage/GitHubReleaseStorage';
+import { GitHubRawStorageProvider } from './storage/GitHubRawStorage';
 import {
     OtaStatus,
     OtaStorageType,
@@ -42,6 +43,7 @@ const OTA_DIR = `${ReactNativeBlobUtil.fs.dirs.DocumentDir}/ota`;
 
 const DEFAULT_STORAGE = new CustomStorageProvider();
 const GITHUB_STORAGE = new GitHubReleaseStorageProvider();
+const GITHUB_RAW_STORAGE = new GitHubRawStorageProvider();
 
 /**
  * Get the storage provider for the given configuration.
@@ -50,6 +52,7 @@ const GITHUB_STORAGE = new GitHubReleaseStorageProvider();
 const getStorage = (config: OtaConfig): OtaStorageProvider => {
     if (config.storage) return config.storage;
     if (config.storageType === OtaStorageType.GITHUB) return GITHUB_STORAGE;
+    if (config.storageType === OtaStorageType.GITHUB_RAW) return GITHUB_RAW_STORAGE;
     return DEFAULT_STORAGE;
 };
 
