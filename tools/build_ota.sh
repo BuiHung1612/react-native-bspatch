@@ -95,9 +95,11 @@ if [ "$ACTION" != "reset" ]; then
 
     if [[ "$BASE_URL" == *"github"* ]] || [[ "$BASE_URL" == *"raw.githubusercontent"* ]]; then
         echo "  Downloading remote registry from GitHub..."
-        HTTP_CODE=$(curl -s -w "%{http_code}" -o "$REGISTRY_SHARED.tmp" "$BASE_URL/$BASE_FOLDER/ota_registry.json" 2>/dev/null || true)
+        # Add cache-busting params + Cache-Control header to bypass GitHub CDN 5-min cache
+        CACHE_BUST="?cb=$(date +%s)"
+        HTTP_CODE=$(curl -s -w "%{http_code}" -H "Cache-Control: no-cache" -o "$REGISTRY_SHARED.tmp" "$BASE_URL/$BASE_FOLDER/ota_registry.json${CACHE_BUST}" 2>/dev/null || true)
         if [ "$HTTP_CODE" != "200" ]; then
-            HTTP_CODE=$(curl -s -w "%{http_code}" -o "$REGISTRY_SHARED.tmp" "$BASE_URL/ota_registry.json" 2>/dev/null || true)
+            HTTP_CODE=$(curl -s -w "%{http_code}" -H "Cache-Control: no-cache" -o "$REGISTRY_SHARED.tmp" "$BASE_URL/ota_registry.json${CACHE_BUST}" 2>/dev/null || true)
         fi
         if [ "$HTTP_CODE" = "200" ] && [ -s "$REGISTRY_SHARED.tmp" ]; then
             mv "$REGISTRY_SHARED.tmp" "$REGISTRY_SHARED"
@@ -150,9 +152,12 @@ fi
 download_from_minio() {
   local REMOTE_PATH="$1"
   local DEST="$2"
+  local CB="?cb=$(date +%s)"
 
   if [[ "$BASE_URL" == *"github"* ]] || [[ "$BASE_URL" == *"raw.githubusercontent"* ]]; then
-      curl -s -f -o "$DEST" "$BASE_URL/$REMOTE_PATH" 2>/dev/null || curl -s -f -o "$DEST" "$BASE_URL/$(basename "$REMOTE_PATH")" 2>/dev/null
+      # Use Cache-Control: no-cache + timestamp query to bypass GitHub CDN 5-min cache
+      curl -s -f -H "Cache-Control: no-cache" -o "$DEST" "$BASE_URL/$REMOTE_PATH${CB}" 2>/dev/null || \
+      curl -s -f -H "Cache-Control: no-cache" -o "$DEST" "$BASE_URL/$(basename "$REMOTE_PATH")${CB}" 2>/dev/null
       return $?
   fi
 

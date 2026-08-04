@@ -9,7 +9,20 @@ import type { OtaConfig, OtaPatch, OtaStorageProvider } from '../types';
  * - Manifest: `${baseUrl}/${baseFolder}/ota_registry.json`
  * - Patch file: `${baseUrl}/${baseFolder}/${appVersion}/${channel}/${filename}`
  * - Assets: `${baseUrl}/${baseFolder}/assets/${hash}.${ext}`
+ *
+ * NOTE: All manifest/registry fetches include Cache-Control: no-cache and a
+ * timestamp query param to bypass GitHub CDN's 5-minute (max-age=300) cache.
+ * Asset URLs are content-addressed (hash-named) so they are immutable and
+ * intentionally NOT cache-busted.
  */
+
+/** Headers to bypass GitHub CDN cache on mutable files (registry, manifests) */
+const NO_CACHE_HEADERS = { 'Cache-Control': 'no-cache' };
+
+/** Append a timestamp query param to defeat CDN caches on mutable URLs */
+const bustCache = (url: string): string =>
+    `${url}?cb=${Date.now()}`;
+
 export class GitHubRawStorageProvider implements OtaStorageProvider {
     async fetchManifest(config: OtaConfig): Promise<OtaPatch[]> {
         if (!config.customServer) return config.bundledPatches || [];
@@ -18,10 +31,17 @@ export class GitHubRawStorageProvider implements OtaStorageProvider {
         const normalizedBaseUrl = baseUrl.endsWith('/')
             ? baseUrl.slice(0, -1)
             : baseUrl;
-        const registryUrl = `${normalizedBaseUrl}/${baseFolder}/ota_registry.json`;
+        // Cache-bust: registry is mutable; must always fetch the latest version
+        const registryUrl = bustCache(
+            `${normalizedBaseUrl}/${baseFolder}/ota_registry.json`,
+        );
 
         try {
-            const res = await ReactNativeBlobUtil.fetch('GET', registryUrl);
+            const res = await ReactNativeBlobUtil.fetch(
+                'GET',
+                registryUrl,
+                NO_CACHE_HEADERS,
+            );
             if (res.respInfo.status !== 200) {
                 throw new Error(
                     `Registry fetch failed with status ${res.respInfo.status}`,
@@ -70,7 +90,11 @@ export class GitHubRawStorageProvider implements OtaStorageProvider {
             : baseUrl;
         const channelName = channel.toLowerCase();
 
-        return `${normalizedBaseUrl}/${baseFolder}/${config.appVersion}/${channelName}/${filename}`;
+        // Cache-bust: patch files are versioned by name but GitHub CDN may
+        // serve a stale 404 response for newly uploaded files within 5 min.
+        return bustCache(
+            `${normalizedBaseUrl}/${baseFolder}/${config.appVersion}/${channelName}/${filename}`,
+        );
     }
 
     async getAssetUrl(
@@ -85,6 +109,7 @@ export class GitHubRawStorageProvider implements OtaStorageProvider {
             ? baseUrl.slice(0, -1)
             : baseUrl;
 
+        // Assets are content-addressed (hash = filename) → immutable, no cache-bust needed
         return `${normalizedBaseUrl}/${baseFolder}/assets/${hash}.${ext}`;
     }
 }
