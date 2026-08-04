@@ -94,8 +94,8 @@ if [[ "$BASE_URL" == *"github"* ]] || [[ "$BASE_URL" == *"raw.githubusercontent"
 
     # 2. Copy generated files into storage repo (or reset remote)
     if [ "$CLEAN_REMOTE" = true ]; then
-        echo "  Resetting remote storage state..."
-        rm -rf "$GH_REPO_DIR/$BASE_FOLDER/$APP_VERSION"
+        echo "  Resetting remote storage state for channel '$CHANNEL'..."
+        rm -rf "$GH_REPO_DIR/$BASE_FOLDER/$APP_VERSION/$CHANNEL"
         mkdir -p "$GH_REPO_DIR/$BASE_FOLDER"
         cp "$REGISTRY_FILE" "$GH_REPO_DIR/$BASE_FOLDER/ota_registry.json"
         cp "$REGISTRY_FILE" "$GH_REPO_DIR/ota_registry.json" 2>/dev/null || true
@@ -103,8 +103,8 @@ if [[ "$BASE_URL" == *"github"* ]] || [[ "$BASE_URL" == *"raw.githubusercontent"
         TARGET_RELEASE_DIR="$GH_REPO_DIR/$BASE_FOLDER/$APP_VERSION/$CHANNEL"
         mkdir -p "$TARGET_RELEASE_DIR"
         
-        echo "  Copying release files to storage repo..."
-        for FILE in "$OUTPUT_DIR"/*.{patch,hbc,json}; do
+        echo "  Copying release files to storage repo for channel '$CHANNEL'..."
+        for FILE in "$OUTPUT_DIR"/*_${CHANNEL}.json "$OUTPUT_DIR"/*_${CHANNEL}.hbc "$OUTPUT_DIR"/*_${CHANNEL}_*.patch "$OUTPUT_DIR"/*_${CHANNEL}.patch; do
             [[ -f "$FILE" ]] || continue
             FNAME=$(basename "$FILE")
             cp "$FILE" "$TARGET_RELEASE_DIR/$FNAME"
