@@ -85,6 +85,22 @@ const IOS_BUNDLE_URL_OVERRIDE = `
 const ANDROID_IMPORT = 'import vn.reactnativebspatch.OtaBundleResolver';
 const ANDROID_JS_BUNDLE = 'jsBundleFilePath = OtaBundleResolver.resolve(applicationContext)';
 
+function findClosingParen(source, openParenIdx) {
+    let depth = 0;
+    for (let i = openParenIdx; i < source.length; i += 1) {
+        const char = source[i];
+        if (char === '(') {
+            depth += 1;
+        } else if (char === ')') {
+            depth -= 1;
+            if (depth === 0) {
+                return i;
+            }
+        }
+    }
+    return -1;
+}
+
 // ── iOS: project.pbxproj ─────────────────────────────────────────────────────
 
 function patchPbxproj(content) {
@@ -172,18 +188,35 @@ function patchMainApplication(content) {
 
     // 2. Add jsBundleFilePath if missing
     if (!result.includes('OtaBundleResolver.resolve')) {
-        // Find getDefaultReactHost(... call and inject jsBundleFilePath param
-        // Look for closing paren of getDefaultReactHost block
-        const hostCallRegex = /getDefaultReactHost\s*\(\s*([\s\S]*?)\)/m;
-        const hostMatch = result.match(hostCallRegex);
-        if (hostMatch) {
-            // Insert before the closing paren
-            const closeIdx = hostMatch.index + hostMatch[0].length - 1;
-            result =
-                result.slice(0, closeIdx) +
-                ',\n      ' + ANDROID_JS_BUNDLE + '\n    ' +
-                result.slice(closeIdx);
-            changed = true;
+        const hostCallMatch = result.match(/getDefaultReactHost\s*\(/);
+        if (hostCallMatch && hostCallMatch.index !== undefined) {
+            const hostCallStart = hostCallMatch.index;
+            const openParenIdx = result.indexOf('(', hostCallStart);
+            const closeIdx =
+                openParenIdx === -1
+                    ? -1
+                    : findClosingParen(result, openParenIdx);
+
+            if (closeIdx === -1) {
+                console.log('    ⚠  Could not find the closing parenthesis for getDefaultReactHost(...). Please add jsBundleFilePath manually.');
+            } else {
+                const trailingWhitespaceMatch = result
+                    .slice(0, closeIdx)
+                    .match(/\s*$/);
+                const trailingWhitespace =
+                    trailingWhitespaceMatch?.[0] ?? '';
+                const insertIdx = closeIdx - trailingWhitespace.length;
+                const beforeClose = result.slice(0, insertIdx).trimEnd();
+                const separator = beforeClose.endsWith(',') ? '\n' : ',\n';
+                result =
+                    result.slice(0, insertIdx) +
+                    separator +
+                    '      ' +
+                    ANDROID_JS_BUNDLE +
+                    trailingWhitespace +
+                    result.slice(closeIdx);
+                changed = true;
+            }
         } else {
             console.log('    ⚠  Could not find getDefaultReactHost(...) call. Please add jsBundleFilePath manually.');
         }
