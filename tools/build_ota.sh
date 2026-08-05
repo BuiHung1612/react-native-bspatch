@@ -18,7 +18,6 @@ MODULE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ROOT="$PWD"
 BUNDLE_XCODE_IOS="$ROOT/ios/output/main.jsbundle"
 BSDIFF="$SCRIPT_DIR/bsdiff"
-GENERATED_TS="$ROOT/src/ota/otaPatches.generated.ts"
 
 # ── Load .env file if exists ─────────────────────────────────────────────────
 # Look in project root first, then module directory (fallback)
@@ -61,6 +60,8 @@ while [[ "$#" -gt 0 ]]; do
 done
 # Configuration
 FLAVOR_LOWER=$(echo "$FLAVOR" | tr '[:upper:]' '[:lower:]')
+if [ "$FLAVOR_LOWER" = "dev" ]; then FLAVOR_LOWER="development"; fi
+if [ "$FLAVOR_LOWER" = "prod" ]; then FLAVOR_LOWER="production"; fi
 
 # ── Setup ──────────────────────────────────────────────────────────────────
 echo "Preparing build environment..."

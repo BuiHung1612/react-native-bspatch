@@ -63,6 +63,16 @@ export function OtaProvider({
   const appState = useRef(AppState.currentState);
   const isCheckingRef = useRef(false);
   const bootstrapDone = useRef(false);
+  const progressRef = useRef(0);
+  const isDebugUpdateEnabled = !__DEV__ || config.allowDebugUpdates === true;
+
+  const setProgressIfChanged = useCallback((nextProgress: number) => {
+    if (progressRef.current === nextProgress) {
+      return;
+    }
+    progressRef.current = nextProgress;
+    setProgress(nextProgress);
+  }, []);
 
   /**
    * Core apply update logic — separated so it can be mapped to button clicks
@@ -86,6 +96,7 @@ export function OtaProvider({
 
       try {
         setStatus(OtaStatus.DOWNLOADING);
+        progressRef.current = 0;
         setProgress(0);
         await applyOtaPatchInternal(
           directPatch,
@@ -100,7 +111,7 @@ export function OtaProvider({
             }
           },
           (percent: number) => {
-            setProgress(percent);
+            setProgressIfChanged(percent);
           },
         );
       } catch (error) {
@@ -109,15 +120,27 @@ export function OtaProvider({
         setMessage(`Update failed: ${(error as Error).message}`);
       }
     },
-    [config],
+    [config, setProgressIfChanged],
   );
 
   /**
    * Exposed method for manual trigger
    */
   const applyUpdate = useCallback(async () => {
+    if (!isDebugUpdateEnabled) {
+      setPendingCount(0);
+      setStatus(OtaStatus.UP_TO_DATE);
+      setMessage('OTA updates are disabled while running a debug build.');
+      return;
+    }
     await executeApplyUpdate(patches, currentVersion, latestVersion);
-  }, [executeApplyUpdate, patches, currentVersion, latestVersion]);
+  }, [
+    currentVersion,
+    executeApplyUpdate,
+    isDebugUpdateEnabled,
+    latestVersion,
+    patches,
+  ]);
 
   /**
    * Check for updates from the manifest.
@@ -125,6 +148,13 @@ export function OtaProvider({
    */
   const checkUpdates = useCallback(async () => {
     if (isCheckingRef.current) return;
+    if (!isDebugUpdateEnabled) {
+      setPendingCount(0);
+      setIsChecking(false);
+      setStatus(OtaStatus.UP_TO_DATE);
+      setMessage('OTA updates are disabled while running a debug build.');
+      return;
+    }
     isCheckingRef.current = true;
     setIsChecking(true);
     setStatus(OtaStatus.CHECKING);
@@ -180,7 +210,7 @@ export function OtaProvider({
       isCheckingRef.current = false;
       setIsChecking(false);
     }
-  }, [config, executeApplyUpdate]);
+  }, [config, executeApplyUpdate, isDebugUpdateEnabled]);
 
   const downloadBackgroundUpdate = async (
     patchList: OtaPatch[],

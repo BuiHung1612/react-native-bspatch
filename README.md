@@ -63,6 +63,7 @@ const config = {
   appVersion: '1.0.0',        // matches versionName in build.gradle
   baseAppVersion: 1,          // OTA version baked into the first APK/IPA (usually 1)
   updateMode: OtaUpdateMode.MANUAL,
+  allowDebugUpdates: false,   // default: OTA is blocked in __DEV__
   customServer: {
     baseUrl: 'https://ota.yourcompany.com',
     username: 'your-user',
@@ -123,6 +124,13 @@ type OtaConfig = {
   bundledPatches?: OtaPatch[];
 
   /**
+   * Allow OTA checks and patch application while React Native is running in
+   * development mode (`__DEV__`).
+   * Default: false
+   */
+  allowDebugUpdates?: boolean;
+
+  /**
    * When to check / apply updates.
    * - MANUAL: call checkUpdate() / applyUpdate() manually
    * - ON_APP_START: check automatically on every cold start
@@ -177,6 +185,16 @@ enum OtaUpdateMode {
   ON_APP_FOREGROUND  = 'ON_APP_FOREGROUND', // Check when app returns to foreground
   BACKGROUND_DOWNLOAD = 'BACKGROUND_DOWNLOAD', // TODO: download in background
 }
+```
+
+### Debug builds
+
+For safety, OTA checks and patch application are disabled by default while React Native runs in `__DEV__`.
+
+If you explicitly want to test OTA inside a debug build, set:
+
+```ts
+allowDebugUpdates: true
 ```
 
 ### OtaStatus values

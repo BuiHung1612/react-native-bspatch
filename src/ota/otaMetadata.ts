@@ -117,6 +117,10 @@ export const markHealthy = async (
     defaultVersion: number,
 ): Promise<OtaMetadata> => {
     const metadata = await loadMetadata(defaultVersion);
+    if (metadata.lastLaunchSuccessful && metadata.rollbackCount === 0) {
+        return metadata;
+    }
+
     const updated: OtaMetadata = {
         ...metadata,
         lastLaunchSuccessful: true,

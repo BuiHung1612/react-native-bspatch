@@ -508,6 +508,14 @@ export const applyOtaPatchInternal = async (
     ) => void,
     onProgress: (percent: number) => void,
 ) => {
+    if (__DEV__ && config.allowDebugUpdates !== true) {
+        onStatus(
+            OtaStatus.UP_TO_DATE,
+            'OTA updates are disabled while running a debug build.',
+        );
+        throw new Error('OTA updates are disabled while running a debug build.');
+    }
+
     const log = createOtaLogger(config.onEvent);
     await ensureOtaDir();
     const totalStart = Date.now();

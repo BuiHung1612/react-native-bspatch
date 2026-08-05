@@ -123,6 +123,11 @@ export type OtaConfig = {
     baseAppVersion: number;
     /** Default patches if manifest fetch fails */
     bundledPatches?: OtaPatch[];
+    /**
+     * Allow OTA checks and patch application while React Native is running in
+     * development mode (`__DEV__`). Disabled by default for safety.
+     */
+    allowDebugUpdates?: boolean;
 
     /** Enterprise configurations */
     updateMode?: OtaUpdateMode;

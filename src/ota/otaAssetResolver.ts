@@ -19,6 +19,7 @@ interface AssetManifest {
 let assetManifest: AssetManifest | null = null;
 let assetMap: Map<string, AssetMetadata> = new Map();
 let assetList: AssetMetadata[] = [];
+let assetLookupCache: Map<string, AssetMetadata | null> = new Map();
 let isPatched = false;
 
 /**
@@ -64,6 +65,7 @@ export const initOtaAssetResolver = async (version: number): Promise<void> => {
             });
             assetMap = map;
             assetList = list;
+            assetLookupCache = new Map();
 
             log(
                 `Initialized version ${version} (${list.length} assets, mapped for O(1) lookup)`,
@@ -119,17 +121,25 @@ const patchAssetResolver = (): void => {
                 .replace(/\//g, '_')
                 .replace(/^(assets_)+/, '');
 
-            // 1. Fast O(1) Map lookup
-            let found = assetMap.get(normUri);
+            const cached = assetLookupCache.get(normUri);
 
-            // 2. Fallback O(N) fuzzy matching (without regex overhead)
-            if (!found) {
+            // 1. Fast cached lookup from previous exact/fuzzy resolution
+            let found = cached === undefined ? undefined : cached;
+
+            // 2. Fast O(1) Map lookup
+            if (found === undefined) {
+                found = assetMap.get(normUri) ?? undefined;
+            }
+
+            // 3. Fallback O(N) fuzzy matching (without regex overhead)
+            if (found === undefined) {
                 found = assetList.find((a: AssetMetadata) => {
                     return (
                         a._normPath.endsWith(normUri) ||
                         normUri.endsWith(a._normPath)
                     );
                 });
+                assetLookupCache.set(normUri, found ?? null);
             }
 
             if (found) {
@@ -177,6 +187,6 @@ export const resetOtaAssetResolver = (): void => {
     assetManifest = null;
     assetMap = new Map();
     assetList = [];
+    assetLookupCache = new Map();
     isPatched = false;
 };
-
