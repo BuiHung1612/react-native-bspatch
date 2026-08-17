@@ -254,7 +254,6 @@ fi
 
 # ── Reset ─────────────────────────────────────────────────────────────────────
 if [ "$ACTION" = "reset" ]; then
-  FLAVOR_LOWER=$(echo "$FLAVOR" | tr '[:upper:]' '[:lower:]')
   echo "Resetting OTA registry and output for flavor '$FLAVOR_LOWER'..."
 
   # Reset only the specific flavor in registry JSON if registry exists
@@ -519,7 +518,6 @@ fi
 
 echo ""
 echo "=== All Builds Complete ==="
-
 
 
 

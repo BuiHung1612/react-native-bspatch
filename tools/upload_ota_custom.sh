@@ -107,6 +107,15 @@ if [[ "$BASE_URL" == *"github"* ]] || [[ "$BASE_URL" == *"raw.githubusercontent"
         for FILE in "$OUTPUT_DIR"/*_${CHANNEL}.json "$OUTPUT_DIR"/*_${CHANNEL}.hbc "$OUTPUT_DIR"/*_${CHANNEL}_*.patch "$OUTPUT_DIR"/*_${CHANNEL}.patch; do
             [[ -f "$FILE" ]] || continue
             FNAME=$(basename "$FILE")
+            if [[ "$FNAME" == "patch_"* ]] || [[ "$FNAME" == "bundle_"* ]]; then
+                if [[ "$FNAME" != *"_${APP_VERSION}_"* ]]; then
+                    continue
+                fi
+            fi
+
+            if [[ "$FNAME" != *"_${APP_VERSION}_"* ]] && [[ "$FNAME" != *"_${CHANNEL}_"* ]] && [[ "$FNAME" != "asset-manifest"* ]] && [[ "$FNAME" != "base-assets"* ]]; then
+                continue
+            fi
             cp "$FILE" "$TARGET_RELEASE_DIR/$FNAME"
         done
 
