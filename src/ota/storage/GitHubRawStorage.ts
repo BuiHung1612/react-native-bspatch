@@ -23,11 +23,19 @@ const NO_CACHE_HEADERS = { 'Cache-Control': 'no-cache' };
 const bustCache = (url: string): string =>
     `${url}?cb=${Date.now()}`;
 
+const normalizeChannel = (channel: string): string => {
+    const lower = channel.toLowerCase();
+    if (lower === 'dev') return 'development';
+    if (lower === 'prod') return 'production';
+    return lower;
+};
+
 export class GitHubRawStorageProvider implements OtaStorageProvider {
     async fetchManifest(config: OtaConfig): Promise<OtaPatch[]> {
         if (!config.customServer) return config.bundledPatches || [];
 
         const { baseUrl, channel, baseFolder = 'ota' } = config.customServer;
+        const channelName = normalizeChannel(channel);
         const normalizedBaseUrl = baseUrl.endsWith('/')
             ? baseUrl.slice(0, -1)
             : baseUrl;
@@ -54,9 +62,7 @@ export class GitHubRawStorageProvider implements OtaStorageProvider {
                     : res.data;
 
             const appGroup = registry?.apps?.[config.appVersion];
-            const flavorGroup =
-                appGroup?.flavors?.[channel.toLowerCase()] ||
-                appGroup?.flavors?.development;
+            const flavorGroup = appGroup?.flavors?.[channelName];
 
             if (!flavorGroup?.patches?.length) {
                 return config.bundledPatches || [];
@@ -88,7 +94,7 @@ export class GitHubRawStorageProvider implements OtaStorageProvider {
         const normalizedBaseUrl = baseUrl.endsWith('/')
             ? baseUrl.slice(0, -1)
             : baseUrl;
-        const channelName = channel.toLowerCase();
+        const channelName = normalizeChannel(channel);
 
         // Cache-bust: patch files are versioned by name but GitHub CDN may
         // serve a stale 404 response for newly uploaded files within 5 min.
