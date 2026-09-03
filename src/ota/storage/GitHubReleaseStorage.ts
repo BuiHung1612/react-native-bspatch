@@ -59,6 +59,11 @@ export class GitHubReleaseStorageProvider implements OtaStorageProvider {
             }
 
             // Structured: apps["1.0.0"].channels["production"].patches[]
+            if (!config.appVersion) {
+                throw new Error(
+                    '[GitHubReleaseStorage] config.appVersion is required to query OTA registry',
+                );
+            }
             const appGroup = registry?.apps?.[config.appVersion];
             const channelGroup = appGroup?.channels?.[config.githubRelease.repo] // use repo as channel fallback
                 ?? appGroup?.channels?.production

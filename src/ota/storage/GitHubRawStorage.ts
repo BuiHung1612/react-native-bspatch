@@ -61,6 +61,11 @@ export class GitHubRawStorageProvider implements OtaStorageProvider {
                     ? JSON.parse(res.data)
                     : res.data;
 
+            if (!config.appVersion) {
+                throw new Error(
+                    '[GitHubRawStorage] config.appVersion is required to query OTA registry',
+                );
+            }
             const appGroup = registry?.apps?.[config.appVersion];
             const flavorGroup = appGroup?.flavors?.[channelName];
 

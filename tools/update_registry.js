@@ -12,6 +12,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const [
   projectRoot,
@@ -61,6 +62,24 @@ if (!registry.apps[appVersion].flavors[flavor]) {
 const flavorGroup = registry.apps[appVersion].flavors[flavor];
 flavorGroup.latestOtaVersion = toOtaVersion;
 
+// ── Check for private key for asymmetric signing ───────────────────────────
+let signingKey = process.env.OTA_PRIVATE_KEY || null;
+if (!signingKey) {
+  const candidateKeyPaths = [
+    path.join(process.cwd(), 'ota_private_key.pem'),
+    path.join(path.dirname(registryPath), 'ota_private_key.pem'),
+    path.join(path.dirname(registryPath), '../ota_private_key.pem'),
+  ];
+  for (const kp of candidateKeyPaths) {
+    if (fs.existsSync(kp)) {
+      try {
+        signingKey = fs.readFileSync(kp, 'utf8');
+        break;
+      } catch (e) {}
+    }
+  }
+}
+
 // ── Update patches ──────────────────────────────────────────────────────────
 if (newPatches.length > 0) {
   // We merge patches by platform to avoid overwriting between Android and iOS
@@ -71,7 +90,32 @@ if (newPatches.length > 0) {
     const fullBundleName = `bundle_${appVersion}_v${toOtaVersion}_${platform}_${flavor}.hbc`;
     const manifestName = path.basename(_assetManifestFile);
 
-    return {
+    let signature = undefined;
+    if (signingKey) {
+      try {
+        const patchFileCandidates = [
+          path.join(path.dirname(registryPath), p.file),
+          path.join(process.cwd(), p.file),
+        ];
+        let patchData = null;
+        for (const pfc of patchFileCandidates) {
+          if (fs.existsSync(pfc)) {
+            patchData = fs.readFileSync(pfc);
+            break;
+          }
+        }
+        if (patchData) {
+          const signer = crypto.createSign('SHA256');
+          signer.update(patchData);
+          signature = signer.sign(signingKey, 'base64');
+          console.log(`  ✓ Signed patch ${p.file} with asymmetric private key`);
+        }
+      } catch (signErr) {
+        console.warn(`  ⚠ Could not sign patch ${p.file}: ${signErr.message}`);
+      }
+    }
+
+    const patchObj = {
       id: `v${p.from}-to-v${p.to}-${flavor}-${platform}`,
       label: `V${p.from} → V${p.to} (${flavor} ${platform})`,
       appVersion,
@@ -85,6 +129,12 @@ if (newPatches.length > 0) {
       assetManifestUrl: manifestName,
       flavor: flavor,
     };
+
+    if (signature) {
+      patchObj.signature = signature;
+    }
+
+    return patchObj;
   });
 
   flavorGroup.patches = [...otherPlatformPatches, ...mappedNewPatches];

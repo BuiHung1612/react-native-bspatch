@@ -7,8 +7,15 @@ interface TokenCache {
     expiresAt: number;
 }
 
+interface RegistryCache {
+    etag?: string;
+    patches: OtaPatch[];
+}
+
 /** Cache tokens per server endpoint so switching configs invalidates stale tokens. */
 const tokenCache = new Map<string, TokenCache>();
+/** Cache registry ETag and parsed patches to avoid redownloading unmodified manifests. */
+const registryCache = new Map<string, RegistryCache>();
 
 /**
  * Implementation for the custom MinIO-based storage server.
@@ -60,6 +67,8 @@ export class CustomStorageProvider implements OtaStorageProvider {
 
     const { baseUrl, channel, baseFolder = 'bspatch' } = config.customServer;
     const registryPath = `${baseFolder}/ota_registry.json`;
+    const regCacheKey = `${baseUrl}|${registryPath}|${config.appVersion}|${channel}`;
+    const cachedReg = registryCache.get(regCacheKey);
 
     try {
       const token = await this.getAccessToken(config);
@@ -74,11 +83,23 @@ export class CustomStorageProvider implements OtaStorageProvider {
       const registryUrl = linkJson.data;
       if (!registryUrl) throw new Error('Failed to generate registry download link');
 
-      const registryRes = await ReactNativeBlobUtil.fetch('GET', registryUrl);
+      const reqHeaders: Record<string, string> = {};
+      if (cachedReg?.etag) {
+        reqHeaders['If-None-Match'] = cachedReg.etag;
+      }
+
+      const registryRes = await ReactNativeBlobUtil.fetch('GET', registryUrl, reqHeaders);
+      if (registryRes.respInfo.status === 304 && cachedReg) {
+        return cachedReg.patches;
+      }
       if (registryRes.respInfo.status !== 200) {
         throw new Error(`Registry fetch failed with status ${registryRes.respInfo.status}`);
       }
 
+      const etag = registryRes.respInfo.headers?.['etag'] || registryRes.respInfo.headers?.['ETag'];
+      if (!config.appVersion) {
+        throw new Error('[CustomStorage] config.appVersion is required to query OTA registry');
+      }
       const registry = JSON.parse(registryRes.data);
       const appGroup = registry?.apps?.[config.appVersion];
       const flavorGroup = appGroup?.flavors?.[channel.toLowerCase()];
@@ -87,10 +108,12 @@ export class CustomStorageProvider implements OtaStorageProvider {
         return config.bundledPatches || [];
       }
 
-      return (flavorGroup.patches || []).filter((p: OtaPatch) => p.platform === Platform.OS);
+      const matchedPatches = (flavorGroup.patches || []).filter((p: OtaPatch) => p.platform === Platform.OS);
+      registryCache.set(regCacheKey, { etag, patches: matchedPatches });
+      return matchedPatches;
     } catch (error) {
       console.warn('[CustomStorage] Manifest fetch error:', (error as Error).message);
-      return config.bundledPatches || [];
+      return cachedReg?.patches || config.bundledPatches || [];
     }
   }
 

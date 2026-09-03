@@ -36,8 +36,16 @@ target_link_libraries(
         log
 )
 
+# Optimization compiler flags
+target_compile_options(bspatch PRIVATE
+    -O3
+    -flto
+    -fomit-frame-pointer
+    -fvisibility=hidden
+)
+
 # Set 16KB (2^14) page alignment for Android compatibility
 # Required for arm64-v8a and x86_64 architectures
 if(ANDROID)
-    target_link_options(bspatch PRIVATE "LINKER:-z,max-page-size=16384")
+    target_link_options(bspatch PRIVATE "LINKER:-z,max-page-size=16384" -flto)
 endif()

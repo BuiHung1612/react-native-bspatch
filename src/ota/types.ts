@@ -117,8 +117,8 @@ export type OtaNetworkStrategy = {
 };
 
 export type OtaConfig = {
-    /** Current app versionName (e.g. "1.0.0") */
-    appVersion: string;
+    /** Current app versionName (e.g. "1.0.0"). If omitted, auto-detected from native app. */
+    appVersion?: string;
     /** Initial version baked into the APK (usually 1) */
     baseAppVersion: number;
     /** Default patches if manifest fetch fails */
@@ -213,8 +213,12 @@ export type OtaState = {
     pendingCount: number;
     isChecking: boolean;
     metrics: OtaMetrics | null;
+    /** True if a background update has been downloaded and prepared silently */
+    isUpdateReady: boolean;
     applyUpdate: () => Promise<void>;
     resetToFactory: () => Promise<void>;
     markAsHealthy: () => Promise<void>;
     checkUpdate: () => Promise<void>;
+    /** Reload the React Native JS bundle immediately to apply downloaded update */
+    reloadBundle: () => void;
 };

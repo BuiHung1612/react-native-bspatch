@@ -62,6 +62,8 @@
   },
   "scripts": {
     "setup": "node ./tools/setup_project.js",
+    "bump-version": "node ./tools/bump_version.js",
+    "generate-keys": "node ./tools/generate_keys.js",
     "typecheck": "tsc --noEmit",
     "prepare": "bob build"
   },

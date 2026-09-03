@@ -73,9 +73,20 @@ int bspatch(const uint8_t* old, int64_t oldsize, uint8_t* new, int64_t newsize, 
 			return -1;
 
 		/* Add old data to diff string */
-		for(i=0;i<ctrl[0];i++)
-			if((oldpos+i>=0) && (oldpos+i<oldsize))
-				new[newpos+i]+=old[oldpos+i];
+		if (oldpos >= 0 && oldpos + ctrl[0] <= oldsize) {
+			const uint8_t *src = old + oldpos;
+			uint8_t *dst = new + newpos;
+			int64_t len = ctrl[0];
+#if defined(__clang__)
+#pragma clang loop vectorize(enable) interleave(enable)
+#endif
+			for(i=0;i<len;i++)
+				dst[i]+=src[i];
+		} else {
+			for(i=0;i<ctrl[0];i++)
+				if((oldpos+i>=0) && (oldpos+i<oldsize))
+					new[newpos+i]+=old[oldpos+i];
+		}
 
 		/* Adjust pointers */
 		newpos+=ctrl[0];

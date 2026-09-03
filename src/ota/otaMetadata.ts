@@ -107,8 +107,50 @@ export const registerNewVersion = (
 };
 
 /**
+ * Scans the OTA directory and removes old version directories and leftover temporary files
+ * that are no longer referenced in the active metadata.
+ */
+export const cleanupOldVersions = async (
+    metadata: OtaMetadata,
+    baseVersion: number,
+): Promise<void> => {
+    try {
+        if (!(await ReactNativeBlobUtil.fs.exists(OTA_DIR))) return;
+        const items = await ReactNativeBlobUtil.fs.ls(OTA_DIR);
+
+        // Retain current active version and rollback versions
+        const retainedVersions = new Set<number>([
+            metadata.currentVersion,
+            ...(metadata.previousVersions || []),
+        ]);
+
+        for (const item of items) {
+            // Check if directory matches "v<number>"
+            const versionMatch = item.match(/^v(\d+)$/);
+            if (versionMatch) {
+                const ver = parseInt(versionMatch[1], 10);
+                if (!retainedVersions.has(ver) && ver !== baseVersion) {
+                    const dirPath = `${OTA_DIR}/${item}`;
+                    await ReactNativeBlobUtil.fs.unlink(dirPath).catch(() => {});
+                    if (__DEV__) {
+                        console.log(`[otaMetadata] Cleaned up obsolete OTA version: ${item}`);
+                    }
+                }
+            }
+            // Clean up leftover temporary bundle files (.tmp)
+            if (item.endsWith('.tmp')) {
+                await ReactNativeBlobUtil.fs.unlink(`${OTA_DIR}/${item}`).catch(() => {});
+            }
+        }
+    } catch (e) {
+        console.warn('[otaMetadata] Cleanup old versions failed:', e);
+    }
+};
+
+/**
  * Marks the current session as healthy, indicating a successful boot.
  * This prevents the native bridge from rolling back the version on the next launch.
+ * Also cleans up obsolete version directories from disk.
  *
  * @param defaultVersion - Base version for metadata lookup fallback.
  * @returns The updated metadata.
@@ -117,16 +159,16 @@ export const markHealthy = async (
     defaultVersion: number,
 ): Promise<OtaMetadata> => {
     const metadata = await loadMetadata(defaultVersion);
-    if (metadata.lastLaunchSuccessful && metadata.rollbackCount === 0) {
-        return metadata;
-    }
-
     const updated: OtaMetadata = {
         ...metadata,
         lastLaunchSuccessful: true,
         rollbackCount: 0,
     };
     await saveMetadata(updated);
+
+    // Garbage collect older versions on disk to free storage
+    await cleanupOldVersions(updated, defaultVersion);
+
     return updated;
 };
 

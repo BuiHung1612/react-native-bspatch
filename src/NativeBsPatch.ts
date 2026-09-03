@@ -47,6 +47,23 @@ export interface Spec extends TurboModule {
    * Log a message to the native console (NSLog on iOS)
    */
   logNative(message: string): void;
+
+  /**
+   * Verify HMAC-SHA256 signature natively with streaming file I/O
+   * @param filePath Absolute path to the file to verify
+   * @param signature Base64-encoded expected signature
+   * @param publicKey Base64-encoded secret key
+   */
+  verifySignature(
+    filePath: string,
+    signature: string,
+    publicKey: string,
+  ): Promise<boolean>;
+
+  /**
+   * Returns the native app version (versionName on Android, CFBundleShortVersionString on iOS)
+   */
+  getAppVersion(): Promise<string>;
 }
 
 export default TurboModuleRegistry.getEnforcing<Spec>('BsPatch');

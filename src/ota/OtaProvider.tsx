@@ -59,9 +59,11 @@ export function OtaProvider({
   const [metrics, setMetrics] = useState<OtaMetrics | null>(null);
   const [patches, setPatches] = useState<OtaPatch[]>([]);
   const [isInitialized, setIsInitialized] = useState<boolean>(false);
+  const [isUpdateReady, setIsUpdateReady] = useState<boolean>(false);
 
   const appState = useRef(AppState.currentState);
   const isCheckingRef = useRef(false);
+  const pendingReloadRef = useRef(false);
   const bootstrapDone = useRef(false);
   const progressRef = useRef(0);
   const isDebugUpdateEnabled = !__DEV__ || config.allowDebugUpdates === true;
@@ -73,6 +75,22 @@ export function OtaProvider({
     progressRef.current = nextProgress;
     setProgress(nextProgress);
   }, []);
+
+  const getEffectiveConfig = useCallback(async (): Promise<OtaConfig> => {
+    if (config.appVersion) return config;
+    try {
+      const nativeVer = await NativeBsPatch.getAppVersion();
+      if (!nativeVer) {
+        throw new Error('Native appVersion is empty');
+      }
+      return { ...config, appVersion: nativeVer };
+    } catch (e) {
+      throw new Error(
+        `[OtaProvider] Failed to auto-detect appVersion from native: ${(e as Error).message}. ` +
+        `Please set versionName (Android) / CFBundleShortVersionString (iOS), or provide config.appVersion explicitly.`
+      );
+    }
+  }, [config]);
 
   /**
    * Core apply update logic — separated so it can be mapped to button clicks
@@ -95,12 +113,13 @@ export function OtaProvider({
       }
 
       try {
+        const effectiveConfig = await getEffectiveConfig();
         setStatus(OtaStatus.DOWNLOADING);
         progressRef.current = 0;
         setProgress(0);
         await applyOtaPatchInternal(
           directPatch,
-          config,
+          effectiveConfig,
           (s: OtaStatus, msg: string, m?: OtaMetrics) => {
             setMessage(msg);
             setStatus(s);
@@ -120,7 +139,7 @@ export function OtaProvider({
         setMessage(`Update failed: ${(error as Error).message}`);
       }
     },
-    [config, setProgressIfChanged],
+    [getEffectiveConfig, setProgressIfChanged],
   );
 
   /**
@@ -142,6 +161,48 @@ export function OtaProvider({
     patches,
   ]);
 
+  const downloadBackgroundUpdate = useCallback(
+    async (
+      patchList: OtaPatch[],
+      localV: number,
+      targetV: number,
+    ) => {
+      const directPatch = patchList.find(
+        p => p.fromVersion === localV &&
+             p.toVersion === targetV &&
+             p.platform === Platform.OS,
+      );
+      if (!directPatch) return;
+
+      try {
+        const effectiveConfig = await getEffectiveConfig();
+        await applyOtaPatchInternal(
+          directPatch,
+          effectiveConfig,
+          (s: OtaStatus, msg: string, m?: OtaMetrics) => {
+            if (s === OtaStatus.SUCCESS) {
+              setIsUpdateReady(true);
+              pendingReloadRef.current = true;
+              setStatus(OtaStatus.UP_TO_DATE);
+              setMessage(`Update V${targetV} ready for next launch`);
+              if (m) {
+                setMetrics(m);
+                initOtaAssetResolver(targetV);
+              }
+            }
+          },
+          () => {}, // silent: background doesn't spam progress
+          { autoReload: false }, // Do NOT reload immediately
+        );
+      } catch (e) {
+        if (__DEV__) {
+          console.warn('[OtaProvider] Silent background update failed:', e);
+        }
+      }
+    },
+    [getEffectiveConfig],
+  );
+
   /**
    * Check for updates from the manifest.
    * Uses a ref to guard against concurrent calls (avoids stale closure).
@@ -160,11 +221,12 @@ export function OtaProvider({
     setStatus(OtaStatus.CHECKING);
     setMessage('Checking for updates...');
 
-    const log = createOtaLogger(config.onEvent);
+    const effectiveConfig = await getEffectiveConfig();
+    const log = createOtaLogger(effectiveConfig.onEvent);
     log.emit(OtaEvent.CHECK_UPDATE);
 
     try {
-      const remotePatches = await fetchOtaManifest(config);
+      const remotePatches = await fetchOtaManifest(effectiveConfig);
       const metadata = await loadMetadata(config.baseAppVersion);
       const localV = metadata.currentVersion;
       console.log('[OtaProvider] checkUpdates | localV:', localV, 'remotePatches count:', remotePatches.length);
@@ -210,24 +272,7 @@ export function OtaProvider({
       isCheckingRef.current = false;
       setIsChecking(false);
     }
-  }, [config, executeApplyUpdate, isDebugUpdateEnabled]);
-
-  const downloadBackgroundUpdate = async (
-    patchList: OtaPatch[],
-    localV: number,
-    targetV: number,
-  ) => {
-    const directPatch = patchList.find(
-      p => p.fromVersion === localV && p.toVersion === targetV,
-    );
-    if (!directPatch) return;
-
-    console.warn(
-      '[OtaProvider] BACKGROUND_DOWNLOAD mode is not yet implemented. ' +
-      'Patches were found but no download occurred. ' +
-      'Use MANUAL or ON_APP_START mode for now.',
-    );
-  };
+  }, [config, executeApplyUpdate, isDebugUpdateEnabled, downloadBackgroundUpdate, getEffectiveConfig]);
 
   /**
    * Bootstrap: runs once on mount.
@@ -301,12 +346,22 @@ export function OtaProvider({
   }, []);
 
   /**
-   * AppState listener for ON_APP_FOREGROUND mode
+   * AppState listener for ON_APP_FOREGROUND mode and silent background reload
    */
   useEffect(() => {
     const subscription = AppState.addEventListener(
       'change',
       (nextAppState: AppStateStatus) => {
+        // When going into background: if update is downloaded and ready, reload bundle silently
+        if (
+          appState.current === 'active' &&
+          nextAppState.match(/inactive|background/) &&
+          pendingReloadRef.current
+        ) {
+          pendingReloadRef.current = false;
+          NativeBsPatch.reloadBundle();
+        }
+
         if (
           appState.current.match(/inactive|background/) &&
           nextAppState === 'active' &&
@@ -363,10 +418,12 @@ export function OtaProvider({
     pendingCount,
     isChecking,
     metrics,
+    isUpdateReady,
     applyUpdate,
     resetToFactory,
     markAsHealthy,
     checkUpdate: checkUpdates,
+    reloadBundle: () => NativeBsPatch.reloadBundle(),
   };
 
   // Logic to determine if we should block the UI

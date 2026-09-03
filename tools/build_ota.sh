@@ -42,6 +42,8 @@ fi
 FLAVOR="dev"
 ACTION="ota"
 PLATFORM_ARG=""
+APP_VERSION_ARG=""
+NON_INTERACTIVE=false
 
 PUSH_REMOTE=false
 # Arg parsing
@@ -49,6 +51,8 @@ while [[ "$#" -gt 0 ]]; do
   case $1 in
     --platform) PLATFORM_ARG="$2"; shift ;;
     --flavor) FLAVOR="$2"; shift ;;
+    --app-version) APP_VERSION_ARG="$2"; shift ;;
+    -y|--yes|--non-interactive) NON_INTERACTIVE=true ;;
     --push) PUSH_REMOTE=true ;;
     reset|base) ACTION="$1" ;;
     setup) ACTION="$1" ;;
@@ -239,18 +243,110 @@ sha256() {
   shasum -a 256 "$1" | awk '{print $1}'
 }
 
-# ── Extract APP_VERSION from otaConfig.ts ─────────────────────────────────────
-APP_VERSION=$(node -e "
+# ── Auto-Detect APP_VERSION ──────────────────────────────────────────────────
+APP_VERSION_INFO=$(node -e "
   const fs = require('fs');
-  const content = fs.readFileSync('$ROOT/src/ota/otaConfig.ts', 'utf8');
-  const match = content.match(/export const APP_VERSION = ['\"](.+?)['\"]/);
-  console.log(match ? match[1] : 'unknown');
+  const path = require('path');
+  const root = '$ROOT';
+  const cliOverride = '$APP_VERSION_ARG';
+
+  if (cliOverride && cliOverride !== '') {
+    console.log(JSON.stringify({ version: cliOverride, source: 'CLI --app-version' }));
+    process.exit(0);
+  }
+
+  // 1. Try android/app/build.gradle (most reliable for Android release)
+  try {
+    const gradlePath = path.join(root, 'android/app/build.gradle');
+    if (fs.existsSync(gradlePath)) {
+      const content = fs.readFileSync(gradlePath, 'utf8');
+      const match = content.match(/versionName\\s+[\"']([^\"']+)[\"']/);
+      if (match && match[1] !== '0.0.0' && match[1] !== '0.0.1') {
+        console.log(JSON.stringify({ version: match[1], source: 'android/app/build.gradle' }));
+        process.exit(0);
+      }
+    }
+  } catch (e) {}
+
+  // 2. Try ios project.pbxproj (most reliable for iOS release)
+  try {
+    const iosDir = path.join(root, 'ios');
+    if (fs.existsSync(iosDir)) {
+      const files = fs.readdirSync(iosDir);
+      for (const f of files) {
+        if (f.endsWith('.xcodeproj')) {
+          const pbxPath = path.join(iosDir, f, 'project.pbxproj');
+          if (fs.existsSync(pbxPath)) {
+            const content = fs.readFileSync(pbxPath, 'utf8');
+            const match = content.match(/MARKETING_VERSION\\s*=\\s*([^;]+);/);
+            if (match && match[1].trim() !== '0.0.0' && match[1].trim() !== '0.0.1') {
+              console.log(JSON.stringify({ version: match[1].trim(), source: 'ios/' + f }));
+              process.exit(0);
+            }
+          }
+        }
+      }
+    }
+  } catch (e) {}
+
+  // 3. Try package.json
+  try {
+    const pkgPath = path.join(root, 'package.json');
+    if (fs.existsSync(pkgPath)) {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+      if (pkg.version && pkg.version !== '0.0.0' && pkg.version !== '0.0.1') {
+        console.log(JSON.stringify({ version: pkg.version, source: 'package.json' }));
+        process.exit(0);
+      }
+    }
+  } catch (e) {}
+
+  // 4. Fallback: src/ota/otaConfig.ts
+  try {
+    const otaConfigPath = path.join(root, 'src/ota/otaConfig.ts');
+    if (fs.existsSync(otaConfigPath)) {
+      const content = fs.readFileSync(otaConfigPath, 'utf8');
+      const match = content.match(/export const APP_VERSION = ['\"](.+?)['\"]/);
+      if (match) {
+        console.log(JSON.stringify({ version: match[1], source: 'src/ota/otaConfig.ts' }));
+        process.exit(0);
+      }
+    }
+  } catch (e) {}
+
+  console.log(JSON.stringify({ version: 'unknown', source: 'none' }));
 ")
 
-if [ "$APP_VERSION" == "unknown" ]; then
-  echo "ERROR: Could not find APP_VERSION in otaConfig.ts"
+APP_VERSION=$(node -e "try { console.log(JSON.parse('$APP_VERSION_INFO').version); } catch(e) { console.log('unknown'); }")
+APP_VERSION_SOURCE=$(node -e "try { console.log(JSON.parse('$APP_VERSION_INFO').source); } catch(e) { console.log('none'); }")
+
+# Interactive confirmation / prompt:
+# Prompt if running in an interactive terminal, not in reset mode, and no explicit flags passed
+if [ -t 0 ] && [ -z "$APP_VERSION_ARG" ] && [ "$NON_INTERACTIVE" = false ] && [ "$ACTION" != "reset" ]; then
+  echo ""
+  echo "────────────────────────────────────────────────────────"
+  if [ "$APP_VERSION" != "unknown" ]; then
+    echo "  Detected Native App Version: $APP_VERSION ($APP_VERSION_SOURCE)"
+    read -p "  Enter App Version to build [Press Enter for '$APP_VERSION']: " USER_INPUT_VER
+  else
+    read -p "  Enter Native App Version to build (e.g. 1.0.0): " USER_INPUT_VER
+  fi
+  echo "────────────────────────────────────────────────────────"
+  echo ""
+
+  if [ -n "$USER_INPUT_VER" ]; then
+    APP_VERSION=$(echo "$USER_INPUT_VER" | tr -d ' ')
+    APP_VERSION_SOURCE="User Input"
+  fi
+fi
+
+if [ "$APP_VERSION" == "unknown" ] || [ -z "$APP_VERSION" ]; then
+  echo "ERROR: Native App Version is required to build OTA updates."
+  echo "       Please enter a valid version or use: ./build_ota.sh --app-version <version>"
   exit 1
 fi
+
+echo "  ✓ Building OTA for APP_VERSION=$APP_VERSION (Source: $APP_VERSION_SOURCE)"
 
 # ── Reset ─────────────────────────────────────────────────────────────────────
 if [ "$ACTION" = "reset" ]; then

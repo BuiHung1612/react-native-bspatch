@@ -2,6 +2,9 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <zlib.h>
+#import <CommonCrypto/CommonHMAC.h>
+#import <CommonCrypto/CommonDigest.h>
+#import <Security/Security.h>
 #import <React/RCTLog.h>
 #import <React/RCTReloadCommand.h>
 #import <SSZipArchive/SSZipArchive.h>
@@ -151,10 +154,148 @@ RCT_EXPORT_METHOD(decompressGzip:(NSString *)sourcePath
     });
 }
 
+RCT_EXPORT_METHOD(verifySignature:(NSString *)filePath
+                  signature:(NSString *)signature
+                  publicKey:(NSString *)publicKey
+                  resolve:(RCTPromiseResolveBlock)resolve
+                  reject:(RCTPromiseRejectBlock)reject)
+{
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSString *cleanKey = [publicKey stringByReplacingOccurrencesOfString:@"-----BEGIN PUBLIC KEY-----" withString:@""];
+        cleanKey = [cleanKey stringByReplacingOccurrencesOfString:@"-----END PUBLIC KEY-----" withString:@""];
+        cleanKey = [cleanKey stringByReplacingOccurrencesOfString:@"-----BEGIN RSA PUBLIC KEY-----" withString:@""];
+        cleanKey = [cleanKey stringByReplacingOccurrencesOfString:@"-----END RSA PUBLIC KEY-----" withString:@""];
+        cleanKey = [cleanKey stringByReplacingOccurrencesOfString:@"\n" withString:@""];
+        cleanKey = [cleanKey stringByReplacingOccurrencesOfString:@"\r" withString:@""];
+        cleanKey = [cleanKey stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+
+        NSData *keyData = [[NSData alloc] initWithBase64EncodedString:cleanKey options:NSDataBase64DecodingIgnoreUnknownCharacters];
+        NSData *expectedSig = [[NSData alloc] initWithBase64EncodedString:signature options:NSDataBase64DecodingIgnoreUnknownCharacters];
+
+        if (!keyData || !expectedSig) {
+            resolve(@(NO));
+            return;
+        }
+
+        // Calculate SHA256 of file stream
+        NSInputStream *stream = [NSInputStream inputStreamWithFileAtPath:filePath];
+        if (!stream) {
+            resolve(@(NO));
+            return;
+        }
+        [stream open];
+
+        CC_SHA256_CTX shaCtx;
+        CC_SHA256_Init(&shaCtx);
+        uint8_t buffer[65536];
+        while ([stream hasBytesAvailable]) {
+            NSInteger bytesRead = [stream read:buffer maxLength:sizeof(buffer)];
+            if (bytesRead > 0) {
+                CC_SHA256_Update(&shaCtx, buffer, (CC_LONG)bytesRead);
+            } else if (bytesRead < 0) {
+                [stream close];
+                resolve(@(NO));
+                return;
+            }
+        }
+        [stream close];
+
+        unsigned char sha256[CC_SHA256_DIGEST_LENGTH];
+        CC_SHA256_Final(sha256, &shaCtx);
+        NSData *sha256Data = [NSData dataWithBytes:sha256 length:CC_SHA256_DIGEST_LENGTH];
+
+        // 1. Try RSA Public Key
+        NSDictionary *rsaParams = @{
+            (id)kSecAttrKeyType: (id)kSecAttrKeyTypeRSA,
+            (id)kSecAttrKeyClass: (id)kSecAttrKeyClassPublic,
+        };
+        CFErrorRef rsaErr = NULL;
+        SecKeyRef rsaKey = SecKeyCreateWithData((__bridge CFDataRef)keyData, (__bridge CFDictionaryRef)rsaParams, &rsaErr);
+        if (rsaKey) {
+            CFErrorRef verifyErr = NULL;
+            Boolean isValid = SecKeyVerifySignature(
+                rsaKey,
+                kSecKeyAlgorithmRSASignatureDigestPKCS1v15SHA256,
+                (__bridge CFDataRef)sha256Data,
+                (__bridge CFDataRef)expectedSig,
+                &verifyErr
+            );
+            CFRelease(rsaKey);
+            if (!verifyErr) {
+                resolve(@(isValid ? YES : NO));
+                return;
+            }
+        }
+
+        // 2. Try ECDSA Public Key
+        NSDictionary *ecParams = @{
+            (id)kSecAttrKeyType: (id)kSecAttrKeyTypeECSECPrimeRandom,
+            (id)kSecAttrKeyClass: (id)kSecAttrKeyClassPublic,
+        };
+        CFErrorRef ecErr = NULL;
+        SecKeyRef ecKey = SecKeyCreateWithData((__bridge CFDataRef)keyData, (__bridge CFDictionaryRef)ecParams, &ecErr);
+        if (ecKey) {
+            CFErrorRef verifyErr = NULL;
+            Boolean isValid = SecKeyVerifySignature(
+                ecKey,
+                kSecKeyAlgorithmECDSASignatureDigestX962SHA256,
+                (__bridge CFDataRef)sha256Data,
+                (__bridge CFDataRef)expectedSig,
+                &verifyErr
+            );
+            CFRelease(ecKey);
+            if (!verifyErr) {
+                resolve(@(isValid ? YES : NO));
+                return;
+            }
+        }
+
+        // 3. Fallback: HMAC-SHA256
+        NSInputStream *hmacStream = [NSInputStream inputStreamWithFileAtPath:filePath];
+        if (!hmacStream) {
+            resolve(@(NO));
+            return;
+        }
+        [hmacStream open];
+
+        CCHmacContext ctx;
+        CCHmacInit(&ctx, kCCHmacAlgSHA256, keyData.bytes, keyData.length);
+        while ([hmacStream hasBytesAvailable]) {
+            NSInteger bytesRead = [hmacStream read:buffer maxLength:sizeof(buffer)];
+            if (bytesRead > 0) {
+                CCHmacUpdate(&ctx, buffer, (CC_LONG)bytesRead);
+            } else if (bytesRead < 0) {
+                [hmacStream close];
+                resolve(@(NO));
+                return;
+            }
+        }
+        [hmacStream close];
+
+        unsigned char hmac[CC_SHA256_DIGEST_LENGTH];
+        CCHmacFinal(&ctx, hmac);
+
+        BOOL isValid = (expectedSig.length == CC_SHA256_DIGEST_LENGTH) &&
+                       (memcmp(expectedSig.bytes, hmac, CC_SHA256_DIGEST_LENGTH) == 0);
+        resolve(@(isValid));
+    });
+}
+
+RCT_EXPORT_METHOD(getAppVersion:(RCTPromiseResolveBlock)resolve
+                  reject:(RCTPromiseRejectBlock)reject)
+{
+    NSString *version = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
+    if (!version || version.length == 0) {
+        reject(@"ERR_NO_VERSION", @"CFBundleShortVersionString is missing in iOS Info.plist", nil);
+    } else {
+        resolve(version);
+    }
+}
+
 - (NSData *)decompressGzipData:(NSData *)compressed {
     // Decompress gzip using zlib directly
     // gzip adds a 10-byte header + 8-byte footer over the raw zlib stream
-    const size_t chunkSize = 32768;
+    const size_t chunkSize = 65536;
     z_stream strm;
     memset(&strm, 0, sizeof(strm));
 

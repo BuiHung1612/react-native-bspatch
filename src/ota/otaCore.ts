@@ -129,18 +129,21 @@ export const verifySignature = async (
 ): Promise<boolean> => {
     if (!signature || !publicKey) return true; // Skip if not configured
     try {
-        // Read file content
-        const fileData = await ReactNativeBlobUtil.fs.readFile(filePath, 'base64');
+        // Fast-path: use Native streaming HMAC-SHA256 (avoids Base64 conversion and JS thread blocking)
+        if (typeof NativeBsPatch.verifySignature === 'function') {
+            const isValid = await NativeBsPatch.verifySignature(filePath, signature, publicKey);
+            if (!isValid && __DEV__) {
+                console.warn('[otaCore] Signature mismatch');
+            }
+            return isValid;
+        }
 
-        // Convert base64 to WordArray for CryptoJS
+        // Fallback to JS CryptoJS if native module is running an older binary
+        const fileData = await ReactNativeBlobUtil.fs.readFile(filePath, 'base64');
         const fileWords = CryptoJS.enc.Base64.parse(fileData);
         const keyWords = CryptoJS.enc.Base64.parse(publicKey);
         const signatureWords = CryptoJS.enc.Base64.parse(signature);
-
-        // Compute HMAC
         const hmac = CryptoJS.HmacSHA256(fileWords, keyWords);
-
-        // Compare computed HMAC with provided signature
         const isValid = hmac.toString(CryptoJS.enc.Base64) === signatureWords.toString(CryptoJS.enc.Base64);
 
         if (!isValid && __DEV__) {
@@ -507,6 +510,7 @@ export const applyOtaPatchInternal = async (
         metrics?: OtaMetrics,
     ) => void,
     onProgress: (percent: number) => void,
+    options: { autoReload?: boolean } = { autoReload: true },
 ) => {
     if (__DEV__ && config.allowDebugUpdates !== true) {
         onStatus(
@@ -531,13 +535,26 @@ export const applyOtaPatchInternal = async (
     try {
         // ── Step 1: Version Compatibility ──
         if (patch.minAppVersion) {
-            if (!semverGte(config.appVersion, patch.minAppVersion)) {
+            let currentAppVer = config.appVersion;
+            if (!currentAppVer && typeof NativeBsPatch.getAppVersion === 'function') {
+                try {
+                    currentAppVer = await NativeBsPatch.getAppVersion();
+                } catch {
+                    currentAppVer = undefined;
+                }
+            }
+            if (!currentAppVer) {
+                throw new Error(
+                    `[otaCore] Cannot verify minAppVersion: Native App Version could not be determined.`,
+                );
+            }
+            if (!semverGte(currentAppVer, patch.minAppVersion)) {
                 log.emit(OtaEvent.VERSION_INCOMPATIBLE, {
-                    message: `App ${config.appVersion} < required ${patch.minAppVersion}`,
+                    message: `App ${currentAppVer} < required ${patch.minAppVersion}`,
                     version: patch.toVersion,
                 });
                 throw new Error(
-                    `Native app ${config.appVersion} is too old. Update to ${patch.minAppVersion}+ first.`,
+                    `Native app ${currentAppVer} is too old. Update to ${patch.minAppVersion}+ first.`,
                 );
             }
         }
@@ -848,17 +865,23 @@ export const applyOtaPatchInternal = async (
         });
 
         // ── Step 11: Reload ──
-        // CRITICAL: Mark healthy BEFORE reload — reloadBundle() calls Runtime.exit(0)
-        // and JS will NOT run again before restart. Native OtaBundleResolver sets
-        // lastLaunchSuccessful=false before loading the new bundle. Without this call,
-        // the next cold boot sees false → rollback to previous version.
+        // Mark healthy BEFORE reload — reloadBundle() calls Runtime.exit(0)
         NativeBsPatch.markAsHealthy();
-        if (__DEV__) {
-            console.log(
-                `[otaCore] V${patch.toVersion} marked healthy — reloading.`,
-            );
+
+        if (options.autoReload !== false) {
+            if (__DEV__) {
+                console.log(
+                    `[otaCore] V${patch.toVersion} marked healthy — reloading.`,
+                );
+            }
+            NativeBsPatch.reloadBundle();
+        } else {
+            if (__DEV__) {
+                console.log(
+                    `[otaCore] V${patch.toVersion} prepared silently in background — will apply on next launch.`,
+                );
+            }
         }
-        NativeBsPatch.reloadBundle();
     } catch (error) {
         if (__DEV__) {
             console.error('[otaCore] Pipeline failed:', error);
@@ -952,11 +975,18 @@ export const applyOtaPatchInternal = async (
                     );
                 }
 
-                onStatus(
-                    OtaStatus.SUCCESS,
-                    `Fallback successful! Reloading...`,
-                );
-                NativeBsPatch.reloadBundle();
+                if (options.autoReload !== false) {
+                    onStatus(
+                        OtaStatus.SUCCESS,
+                        `Fallback successful! Reloading...`,
+                    );
+                    NativeBsPatch.reloadBundle();
+                } else {
+                    onStatus(
+                        OtaStatus.SUCCESS,
+                        `Fallback bundle prepared silently in background.`,
+                    );
+                }
                 return;
             } catch (fallbackError) {
                 if (__DEV__) {
