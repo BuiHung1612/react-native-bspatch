@@ -21,6 +21,8 @@ export * from './ota/OtaProvider';
 export * from './ota/types';
 export { initOtaAssetResolver, resetOtaAssetResolver } from './ota/otaAssetResolver';
 export { GitHubReleaseStorageProvider } from './ota/storage/GitHubReleaseStorage';
+export { GitHubRawStorageProvider } from './ota/storage/GitHubRawStorage';
+export { CustomStorageProvider } from './ota/storage/CustomStorage';
 
 export default {
   applyPatch,

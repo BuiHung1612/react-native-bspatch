@@ -16,7 +16,18 @@ coverage
 lib
 compile_commands.json
 
-**/tsconfig.tsbuildinfo
 android/.cxx
 android/.gradle
 android/.idea
+
+# OTA & Local tools artifacts
+tools/bsdiff
+output/
+android/output/
+ios/output/
+ota_registry.json
+ota_registry.json.tmp
+*.patch
+*.hbc
+*.pem
+*.tgz
