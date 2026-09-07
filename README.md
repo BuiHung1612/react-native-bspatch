@@ -363,6 +363,7 @@ Add these to your `package.json` (or use the existing ones in this project):
     "react-native-bspatch": "bash ./src/native_modules/react-native-bspatch/tools/build_ota.sh",
     "ota:setup":   "yarn react-native-bspatch setup",
     "ota:init":    "yarn react-native-bspatch base",
+    "ota:seed":    "yarn react-native-bspatch seed",
     "ota:build":   "yarn react-native-bspatch",
     "ota:clean":   "yarn react-native-bspatch reset"
   }
@@ -372,22 +373,19 @@ Add these to your `package.json` (or use the existing ones in this project):
 ### Workflow
 
 ```
-ota:setup ──► ota:init ──► ota:build ──► (ota:build ◄── repeat for each release)
-   │             │            │
-   │             │            └── 1. Bundle JS → Hermes bytecode (.hbc)
-   │             │                2. Compare assets → generate asset-manifest-{ver}.json
-   │             │                3. bsdiff against previous bundle → .patch files
-   │             │                4. Upload to server + update ota_registry.json
-   │             │                5. Write otaPatches.generated.ts for bundled patches fallback
-   │             │
-   │             └── First build only: creates base bundle from APK/IPA.
-   │                                Stores base asset manifest so subsequent builds know
-   │                                which assets are already in the APK and skip them.
+ota:setup ──► (Build Release APK/IPA) ──► ota:build ──► (repeat for each OTA update)
+   │                  │                       │
+   │                  │                       └── Incremental patch from Base Bundle v1
+   │                  │
+   │                  └── Automatic Base Capture (Gradle & Xcode):
+   │                      Each release build automatically saves `bundle_{appVersion}_v1_{platform}.hbc`.
+   │                      No manual `ota:init` is required!
    │
    └── Patches native integration into project files:
          • iOS: AppDelegate.swift — adds bundleURL() override
-         • iOS: project.pbxproj — adds build-phase script to sync bundle → ios/output/
+         • iOS: project.pbxproj — syncs and auto-captures base bundle on Release archive
          • Android: MainApplication.kt — adds OtaBundleResolver.resolve() call
+         • Android: app/build.gradle — auto-captures base bundle upon assembleRelease / bundleRelease
          Idempotent: safe to run multiple times; skips already-patched files.
 ```
 
@@ -395,13 +393,21 @@ ota:setup ──► ota:init ──► ota:build ──► (ota:build ◄── 
 
 | Command | Action |
 |---|---|
-| `yarn ota:setup` | Inject OTA integration into AppDelegate.swift, MainApplication.kt, project.pbxproj. Run once per project. |
-| `yarn ota:init` | First release: build base APK/IPA + bundle + base asset manifest. Creates `ota_registry.json`. |
-| `yarn ota:build` | Subsequent releases: generate incremental .patch from previous bundle, upload to server, update registry. |
+| `yarn ota:setup` | Inject OTA integration into AppDelegate.swift, MainApplication.kt, project.pbxproj, and app/build.gradle. |
+| `yarn ota:build` | Generate incremental `.patch` from previous bundle, upload to server, update registry. |
+| `yarn ota:seed --apk <path>` | **Zero Mismatch Recovery:** Seed base bundle directly from an existing release APK/AAB. |
+| `yarn ota:seed --ipa <path>` | **Zero Mismatch Recovery:** Seed base bundle directly from an existing release IPA. |
+| `yarn ota:init` | Manual first release: build base APK/IPA + bundle + base asset manifest. Creates `ota_registry.json`. |
 | `yarn ota:build --platform android` | Build Android only |
 | `yarn ota:build --platform ios` | Build iOS only |
 | `yarn ota:build --flavor staging` | Build with flavor "staging" (default: "dev") |
 | `yarn ota:clean` | Wipe `ota_registry.json` + output files. Preserves base asset manifests so `ota:build` still works after clean. |
+
+> [!TIP]
+> **Zero Mismatch & Fail-Safe Protection:**
+> 1. **Auto-Capture:** When you build a Release APK/AAB or Archive on Xcode, the bundle is automatically captured into `output/` as Base Bundle v1.
+> 2. **Seed Binary:** If you forgot to capture the base bundle and already submitted your APK/IPA to the Store, run `yarn ota:seed --apk ./app-release.apk`. It extracts the exact byte-for-byte bundle directly from the release binary, guaranteeing 100% hash match.
+> 3. **Fail-Safe Guard:** `ota:build` will refuse to generate an update if no authentic Base Bundle v1 is found, preventing corrupt patches that trigger full-bundle fallback downloads.
 
 ### How It Works
 
@@ -417,11 +423,10 @@ ota:setup ──► ota:init ──► ota:build ──► (ota:build ◄── 
 # 1. Add the npm scripts to package.json (or run directly)
 bash ./src/native_modules/react-native-bspatch/tools/build_ota.sh setup
 
-# 2. Initialize the first release (creates base APK + registry)
-yarn ota:init
-# Or per platform:
-yarn ota:init --platform android   # Android only
-yarn ota:init --platform ios       # iOS only
+# 2. Build your app normally for App Store / Google Play
+# Gradle and Xcode will automatically capture the base bundle (v1)!
+# OR seed from an existing release binary:
+yarn ota:seed --apk ./release.apk
 
 # 3. For each subsequent release:
 yarn ota:build

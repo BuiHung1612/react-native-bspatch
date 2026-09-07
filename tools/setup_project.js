@@ -60,6 +60,13 @@ const XCODE_BUNDLE_SYNC_SNIPPET = [
     '  mkdir -p "$(dirname \\"$DEST_FILE\\")"',
     '  cp "$BUNDLE_RESULT" "$DEST_FILE"',
     '  echo "Bundle synced to $DEST_FILE"',
+    '  if [ "$CONFIGURATION" = "Release" ]; then',
+    '    APP_VER="${MARKETING_VERSION:-1.0.0}"',
+    '    mkdir -p "$PROJECT_DIR/output"',
+    '    cp "$BUNDLE_RESULT" "$PROJECT_DIR/output/bundle_${APP_VER}_v1_ios_production.hbc"',
+    '    cp "$BUNDLE_RESULT" "$PROJECT_DIR/output/bundle_${APP_VER}_v1_ios_development.hbc" 2>/dev/null || true',
+    '    echo "[react-native-bspatch] ✓ Auto-captured iOS base bundle v1 to output/"',
+    '  fi',
     'else',
     '  echo "Bundle not found at $BUNDLE_RESULT (skipping sync)"',
     'fi',
@@ -67,6 +74,48 @@ const XCODE_BUNDLE_SYNC_SNIPPET = [
 
 // The escaped version as it appears in pbxproj shellScript value
 const XCODE_BUNDLE_SYNC_MARKER = 'react-native-bspatch] Sync compiled bundle to output/';
+
+const ANDROID_GRADLE_MARKER = '[react-native-bspatch] Auto-capture Base Bundle';
+const ANDROID_GRADLE_SNIPPET = `
+// [react-native-bspatch] Auto-capture Base Bundle on Release builds
+afterEvaluate {
+    android.applicationVariants.all { variant ->
+        if (variant.buildType.name == 'release') {
+            def flavorName = (variant.flavorName ?: 'development').toLowerCase()
+            if (flavorName == 'dev') flavorName = 'development'
+            if (flavorName == 'prod') flavorName = 'production'
+            def versionName = variant.versionName ?: '1.0.0'
+            def capVariant = variant.name.capitalize()
+            def bundleTask = tasks.findByName("createBundle\${capVariant}JsAndAssets")
+            if (bundleTask != null) {
+                def saveTask = tasks.register("saveOtaBaseBundle\${capVariant}") {
+                    doLast {
+                        def bundleDir = file("\$buildDir/generated/assets/react/\${variant.name}")
+                        def bundleFile = file("\$bundleDir/index.android.bundle")
+                        def outputDir = file("\$rootDir/output")
+                        if (bundleFile.exists()) {
+                            outputDir.mkdirs()
+                            def destName = "bundle_\${versionName}_v1_android_\${flavorName}.hbc"
+                            copy {
+                                from bundleFile
+                                into outputDir
+                                rename { destName }
+                            }
+                            println "[react-native-bspatch] ✓ Auto-captured base bundle: android/output/\${destName}"
+                        }
+                    }
+                }
+                bundleTask.finalizedBy(saveTask)
+            }
+        }
+    }
+}
+`;
+
+function patchAppBuildGradle(content) {
+    if (content.includes(ANDROID_GRADLE_MARKER)) return content;
+    return content.trimEnd() + '\n' + ANDROID_GRADLE_SNIPPET;
+}
 
 const IOS_IMPORT = 'import react_native_bspatch';
 const IOS_BUNDLE_URL_OVERRIDE = `
@@ -275,12 +324,28 @@ function main() {
         patchFile(mainAppFiles[0], 'MainApplication.kt', patchMainApplication);
     }
 
+    const appGradleFiles = findFile(path.join(ANDROID_DIR, 'app'), (name) => name === 'build.gradle');
+    if (appGradleFiles.length === 0) {
+        console.log('  ⚠  No android/app/build.gradle found.');
+    } else {
+        patchFile(appGradleFiles[0], 'android/app/build.gradle (auto-capture base bundle)', patchAppBuildGradle);
+    }
+
+    // Ensure android/output/ exists
+    const androidOutputDir = path.join(ANDROID_DIR, 'output');
+    if (!fs.existsSync(androidOutputDir)) {
+        fs.mkdirSync(androidOutputDir, { recursive: true });
+        console.log('  ✓  Created android/output/ directory');
+    }
+
     console.log('\n=== Setup Complete ===');
     console.log('Next steps:');
-    console.log('  1. iOS: Run Xcode build once to populate ios/output/main.jsbundle');
-    console.log('         (or run: yarn ota:init --platform ios)');
-    console.log('  2. Android: Run: yarn ota:init --platform android');
-    console.log('  3. Then: yarn ota:build to start publishing OTA updates\n');
+    console.log('  1. Base bundles will now automatically be captured on Release builds (Gradle & Xcode).');
+    console.log('  2. Or seed directly from an existing Store binary:');
+    console.log('         yarn react-native-bspatch seed --apk path/to/release.apk');
+    console.log('         yarn react-native-bspatch seed --ipa path/to/release.ipa');
+    console.log('  3. Or create base release manually: yarn ota:init');
+    console.log('  4. Then publish OTA updates safely with: yarn ota:build\n');
 }
 
 main();

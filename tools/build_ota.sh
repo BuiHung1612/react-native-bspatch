@@ -45,20 +45,41 @@ PLATFORM_ARG=""
 APP_VERSION_ARG=""
 NON_INTERACTIVE=false
 
-PUSH_REMOTE=false
+SEED_APK=""
+SEED_IPA=""
+SEED_BUNDLE=""
+FORCE_BASE=false
+
 # Arg parsing
 while [[ "$#" -gt 0 ]]; do
   case $1 in
     --platform) PLATFORM_ARG="$2"; shift ;;
     --flavor) FLAVOR="$2"; shift ;;
     --app-version) APP_VERSION_ARG="$2"; shift ;;
+    --apk) SEED_APK="$2"; ACTION="seed"; shift ;;
+    --ipa) SEED_IPA="$2"; ACTION="seed"; shift ;;
+    --bundle) SEED_BUNDLE="$2"; ACTION="seed"; shift ;;
+    --force) FORCE_BASE=true ;;
     -y|--yes|--non-interactive) NON_INTERACTIVE=true ;;
     --push) PUSH_REMOTE=true ;;
     reset|base) ACTION="$1" ;;
     setup) ACTION="$1" ;;
-    apk|ipa|seed) ACTION="base" ;; # Compatibility for legacy/seed actions
+    seed) ACTION="seed" ;;
+    apk|ipa) ACTION="base" ;; # Compatibility for legacy actions
     dev|staging|production) FLAVOR="$1" ;; # Support positional flavor
     [0-9]*) ;; # Ignore version if passed as $1 (pos 1 usually)
+    *)
+      if [[ "$1" == *.apk ]] || [[ "$1" == *.aab ]]; then
+        SEED_APK="$1"
+        ACTION="seed"
+      elif [[ "$1" == *.ipa ]]; then
+        SEED_IPA="$1"
+        ACTION="seed"
+      elif [[ "$1" == *.hbc ]] || [[ "$1" == *.bundle ]]; then
+        SEED_BUNDLE="$1"
+        ACTION="seed"
+      fi
+      ;;
   esac
   shift
 done
@@ -397,6 +418,22 @@ if [ ! -f "$BSDIFF" ]; then
   echo "  ✓ bsdiff compiled"
 fi
 
+find_hermesc() {
+  HERMESC_PATH="$ROOT/node_modules/hermes-compiler/hermesc/osx-bin/hermesc"
+  if [ ! -f "$HERMESC_PATH" ]; then
+      HERMESC_PATH="$ROOT/node_modules/react-native/sdks/hermesc/osx-bin/hermesc"
+  fi
+  if [ ! -f "$HERMESC_PATH" ]; then
+      HERMESC_PATH="$ROOT/node_modules/hermes-compiler/hermesc/linux64-bin/hermesc"
+  fi
+  if [ ! -f "$HERMESC_PATH" ]; then
+      HERMESC_PATH="$ROOT/node_modules/react-native/sdks/hermesc/linux64-bin/hermesc"
+  fi
+  if [ ! -f "$HERMESC_PATH" ]; then
+      HERMESC_PATH="$(which hermesc 2>/dev/null || echo "")"
+  fi
+}
+
 build_platform() {
   local PLATFORM="$1"
   local FLAVOR="$2"
@@ -411,9 +448,6 @@ build_platform() {
 
   echo ""
   echo ">>> Building $PLATFORM | Version: $APP_VERSION | OTA: v$CURRENT → v$NEXT"
-
-  # ── Bundle ──
-# ... (rest of the function omitted for space, but I'll make sure to replace correctly)
 
   # ── Bundle ──
   # Workspace for building
@@ -446,10 +480,7 @@ build_platform() {
   fi
 
   # Ensure Hermes bytecode format (for both iOS and Android OTA bundles)
-  HERMESC_PATH="$ROOT/node_modules/hermes-compiler/hermesc/osx-bin/hermesc"
-  if [ ! -f "$HERMESC_PATH" ]; then
-      HERMESC_PATH="$ROOT/node_modules/react-native/sdks/hermesc/osx-bin/hermesc"
-  fi
+  find_hermesc
 
   IS_HBC=false
   if [ -f "$BUNDLE_SOURCE" ]; then
@@ -588,11 +619,159 @@ EOF
   bash "$SCRIPT_DIR/upload_ota_custom.sh" "$APP_VERSION" "$FLAVOR_LOWER" "$NEXT" "$NEW_BUNDLE_PATH" "$PLATFORM"
 }
 
+seed_platform() {
+  local PLATFORM="$1"
+  local FLAVOR="$2"
+  local BINARY_PATH="$3"
+  local FLAVOR_LOWER=$(echo "$FLAVOR" | tr '[:upper:]' '[:lower:]')
+  if [ "$FLAVOR_LOWER" = "dev" ]; then FLAVOR_LOWER="development"; fi
+  if [ "$FLAVOR_LOWER" = "prod" ]; then FLAVOR_LOWER="production"; fi
+
+  local OUTPUT="$ROOT/android/output"
+  if [ "$PLATFORM" == "ios" ]; then OUTPUT="$ROOT/ios/output"; fi
+  mkdir -p "$OUTPUT"
+
+  echo ""
+  echo ">>> Seeding Base Bundle (v1) | Platform: $PLATFORM | App: $APP_VERSION | Flavor: $FLAVOR_LOWER"
+  echo "  Source binary: $BINARY_PATH"
+
+  if [ ! -f "$BINARY_PATH" ]; then
+    echo "  ❌ ERROR: Source binary file not found: $BINARY_PATH"
+    exit 1
+  fi
+
+  local TARGET_BUNDLE="$OUTPUT/bundle_${APP_VERSION}_v1_${PLATFORM}_${FLAVOR_LOWER}.hbc"
+  local BASE_ASSET_MANIFEST="$OUTPUT/base-assets_${PLATFORM}_${FLAVOR_LOWER}.json"
+  local ASSET_MANIFEST_FILE="$OUTPUT/asset-manifest-v1_${FLAVOR_LOWER}.json"
+  local TMP_DIR=$(mktemp -d)
+
+  if [ "$PLATFORM" == "android" ]; then
+    echo "  Extracting index.android.bundle from Android binary..."
+    if unzip -l "$BINARY_PATH" 2>/dev/null | grep -q "assets/index.android.bundle"; then
+      unzip -p "$BINARY_PATH" assets/index.android.bundle > "$TMP_DIR/extracted.bundle"
+    elif unzip -l "$BINARY_PATH" 2>/dev/null | grep -q "base/assets/index.android.bundle"; then
+      unzip -p "$BINARY_PATH" base/assets/index.android.bundle > "$TMP_DIR/extracted.bundle"
+    elif [[ "$BINARY_PATH" == *.bundle ]] || [[ "$BINARY_PATH" == *.hbc ]]; then
+      cp "$BINARY_PATH" "$TMP_DIR/extracted.bundle"
+    else
+      echo "  ❌ ERROR: Could not find 'assets/index.android.bundle' inside $BINARY_PATH"
+      rm -rf "$TMP_DIR"
+      exit 1
+    fi
+  else
+    echo "  Extracting main.jsbundle from iOS binary..."
+    local IPA_ENTRY=$(unzip -l "$BINARY_PATH" 2>/dev/null | grep -o 'Payload/[^/]*\.app/main\.jsbundle' | head -n 1)
+    if [ -n "$IPA_ENTRY" ]; then
+      unzip -p "$BINARY_PATH" "$IPA_ENTRY" > "$TMP_DIR/extracted.bundle"
+    elif unzip -l "$BINARY_PATH" 2>/dev/null | grep -q "main.jsbundle"; then
+      local ANY_BUNDLE=$(unzip -l "$BINARY_PATH" 2>/dev/null | grep -o '[^ ]*main\.jsbundle' | head -n 1)
+      unzip -p "$BINARY_PATH" "$ANY_BUNDLE" > "$TMP_DIR/extracted.bundle"
+    elif [[ "$BINARY_PATH" == *.bundle ]] || [[ "$BINARY_PATH" == *.hbc ]]; then
+      cp "$BINARY_PATH" "$TMP_DIR/extracted.bundle"
+    else
+      echo "  ❌ ERROR: Could not find 'main.jsbundle' inside $BINARY_PATH"
+      rm -rf "$TMP_DIR"
+      exit 1
+    fi
+  fi
+
+  # Check Hermes bytecode format (0xc6 magic number)
+  FIRST_BYTE=$(od -An -N1 -t x1 "$TMP_DIR/extracted.bundle" | tr -d ' ' || echo "")
+  if [ "$FIRST_BYTE" == "c6" ]; then
+    echo "  ✓ Bundle is verified Hermes bytecode format."
+    cp "$TMP_DIR/extracted.bundle" "$TARGET_BUNDLE"
+  else
+    echo "  Bundle is JavaScript text. Compiling to Hermes bytecode..."
+    find_hermesc
+    if [ -z "$HERMESC_PATH" ] || [ ! -f "$HERMESC_PATH" ]; then
+      echo "  ❌ ERROR: hermesc compiler not found. Cannot compile bundle to bytecode."
+      rm -rf "$TMP_DIR"
+      exit 1
+    fi
+    "$HERMESC_PATH" -emit-binary -out "$TARGET_BUNDLE" "$TMP_DIR/extracted.bundle"
+  fi
+
+  # Extract base assets manifest
+  echo "  Scanning assets from binary for base manifest..."
+  local NEW_BASE_ASSETS="{"
+  local ASSET_JSON_LIST="["
+  local FIRST=true
+
+  if [ "$PLATFORM" == "android" ]; then
+    unzip -q -o "$BINARY_PATH" "res/drawable*/*" "res/raw/*" -d "$TMP_DIR/assets_unzipped" 2>/dev/null || true
+  else
+    unzip -q -o "$BINARY_PATH" "Payload/*.app/assets/*" -d "$TMP_DIR/assets_unzipped" 2>/dev/null || true
+  fi
+
+  if [ -d "$TMP_DIR/assets_unzipped" ]; then
+    while IFS= read -r -d '' ASSET_FILE; do
+      local HASH=$(sha256 "$ASSET_FILE")
+      local FNAME=$(basename "$ASSET_FILE")
+      local EX="${FNAME##*.}"
+      local REL_PATH="${ASSET_FILE#$TMP_DIR/assets_unzipped/}"
+      
+      if [ "$NEW_BASE_ASSETS" != "{" ]; then NEW_BASE_ASSETS+=", "; fi
+      NEW_BASE_ASSETS+="\"$REL_PATH\": \"$HASH\""
+
+      if [ "$FIRST" = true ]; then FIRST=false; else ASSET_JSON_LIST+=", "; fi
+      ASSET_JSON_LIST+="{\"hash\": \"$HASH\", \"ext\": \"$EX\", \"originalPath\": \"$REL_PATH\", \"isBase\": true}"
+    done < <(find "$TMP_DIR/assets_unzipped" -type f -print0 2>/dev/null)
+  fi
+
+  NEW_BASE_ASSETS+="}"
+  ASSET_JSON_LIST+="]"
+
+  echo "$NEW_BASE_ASSETS" > "$BASE_ASSET_MANIFEST"
+  cat > "$ASSET_MANIFEST_FILE" << EOF
+{ "version": 1, "appVersion": "$APP_VERSION", "platform": "$PLATFORM", "flavor": "$FLAVOR_LOWER", "assets": $ASSET_JSON_LIST }
+EOF
+
+  rm -rf "$TMP_DIR"
+
+  local BUNDLE_HASH=$(sha256 "$TARGET_BUNDLE")
+  echo "  ✓ Base bundle v1 successfully created: $(basename "$TARGET_BUNDLE")"
+  echo "    SHA-256: $BUNDLE_HASH"
+
+  # Update registry for v1
+  node "$SCRIPT_DIR/update_registry.js" "$REGISTRY_SHARED" "$APP_VERSION" "1" "[]" "$PLATFORM" "$ASSET_MANIFEST_FILE" "$FLAVOR_LOWER"
+
+  # Push if requested
+  if [ "$PUSH_REMOTE" = true ]; then
+    echo "  Pushing seeded base bundle to remote..."
+    bash "$SCRIPT_DIR/upload_ota_custom.sh" "$APP_VERSION" "$FLAVOR_LOWER" "1" "$TARGET_BUNDLE" "$PLATFORM"
+  fi
+
+  echo "  ✓ Seeding complete for $PLATFORM!"
+}
+
 # ── Main ───────────────────────────────────────────────────────────────────
-echo "=== OTA Dual Build | App: $APP_VERSION | Flavor: $FLAVOR ==="
+echo "=== OTA Build Pipeline | App: $APP_VERSION | Flavor: $FLAVOR ==="
+
+FLAVOR_LOWER=$(echo "$FLAVOR" | tr '[:upper:]' '[:lower:]')
+if [ "$FLAVOR_LOWER" = "dev" ]; then FLAVOR_LOWER="development"; fi
+if [ "$FLAVOR_LOWER" = "prod" ]; then FLAVOR_LOWER="production"; fi
+
+# ── Seed Action ────────────────────────────────────────────────────────────
+if [ "$ACTION" = "seed" ]; then
+  if [ -n "$SEED_APK" ]; then
+    seed_platform "android" "$FLAVOR_LOWER" "$SEED_APK"
+  elif [ -n "$SEED_IPA" ]; then
+    seed_platform "ios" "$FLAVOR_LOWER" "$SEED_IPA"
+  elif [ -n "$SEED_BUNDLE" ]; then
+    PLATFORM="${PLATFORM_ARG:-android}"
+    seed_platform "$PLATFORM" "$FLAVOR_LOWER" "$SEED_BUNDLE"
+  else
+    echo "❌ Please provide a binary file to seed:"
+    echo "   ./build_ota.sh seed --apk <path-to-apk>"
+    echo "   ./build_ota.sh seed --ipa <path-to-ipa>"
+    exit 1
+  fi
+  echo ""
+  echo "=== Base Seeding Complete ==="
+  exit 0
+fi
 
 # Read current version once to coordinate across platforms
-FLAVOR_LOWER=$(echo "$FLAVOR" | tr '[:upper:]' '[:lower:]')
 CURRENT_TOTAL=0
 if [ -f "$REGISTRY_SHARED" ]; then
   CURRENT_TOTAL=$(node -e "
@@ -602,6 +781,79 @@ if [ -f "$REGISTRY_SHARED" ]; then
     } catch(e) { console.log(0); }
   ")
 fi
+
+# ── Fail-Safe Guard for OTA Updates ────────────────────────────────────────
+# If building an OTA patch but no base version (v1) exists in the registry:
+if [ "$ACTION" = "ota" ] && [ $CURRENT_TOTAL -eq 0 ]; then
+  echo "Checking for pre-existing Base Bundle v1..."
+  
+  CHECK_PLATFORMS=()
+  if [ -n "$PLATFORM_ARG" ]; then
+    CHECK_PLATFORMS=("$PLATFORM_ARG")
+  else
+    CHECK_PLATFORMS=("android" "ios")
+  fi
+
+  ALL_FOUND=true
+  MISSING_PLATFORM=""
+  for P in "${CHECK_PLATFORMS[@]}"; do
+    P_OUTPUT="$ROOT/$P/output"
+    P_BASE_BUNDLE="$P_OUTPUT/bundle_${APP_VERSION}_v1_${P}_${FLAVOR_LOWER}.hbc"
+    
+    # Check if local exists
+    if [ ! -f "$P_BASE_BUNDLE" ]; then
+      # Try downloading from remote if available
+      REMOTE_BASE_PATH="$BASE_FOLDER/$APP_VERSION/$FLAVOR_LOWER/$(basename "$P_BASE_BUNDLE")"
+      download_from_minio "$REMOTE_BASE_PATH" "$P_BASE_BUNDLE" || true
+    fi
+
+    if [ -f "$P_BASE_BUNDLE" ]; then
+      echo "  ✓ Found Base Bundle v1 for $P: $(basename "$P_BASE_BUNDLE")"
+      # Auto-adopt base bundle in registry
+      node "$SCRIPT_DIR/update_registry.js" "$REGISTRY_SHARED" "$APP_VERSION" "1" "[]" "$P" "" "$FLAVOR_LOWER"
+    else
+      ALL_FOUND=false
+      MISSING_PLATFORM="$P"
+    fi
+  done
+
+  if [ "$ALL_FOUND" = true ]; then
+    echo "  ✓ Base bundle v1 verified and registered. Proceeding with incremental OTA update..."
+    CURRENT_TOTAL=1
+  else
+    if [ "$FORCE_BASE" = true ]; then
+      echo "  ⚠ Warning: --force flag detected. Creating base bundle v1 from current working tree..."
+      ACTION="base"
+    else
+      echo ""
+      echo "╔══════════════════════════════════════════════════════════════════════════════════════════╗"
+      echo "║ ❌ CANNOT BUILD OTA: MISSING BASE BUNDLE (v1)                                            ║"
+      echo "╠══════════════════════════════════════════════════════════════════════════════════════════╣"
+      echo "║ App Version: $APP_VERSION | Flavor: $FLAVOR_LOWER | Missing: $MISSING_PLATFORM"
+      echo "║"
+      echo "║ No base bundle (v1) was found for this app version (neither locally nor on remote).     ║"
+      echo "║ If an OTA update is built now, it would generate a base bundle from your current         ║"
+      echo "║ working tree, which will MISMATCH the version installed on user devices and force a      ║"
+      echo "║ 100% full-bundle download (wasting bandwidth and bypassing patch benefits).              ║"
+      echo "║"
+      echo "║ How to resolve:                                                                          ║"
+      echo "║ 1. If you already have the release APK/IPA submitted to Google Play / App Store:         ║"
+      echo "║    Seed the exact base bundle from your release binary:                                  ║"
+      echo "║      ./build_ota.sh seed --apk <path-to-apk>                                             ║"
+      echo "║      ./build_ota.sh seed --ipa <path-to-ipa>                                             ║"
+      echo "║"
+      echo "║ 2. If you are preparing a brand new Store release right now from this commit:            ║"
+      echo "║      ./build_ota.sh base                                                                 ║"
+      echo "║"
+      echo "║ 3. If you really want to force create base v1 from current code:                         ║"
+      echo "║      ./build_ota.sh --force                                                              ║"
+      echo "╚══════════════════════════════════════════════════════════════════════════════════════════╝"
+      echo ""
+      exit 1
+    fi
+  fi
+fi
+
 TARGET_OTA=$((CURRENT_TOTAL + 1))
 
 if [ -n "$PLATFORM_ARG" ]; then
