@@ -539,6 +539,7 @@ react-native-bspatch/
 │   └── OtaBundleResolver.swift       # Bundle resolution + crash rollback (before JS)
 ├── cpp/bsdiff/                       # bspatch (C, mmap)
 └── tools/
+    ├── cli.js                        # bin entry (Yarn Berry runs bins with node)
     ├── build_ota.sh                  # CLI: patch / reset / setup / version
     ├── upload_ota.sh                 # Upload to Cloudflare R2 or a GitHub storage repo
     ├── update_registry.js            # Writes ota_registry.json entries + signatures

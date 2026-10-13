@@ -56,7 +56,7 @@
     "access": "public"
   },
   "bin": {
-    "react-native-bspatch": "./tools/build_ota.sh"
+    "react-native-bspatch": "./tools/cli.js"
   },
   "scripts": {
     "setup": "node ./tools/setup_project.js",
