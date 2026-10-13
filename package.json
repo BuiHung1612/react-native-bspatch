@@ -40,7 +40,7 @@
   "peerDependencies": {
     "react": "*",
     "react-native": "*",
-    "react-native-blob-util": ">=0.24.12"
+    "react-native-blob-util": ">=0.24.11"
   },
   "repository": {
     "type": "git",
