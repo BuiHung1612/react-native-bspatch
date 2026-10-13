@@ -95,7 +95,6 @@ if (!signingKey) {
     }
     const signer = crypto.createSign('SHA256');
     signer.update(fs.readFileSync(filePath));
-    console.log(`  ✓ Signed ${file}`);
     return signer.sign(signingKey, 'base64');
   };
 
@@ -138,6 +137,9 @@ if (!signingKey) {
 // ── Write updated registry ───────────────────────────────────────────────────
 fs.mkdirSync(path.dirname(registryPath), { recursive: true });
 fs.writeFileSync(registryPath, JSON.stringify(registry, null, 2) + '\n');
+// Same layout as build_ota.sh step details
+const patchCount = newPatches.length;
 console.log(
-  `  ✓ Registry updated | App: ${appVersion} | Flavor: ${flavor} | latestOta: ${toOtaVersion}`,
+  `        ${'entries'.padEnd(18)} full bundle${patchCount ? ` + ${patchCount} patch${patchCount > 1 ? 'es' : ''}` : ''}` +
+    (signingKey ? ' · signed' : ' · unsigned (no ota_private_key.pem)'),
 );

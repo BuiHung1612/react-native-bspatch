@@ -65,6 +65,23 @@ FLAVOR_LOWER=$(echo "$FLAVOR" | tr '[:upper:]' '[:lower:]')
 if [ "$FLAVOR_LOWER" = "dev" ]; then FLAVOR_LOWER="development"; fi
 if [ "$FLAVOR_LOWER" = "prod" ]; then FLAVOR_LOWER="production"; fi
 
+# ── Output (exported: upload_ota.sh prints in the same layout) ────────────────
+if [ -t 1 ]; then
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; RESET=$'\033[0m'
+else
+  BOLD=""; DIM=""; GREEN=""; YELLOW=""; RESET=""
+fi
+# Pad to N characters, not bytes ("→" is 3 bytes, printf %-Ns counts bytes)
+padr() { local LC_ALL=en_US.UTF-8; printf "%s%*s" "$1" $(( $2 > ${#1} ? $2 - ${#1} : 0 )) ""; }
+info() { printf "  ${DIM}%s${RESET} %s\n" "$(padr "$1" 9)" "$2"; }   # "  storage   R2 bucket"
+sub() { printf "        %s %s\n" "$(padr "$1" 18)" "$2"; }          # detail under a step
+export BOLD DIM GREEN YELLOW RESET
+export -f padr info sub
+if [ "$ACTION" != "setup" ]; then
+  if [ "$ACTION" = "ota" ]; then TITLE="patch ${PLATFORM_ARG:-android + ios}"; else TITLE="$ACTION"; fi
+  printf "\n${BOLD}react-native-bspatch${RESET} ${DIM}%s · %s${RESET}\n" "$TITLE" "$FLAVOR_LOWER"
+fi
+
 # ── Environment ──────────────────────────────────────────────────────────────
 # .env.<flavor>: OTA_BASE_URL / OTA_FOLDER, the same values react-native-config bakes into the app.
 # .env.ota: upload secrets (OTA_R2_*). Never put them in .env.<flavor>: react-native-config
@@ -72,7 +89,7 @@ if [ "$FLAVOR_LOWER" = "prod" ]; then FLAVOR_LOWER="production"; fi
 # Parsed like react-native-config (KEY=VALUE, optional quotes), never executed:
 # `APP_NAME=Baseform Dev` is valid dotenv but breaks `source`.
 load_env() {
-  echo "Loading $(basename "$1")..."
+  ENV_LOADED="${ENV_LOADED:+$ENV_LOADED + }$(basename "$1")"
   local line k v
   while IFS= read -r line || [ -n "$line" ]; do
     [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=(.*)$ ]] || continue
@@ -93,6 +110,7 @@ if [ "$ACTION" != "setup" ]; then
   fi
   load_env "$ROOT/.env.$FLAVOR_LOWER"
   if [ -f "$ROOT/.env.ota" ]; then load_env "$ROOT/.env.ota"; fi
+  info env "$ENV_LOADED"
 fi
 
 # ── Setup (project wiring only, no build env needed) ─────────────────────────
@@ -104,7 +122,6 @@ fi
 
 # ── Build environment ──────────────────────────────────────────────────────
 if [ "$ACTION" = "ota" ]; then
-  echo "Preparing build environment..."
   # Kill any existing Metro processes to prevent file locks
   pkill -f "react-native/local-cli/cli.js" || true
   pkill -f "metro-config/src/index.js" || true
@@ -112,8 +129,10 @@ if [ "$ACTION" = "ota" ]; then
   # Manually clear metro cache if it exists (robust vs ENOTEMPTY error)
   METRO_CACHE_DIR=$(node -e "console.log(require('os').tmpdir())")/metro-cache
   if [ -d "$METRO_CACHE_DIR" ]; then
-    echo "  Cleaning Metro cache..."
     rm -rf "$METRO_CACHE_DIR"
+    info metro "stopped · cache cleared"
+  else
+    info metro "stopped"
   fi
 fi
 
@@ -125,12 +144,10 @@ REGISTRY_SHARED="$ROOT/ota_registry.json"
 # ── Registry Sync ──────────────────────────────────────────────────────────
 # Reset syncs too: it edits the latest remote registry instead of overwriting it with a stale local copy
 if [ "$ACTION" != "setup" ]; then
-    echo "Syncing remote registry..."
-
     BASE_URL="${OTA_BASE_URL:-}"
     BASE_FOLDER="${OTA_FOLDER:-ota}"
 
-    echo "  Storage: ${OTA_R2_BUCKET:+R2 $OTA_R2_BUCKET → }$BASE_URL/$BASE_FOLDER"
+    info storage "${OTA_R2_BUCKET:+R2 $OTA_R2_BUCKET → }$BASE_URL/$BASE_FOLDER"
 
     if [[ -n "${OTA_R2_BUCKET:-}" ]]; then
         R2_URL="https://${OTA_R2_ACCOUNT_ID:?set OTA_R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${OTA_R2_BUCKET}"
@@ -162,13 +179,13 @@ if [ "$ACTION" != "setup" ]; then
 
     if [[ "$API_HTTP" == "200" ]] && node -e "JSON.parse(require('fs').readFileSync(process.argv[1],'utf8'))" "$REGISTRY_SHARED.tmp" 2>/dev/null; then
         mv "$REGISTRY_SHARED.tmp" "$REGISTRY_SHARED"
-        echo "  ✓ Remote registry synced"
+        info registry "synced"
     elif [[ "$API_HTTP" == "404" ]]; then
         rm -f "$REGISTRY_SHARED.tmp"
         # Remote is the source of truth: a local registry from another storage would publish
         # entries for files that don't exist here
         echo '{"apps":{}}' > "$REGISTRY_SHARED"
-        echo "  Notice: No remote registry yet (HTTP 404) — starting a new one."
+        info registry "new (nothing on storage yet)"
     else
         # Continuing would later push a stale local registry over the remote one
         rm -f "$REGISTRY_SHARED.tmp"
@@ -209,8 +226,19 @@ human_size() {
 file_size() { wc -c < "$1" | tr -d ' '; }
 STEP=0
 STEP_TOTAL=5
-step() { STEP=$((STEP + 1)); STEP_START=$SECONDS; echo ""; echo "  [$STEP/$STEP_TOTAL] $*"; }
-step_done() { echo "      ✓ $* ($((SECONDS - STEP_START))s)"; }
+# One line per step: "  [3/5] Assets           59 files · 1s". In a terminal the label shows
+# while the step runs and step_progress updates it in place.
+step_line() { printf "  [%d/%d] %-16s %s" "$STEP" "$STEP_TOTAL" "$STEP_LABEL" "$1"; }
+step() {
+  STEP=$((STEP + 1)); STEP_START=$SECONDS; STEP_LABEL="$1"
+  if [ -t 1 ]; then step_line "${DIM}…${RESET}"; fi
+}
+step_progress() { if [ -t 1 ]; then printf "\r\033[K"; step_line "${DIM}$1${RESET}"; fi; }
+step_done() {
+  if [ -t 1 ]; then printf "\r\033[K"; fi
+  step_line "$1 ${DIM}· $((SECONDS - STEP_START))s${RESET}"; printf "\n"
+}
+step_fail() { if [ -t 1 ]; then printf "\n"; fi; }   # leave the step line before error output
 export -f human_size file_size
 
 # ── Release version (native app version the OTA targets) ─────────────────────
@@ -239,10 +267,9 @@ fi
 
 # Confirm in a terminal (Enter keeps the detected version); CI / -y / --release-version skip it
 if [ -t 0 ] && [ "$CONFIRM_VERSION" = true ] && [ -z "$APP_VERSION_ARG" ]; then
-  echo ""
   if [ "$ACTION" = "reset" ]; then PROMPT_WHAT="Release version to RESET ($FLAVOR_LOWER, android + ios)"
   else PROMPT_WHAT="Release version for ${PLATFORM_ARG:-android + ios} ($FLAVOR_LOWER)"; fi
-  read -r -p "  $PROMPT_WHAT [${APP_VERSION:-none detected}]: " INPUT_VERSION
+  read -r -p "  ${BOLD}?${RESET} $PROMPT_WHAT [${APP_VERSION:-none detected}]: " INPUT_VERSION
   INPUT_VERSION="${INPUT_VERSION// /}"
   APP_VERSION="${INPUT_VERSION:-$APP_VERSION}"
 fi
@@ -251,15 +278,14 @@ if [ -z "$APP_VERSION" ]; then
   echo "❌ Could not read the native app version. Pass --release-version <x.y.z>."
   exit 1
 fi
-echo "  ✓ Release version: $APP_VERSION"
+info release "$APP_VERSION"
 
 # ── Reset ─────────────────────────────────────────────────────────────────────
 if [ "$ACTION" = "reset" ]; then
-  echo "Resetting OTA registry and output for flavor '$FLAVOR_LOWER'..."
-
   # Reset only the specific flavor in registry JSON if registry exists
+  LATEST=1
   if [ -f "$REGISTRY_SHARED" ]; then
-    node -e "
+    LATEST=$(node -e "
       try {
         const fs = require('fs');
         const reg = JSON.parse(fs.readFileSync('$REGISTRY_SHARED', 'utf8'));
@@ -270,8 +296,9 @@ if [ "$ACTION" = "reset" ]; then
           flavors['$FLAVOR_LOWER'] = { latestOtaVersion: flavors['$FLAVOR_LOWER'].latestOtaVersion || 1, patches: [] };
         }
         fs.writeFileSync('$REGISTRY_SHARED', JSON.stringify(reg, null, 4));
-      } catch(e) {}
-    "
+        console.log(flavors?.['$FLAVOR_LOWER']?.latestOtaVersion || 1);
+      } catch(e) { console.log(1); }
+    ")
   else
     echo '{"apps":{}}' > "$REGISTRY_SHARED"
   fi
@@ -282,20 +309,20 @@ if [ "$ACTION" = "reset" ]; then
     find "$D" -maxdepth 1 -type f -name "asset-manifest-v*_${FLAVOR_LOWER}.json" -delete 2>/dev/null || true # legacy names
   done
 
-  echo "  ✓ Registry and output cleared for $APP_VERSION/$FLAVOR_LOWER "
+  info local "cleared $APP_VERSION/$FLAVOR_LOWER · next OTA is v$((LATEST + 1))"
 
   if [ "$PUSH_REMOTE" = true ]; then
-      echo "  Syncing reset state for flavor '$FLAVOR_LOWER' to remote storage..."
       bash "$SCRIPT_DIR/upload_ota.sh" "$APP_VERSION" "$FLAVOR_LOWER" "0" "" "ios" "--clean-remote"
+  else
+      info remote "unchanged ${DIM}(add --push to delete on storage)${RESET}"
   fi
   exit 0
 fi
 
 # ── Ensure bsdiff compiled ───────────────────────────────────────────────────
 if [ ! -f "$BSDIFF" ]; then
-  echo "Compiling bsdiff..."
   clang -O2 -D BSDIFF_EXECUTABLE -o "$BSDIFF" "$SCRIPT_DIR/bsdiff.c" -lbz2
-  echo "  ✓ bsdiff compiled"
+  info bsdiff "compiled"
 fi
 
 find_hermesc() {
@@ -328,8 +355,7 @@ build_platform() {
   if [ "$PLATFORM" == "ios" ]; then OUTPUT="$ROOT/ios/output"; fi
   local REGISTRY="$REGISTRY_SHARED"
 
-  echo ""
-  echo ">>> Building $PLATFORM | Version: $APP_VERSION | OTA: v$CURRENT → v$NEXT"
+  printf "\n${BOLD}%s${RESET} · %s · ${BOLD}v%s${RESET} ${DIM}(previous v%s)${RESET}\n" "$PLATFORM" "$APP_VERSION" "$NEXT" "$CURRENT"
   STEP=0
   local PLATFORM_START=$SECONDS
 
@@ -341,17 +367,17 @@ build_platform() {
   # Determine source bundle
   local BUILD_LOG="$WORKSPACE/bundle.log"
   if [ "$PLATFORM" == "android" ]; then
-    step "Bundling JS (Gradle createBundle${FLAVOR_CAP}ReleaseJsAndAssets)..."
+    step "Bundle JS"
     # Gradle's config noise goes to a log; shown only on failure
     if ! (cd "$ROOT/android" && ./gradlew ":app:createBundle${FLAVOR_CAP}ReleaseJsAndAssets" -Pkotlin.incremental=false --quiet) > "$BUILD_LOG" 2>&1; then
-      tail -n 40 "$BUILD_LOG"; echo "  ❌ Gradle bundle failed (full log: $BUILD_LOG)"; exit 1
+      step_fail; tail -n 40 "$BUILD_LOG"; echo "  ❌ Gradle bundle failed (full log: $BUILD_LOG)"; exit 1
     fi
     BUNDLE_SOURCE="$ROOT/android/app/build/generated/assets/react/${FLAVOR_LOWER}Release/index.android.bundle"
   else
-    step "Bundling JS (react-native bundle)..."
+    step "Bundle JS"
     if ! npx react-native bundle --platform ios --dev false --entry-file index.js \
       --bundle-output "$WORKSPACE/source.bundle" --assets-dest "$OUTPUT/assets" > "$BUILD_LOG" 2>&1; then
-      tail -n 40 "$BUILD_LOG"; echo "  ❌ Bundle failed (full log: $BUILD_LOG)"; exit 1
+      step_fail; tail -n 40 "$BUILD_LOG"; echo "  ❌ Bundle failed (full log: $BUILD_LOG)"; exit 1
     fi
     BUNDLE_SOURCE="$WORKSPACE/source.bundle"
   fi
@@ -366,12 +392,12 @@ build_platform() {
     if [ "$FIRST_BYTE" == "c6" ]; then IS_HBC=true; fi
   fi
 
-  step "Hermes bytecode..."
-  if [ "$IS_HBC" = true ]; then
-    echo "      already Hermes bytecode"
-  else
+  step "Hermes"
+  local HERMES_NOTE="already bytecode"
+  if [ "$IS_HBC" != true ]; then
+    HERMES_NOTE="compiled"
     if [ -z "$HERMESC_PATH" ] || [ ! -f "$HERMESC_PATH" ]; then
-      echo "  ❌ ERROR: hermesc not found"; exit 1
+      step_fail; echo "  ❌ ERROR: hermesc not found"; exit 1
     fi
     # -O matches what Xcode/Gradle use for release
     "$HERMESC_PATH" -emit-binary -O -out "$WORKSPACE/source.hbc" "$BUNDLE_SOURCE"
@@ -382,7 +408,7 @@ build_platform() {
   local NEW_BUNDLE_PATH="$OUTPUT/$BUNDLE_NAME"
 
   cp "$BUNDLE_SOURCE" "$NEW_BUNDLE_PATH"
-  step_done "$BUNDLE_NAME, $(human_size "$(file_size "$NEW_BUNDLE_PATH")")"
+  step_done "$HERMES_NOTE"
 
   # ── Assets ──
   local ASSET_MANIFEST_FILE="$OUTPUT/asset-manifest_${APP_VERSION}_v${NEXT}_${PLATFORM}_${FLAVOR_LOWER}.json"
@@ -394,7 +420,7 @@ build_platform() {
   local ASSET_JSON_LIST="["
   local FIRST=true
   local ASSET_COUNT=0
-  step "Hashing assets..."
+  step "Assets"
   if [ -d "$ASSETS_SRC_DIR" ]; then
     while IFS= read -r -d '' ASSET_FILE; do
       local HASH=$(sha256 "$ASSET_FILE")
@@ -409,12 +435,11 @@ build_platform() {
       if [ "$FIRST" = true ]; then FIRST=false; else ASSET_JSON_LIST+=", "; fi
       ASSET_JSON_LIST+="{\"hash\": \"$HASH\", \"ext\": \"$EX\", \"originalPath\": \"$REL_PATH\"}"
       ASSET_COUNT=$((ASSET_COUNT + 1))
-      if [ -t 1 ]; then printf "\r      %d assets" "$ASSET_COUNT"; fi
+      step_progress "$ASSET_COUNT files"
     done < <(find "$ASSETS_SRC_DIR" -type f -print0 2>/dev/null)
-    if [ -t 1 ]; then printf "\r\033[K"; fi
   fi
   ASSET_JSON_LIST+="]"
-  step_done "$ASSET_COUNT assets"
+  step_done "$ASSET_COUNT files"
 
   cat > "$ASSET_MANIFEST_FILE" << EOF
 { "version": $NEXT, "appVersion": "$APP_VERSION", "platform": "$PLATFORM", "flavor": "$FLAVOR_LOWER", "assets": $ASSET_JSON_LIST }
@@ -426,48 +451,49 @@ EOF
   local NEW_HASH=$(sha256 "$NEW_BUNDLE_PATH")
   local PATCHES_JSON="["
   local FIRST_FROM=$((NEXT - 5)); if [ $FIRST_FROM -lt 2 ]; then FIRST_FROM=2; fi
-  local PATCH_TOTAL=$((NEXT - FIRST_FROM)) PATCH_N=0 PATCH_MADE=0
-  if [ $PATCH_TOTAL -gt 0 ]; then
-    step "Creating $PATCH_TOTAL patch(es) from v$FIRST_FROM..v$((NEXT - 1))..."
-  else
-    step "Patches: none (first OTA of this release — clients take the full bundle)"
-  fi
+  local PATCH_TOTAL=$((NEXT - FIRST_FROM)) PATCH_MADE=0 PATCH_LINES=() PATCH_MISSING=""
+  step "Patches"
   for (( i=FIRST_FROM; i<NEXT; i++ )); do
-    PATCH_N=$((PATCH_N + 1))
     local OLD_B="bundle_${APP_VERSION}_v${i}_${PLATFORM}_${FLAVOR_LOWER}.hbc"
     local OLD_P="$OUTPUT/$OLD_B"
     if [ ! -f "$OLD_P" ]; then
-      echo "      ($PATCH_N/$PATCH_TOTAL) v$i: downloading base bundle..."
+      step_progress "v$i: fetching bundle…"
       local REMOTE_BUNDLE_PATH="$BASE_FOLDER/$APP_VERSION/$FLAVOR_LOWER/$OLD_B"
       download_remote "$REMOTE_BUNDLE_PATH" "$OLD_P" || true
     fi
     if [ ! -f "$OLD_P" ]; then
-      echo "      ($PATCH_N/$PATCH_TOTAL) v$i: ⚠ bundle not found, skipped (v$i clients take the full bundle)"
+      PATCH_MISSING="${PATCH_MISSING:+$PATCH_MISSING, }v$i"
       continue
     fi
     local PNAME="patch_${APP_VERSION}_v${i}_to_v${NEXT}_${FLAVOR_LOWER}_${PLATFORM}.patch"
     local PATCH_START=$SECONDS
-    if [ -t 1 ]; then printf "      (%d/%d) v%d → v%d ..." "$PATCH_N" "$PATCH_TOTAL" "$i" "$NEXT"; fi
+    step_progress "v$i → v$NEXT…"
     "$BSDIFF" "$OLD_P" "$NEW_BUNDLE_PATH" "$OUTPUT/$PNAME"
-    if [ -t 1 ]; then printf "\r\033[K"; fi
-    echo "      ($PATCH_N/$PATCH_TOTAL) v$i → v$NEXT: $(human_size "$(file_size "$OUTPUT/$PNAME")") ($((SECONDS - PATCH_START))s)"
+    PATCH_LINES+=("v$i → v$NEXT|$(human_size "$(file_size "$OUTPUT/$PNAME")") ${DIM}· $((SECONDS - PATCH_START))s${RESET}")
     PATCH_MADE=$((PATCH_MADE + 1))
     if [ "$PATCHES_JSON" != "[" ]; then PATCHES_JSON+=", "; fi
     PATCHES_JSON+="{\"from\": $i, \"to\": $NEXT, \"file\": \"$PNAME\", \"baseHash\": \"$(sha256 "$OLD_P")\", \"bundleHash\": \"$NEW_HASH\"}"
   done
   PATCHES_JSON+="]"
-  if [ $PATCH_TOTAL -gt 0 ]; then step_done "$PATCH_MADE patch(es)"; fi
+  if [ $PATCH_TOTAL -eq 0 ]; then
+    step_done "none ${DIM}(first OTA of this release: full bundle only)${RESET}"
+  else
+    step_done "$PATCH_MADE created"
+  fi
+  local L
+  for L in "${PATCH_LINES[@]}"; do sub "${L%%|*}" "${L#*|}"; done
+  if [ -n "$PATCH_MISSING" ]; then sub "$PATCH_MISSING" "${DIM}no bundle on storage → full download${RESET}"; fi
 
   # ── Finalize ──
-  step "Registry + upload..."
+  step "Publish"
+  if [ -t 1 ]; then printf "\r\033[K"; fi
+  step_line ""; printf "\n"
   node "$SCRIPT_DIR/update_registry.js" "$REGISTRY_SHARED" "$APP_VERSION" "$NEXT" "$PATCHES_JSON" "$PLATFORM" "$ASSET_MANIFEST_FILE" "$FLAVOR_LOWER"
   bash "$SCRIPT_DIR/upload_ota.sh" "$APP_VERSION" "$FLAVOR_LOWER" "$NEXT" "$NEW_BUNDLE_PATH" "$PLATFORM"
-  echo ""
-  echo "  ✓ $PLATFORM v$NEXT published in $((SECONDS - PLATFORM_START))s"
+  printf "${GREEN}✓${RESET} ${BOLD}%s v%s${RESET} published ${DIM}in %ss${RESET}\n" "$PLATFORM" "$NEXT" "$((SECONDS - PLATFORM_START))"
 }
 
 # ── Main ───────────────────────────────────────────────────────────────────
-echo "=== OTA Build Pipeline | App: $APP_VERSION | Flavor: $FLAVOR ==="
 
 FLAVOR_LOWER=$(echo "$FLAVOR" | tr '[:upper:]' '[:lower:]')
 if [ "$FLAVOR_LOWER" = "dev" ]; then FLAVOR_LOWER="development"; fi
@@ -496,8 +522,7 @@ else
   build_platform "ios" "$FLAVOR" "$CURRENT_TOTAL" "$TARGET_OTA"
 fi
 
-echo ""
-echo "=== All Builds Complete ==="
+
 
 
 

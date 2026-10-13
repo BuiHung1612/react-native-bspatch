@@ -53,39 +53,49 @@ if [[ -n "${OTA_R2_BUCKET:-}" ]]; then
     : "${OTA_R2_ACCOUNT_ID:?set OTA_R2_ACCOUNT_ID}" "${OTA_R2_ACCESS_KEY_ID:?set OTA_R2_ACCESS_KEY_ID}" "${OTA_R2_SECRET_ACCESS_KEY:?set OTA_R2_SECRET_ACCESS_KEY}"
     R2_URL="https://${OTA_R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${OTA_R2_BUCKET}"
     r2() { curl -sS --aws-sigv4 "aws:amz:auto:s3" --user "$OTA_R2_ACCESS_KEY_ID:$OTA_R2_SECRET_ACCESS_KEY" "$@"; }
-    r2_put() { # <file> <key> <cache-control> [label]
-        local SIZE PROGRESS=(-s)
+    # "patch_1.0.4_v4_to_v7_…" → "patch v4 → v7", "bundle_…_v7_…" → "bundle v7"
+    pretty() {
+        case "$1" in
+            patch_*) echo "$1" | sed -E 's/.*_v([0-9]+)_to_v([0-9]+)_.*/patch v\1 → v\2/' ;;
+            bundle_*) echo "$1" | sed -E 's/.*_v([0-9]+)_.*/bundle v\1/' ;;
+            asset-manifest_*) echo "asset manifest" ;;
+            *) echo "$1" ;;
+        esac
+    }
+    r2_put() { # <file> <key> <cache-control> <label>
+        local SIZE PROGRESS=(-s) BAR=false
         SIZE=$(wc -c < "$1" | tr -d ' ')
-        # Progress bar for big files (bundles) in a terminal
-        if [ -t 2 ] && [ "$SIZE" -gt 1048576 ]; then echo "      ↑ ${4:-$2}"; PROGRESS=(-#); fi
-        curl -S "${PROGRESS[@]}" -f --aws-sigv4 "aws:amz:auto:s3" --user "$OTA_R2_ACCESS_KEY_ID:$OTA_R2_SECRET_ACCESS_KEY" \
+        # Progress bar for big files (bundles) in a terminal; erased once done
+        if [ -t 1 ] && [ "$SIZE" -gt 1048576 ]; then printf "        ↑ %s\n" "$4"; PROGRESS=(-#); BAR=true; fi
+        COLUMNS=60 curl -S "${PROGRESS[@]}" -f --aws-sigv4 "aws:amz:auto:s3" --user "$OTA_R2_ACCESS_KEY_ID:$OTA_R2_SECRET_ACCESS_KEY" \
             -X PUT -T "$1" -H "Cache-Control: $3" "$R2_URL/$2" -o /dev/null || { echo "  ❌ Upload failed: $2"; exit 1; }
-        echo "      ✓ ${4:-$2} ($(human_size "$SIZE"))"
+        if [ "$BAR" = true ]; then printf "\033[2A\033[K\n\033[K\033[1A"; fi
+        printf "        ${GREEN}✓${RESET} %s %s\n" "$(padr "$4" 16)" "$(human_size "$SIZE")"
     }
     RELEASE_PREFIX="$BASE_FOLDER/$APP_VERSION/$CHANNEL"
     IMMUTABLE="public, max-age=31536000, immutable"
 
-    echo "      → Cloudflare R2: $OTA_R2_BUCKET/$RELEASE_PREFIX"
     if [ "$CLEAN_REMOTE" = true ]; then
-        echo "      Deleting $RELEASE_PREFIX/ ..."
         # ponytail: one ListObjectsV2 page (1000 keys); a release+channel holds far fewer
         LISTING=$(r2 -f "$R2_URL?list-type=2&prefix=$RELEASE_PREFIX/") || { echo "  ❌ Listing $RELEASE_PREFIX/ failed"; exit 1; }
-        DELETED=0
+        DELETED=0; BUNDLES=0; PATCHES=0; MANIFESTS=0
         for KEY in $(echo "$LISTING" | grep -o '<Key>[^<]*</Key>' | sed 's/<[^>]*>//g'); do
             r2 -f -X DELETE "$R2_URL/$KEY" -o /dev/null || { echo "  ❌ Delete failed: $KEY"; exit 1; }
-            echo "      ✗ $KEY"; DELETED=$((DELETED + 1))
+            DELETED=$((DELETED + 1))
+            case "$KEY" in *.hbc) BUNDLES=$((BUNDLES + 1)) ;; *.patch) PATCHES=$((PATCHES + 1)) ;; *.json) MANIFESTS=$((MANIFESTS + 1)) ;; esac
+            if [ -t 1 ]; then printf "\r\033[K  ${DIM}%-9s${RESET} deleting… %d" "remote" "$DELETED"; fi
         done
-        echo "      ✓ $DELETED object(s) deleted"
+        if [ -t 1 ]; then printf "\r\033[K"; fi
+        info remote "$DELETED object(s) deleted ${DIM}($BUNDLES bundles · $PATCHES patches · $MANIFESTS manifests)${RESET}"
     else
         # Only this version's files: earlier bundles/patches are already uploaded and never change
         RELEASE_FILES=()
         for FILE in "$OUTPUT_DIR"/*_v"${OTA_VERSION}"_*.{patch,hbc,json}; do
             [[ -f "$FILE" ]] && is_release_file "$(basename "$FILE")" && RELEASE_FILES+=("$FILE")
         done
-        N=0
         for FILE in "${RELEASE_FILES[@]}"; do
-            N=$((N + 1)); FNAME=$(basename "$FILE")
-            r2_put "$FILE" "$RELEASE_PREFIX/$FNAME" "$IMMUTABLE" "($N/${#RELEASE_FILES[@]}) $FNAME"
+            FNAME=$(basename "$FILE")
+            r2_put "$FILE" "$RELEASE_PREFIX/$FNAME" "$IMMUTABLE" "$(pretty "$FNAME")"
         done
         # Content-addressed assets: upload only hashes the bucket doesn't have yet
         ASSETS=("$OUTPUT_DIR"/asset-store/*)
@@ -98,13 +108,18 @@ if [[ -n "${OTA_R2_BUCKET:-}" ]]; then
                 r2 -f -X PUT -T "$FILE" -H "Cache-Control: $IMMUTABLE" "$R2_URL/$KEY" -o /dev/null || { echo "  ❌ Upload failed: $KEY"; exit 1; }
                 NEW=$((NEW + 1)); NEW_BYTES=$((NEW_BYTES + $(wc -c < "$FILE")))
             fi
-            if [ -t 1 ]; then printf "\r      assets %d/%d checked, %d uploaded" "$N" "${#ASSETS[@]}" "$NEW"; fi
+            if [ -t 1 ]; then printf "\r\033[K        ${DIM}assets %d/%d checked${RESET}" "$N" "${#ASSETS[@]}"; fi
         done
         if [ -t 1 ] && [ ${#ASSETS[@]} -gt 0 ]; then printf "\r\033[K"; fi
-        echo "      ✓ assets: ${#ASSETS[@]} total, $NEW uploaded ($(human_size "$NEW_BYTES")), $((${#ASSETS[@]} - NEW)) already on R2"
+        printf "        ${GREEN}✓${RESET} %s %s\n" "$(padr assets 16)" "${#ASSETS[@]} · $NEW new ($(human_size "$NEW_BYTES"))"
     fi
     # Registry last: clients never see a version whose files aren't uploaded yet
-    r2_put "$REGISTRY_FILE" "$BASE_FOLDER/ota_registry.json" "no-cache" "ota_registry.json"
+    if [ "$CLEAN_REMOTE" = true ]; then
+        r2 -f -X PUT -T "$REGISTRY_FILE" -H "Cache-Control: no-cache" "$R2_URL/$BASE_FOLDER/ota_registry.json" -o /dev/null || { echo "  ❌ Upload failed: ota_registry.json"; exit 1; }
+        info registry "uploaded"
+    else
+        r2_put "$REGISTRY_FILE" "$BASE_FOLDER/ota_registry.json" "no-cache" "registry"
+    fi
     exit 0
 fi
 
