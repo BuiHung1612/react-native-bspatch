@@ -239,6 +239,20 @@ step_done() {
   step_line "$1 ${DIM}· $((SECONDS - STEP_START))s${RESET}"; printf "\n"
 }
 step_fail() { if [ -t 1 ]; then printf "\n"; fi; }   # leave the step line before error output
+# run_logged LOG cmd… — run cmd with output to LOG; in a terminal, tick elapsed time + the log's last line
+run_logged() {
+  local LOG="$1"; shift
+  "$@" > "$LOG" 2>&1 &
+  local PID=$!
+  if [ -t 1 ]; then
+    while kill -0 "$PID" 2>/dev/null; do
+      local LAST=$(tail -n 1 "$LOG" 2>/dev/null | tr -d '\r\033' | cut -c1-50)
+      step_progress "$((SECONDS - STEP_START))s${LAST:+ · $LAST}"
+      sleep 1
+    done
+  fi
+  wait "$PID"
+}
 export -f human_size file_size
 
 # ── Release version (native app version the OTA targets) ─────────────────────
@@ -369,14 +383,14 @@ build_platform() {
   if [ "$PLATFORM" == "android" ]; then
     step "Bundle JS"
     # Gradle's config noise goes to a log; shown only on failure
-    if ! (cd "$ROOT/android" && ./gradlew ":app:createBundle${FLAVOR_CAP}ReleaseJsAndAssets" -Pkotlin.incremental=false --quiet) > "$BUILD_LOG" 2>&1; then
+    if ! run_logged "$BUILD_LOG" bash -c 'cd "$1/android" && ./gradlew ":app:createBundle${2}ReleaseJsAndAssets" -Pkotlin.incremental=false --quiet' _ "$ROOT" "$FLAVOR_CAP"; then
       step_fail; tail -n 40 "$BUILD_LOG"; echo "  ❌ Gradle bundle failed (full log: $BUILD_LOG)"; exit 1
     fi
     BUNDLE_SOURCE="$ROOT/android/app/build/generated/assets/react/${FLAVOR_LOWER}Release/index.android.bundle"
   else
     step "Bundle JS"
-    if ! npx react-native bundle --platform ios --dev false --entry-file index.js \
-      --bundle-output "$WORKSPACE/source.bundle" --assets-dest "$OUTPUT/assets" > "$BUILD_LOG" 2>&1; then
+    if ! run_logged "$BUILD_LOG" npx react-native bundle --platform ios --dev false --entry-file index.js \
+      --bundle-output "$WORKSPACE/source.bundle" --assets-dest "$OUTPUT/assets"; then
       step_fail; tail -n 40 "$BUILD_LOG"; echo "  ❌ Bundle failed (full log: $BUILD_LOG)"; exit 1
     fi
     BUNDLE_SOURCE="$WORKSPACE/source.bundle"
