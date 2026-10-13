@@ -339,12 +339,9 @@ export function OtaProvider({
       'change',
       (nextAppState: AppStateStatus) => {
         // When going into background: if update is downloaded and ready, reload bundle silently
-        if (
-          appState.current === 'active' &&
-          // Not 'inactive': iOS fires it for Control Center, calls, Face ID prompts
-          nextAppState === 'background' &&
-          pendingReloadRef.current
-        ) {
+        // Only 'background', not 'inactive' (iOS fires it for Control Center, calls,
+        // Face ID). Any previous state: iOS goes active → inactive → background.
+        if (nextAppState === 'background' && pendingReloadRef.current) {
           pendingReloadRef.current = false;
           NativeBsPatch.reloadBundle();
         }
