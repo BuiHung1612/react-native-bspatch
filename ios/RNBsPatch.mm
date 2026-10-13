@@ -1,6 +1,5 @@
-#import "RNBsPatch.h"
 #import <Foundation/Foundation.h>
-#import <UIKit/UIKit.h>
+#import <QuartzCore/QuartzCore.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <Security/Security.h>
 #import <React/RCTLog.h>
@@ -20,13 +19,109 @@ extern "C" {
 }
 #endif
 
-// Import codegen headers for New Architecture
-#ifdef RCT_NEW_ARCH_ENABLED
 #import "RNBsPatchSpec.h"
-#endif
 
-@interface RNBsPatch () <RCTBridgeModule>
+// Declared here, not in a public header: the codegen header is C++, which the
+// pod's Swift module umbrella can't import
+@interface RNBsPatch : NativeBsPatchSpecBase <NativeBsPatchSpec>
 @end
+
+/** One download: streams to a system temp file, moved to destPath only on a 2xx response. */
+@interface RNBsPatchDownload : NSObject <NSURLSessionDownloadDelegate>
+@property (nonatomic, copy) NSString *destPath;
+@property (nonatomic, copy) RCTPromiseResolveBlock resolve;
+@property (nonatomic, copy) RCTPromiseRejectBlock reject;
+@property (nonatomic, copy) void (^onProgress)(int64_t received, int64_t total);
+@property (nonatomic, strong) NSError *error;
+@property (nonatomic) unsigned long long size;
+@property (nonatomic) CFTimeInterval lastEmit;
+@end
+
+@implementation RNBsPatchDownload
+
+- (void)URLSession:(NSURLSession *)session
+      downloadTask:(NSURLSessionDownloadTask *)task
+      didWriteData:(int64_t)bytesWritten
+ totalBytesWritten:(int64_t)written
+totalBytesExpectedToWrite:(int64_t)expected
+{
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now - self.lastEmit < 0.25) return;
+    self.lastEmit = now;
+    self.onProgress(written, expected); // expected is -1 without a Content-Length
+}
+
+// The temp file is deleted when this returns, so move it here
+- (void)URLSession:(NSURLSession *)session
+      downloadTask:(NSURLSessionDownloadTask *)task
+didFinishDownloadingToURL:(NSURL *)location
+{
+    NSInteger status = [(NSHTTPURLResponse *)task.response statusCode];
+    if (status < 200 || status >= 300) {
+        self.error = [NSError errorWithDomain:@"RNBsPatch" code:status userInfo:@{
+            NSLocalizedDescriptionKey: [NSString stringWithFormat:@"HTTP %ld for %@", (long)status, task.originalRequest.URL]
+        }];
+        return;
+    }
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *dir = self.destPath.stringByDeletingLastPathComponent;
+    NSError *error = nil;
+    [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    [fm removeItemAtPath:self.destPath error:nil];
+    if (![fm moveItemAtPath:location.path toPath:self.destPath error:&error]) {
+        self.error = error;
+        return;
+    }
+    self.size = [[fm attributesOfItemAtPath:self.destPath error:nil] fileSize];
+    self.onProgress((int64_t)self.size, (int64_t)self.size);
+}
+
+- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error
+{
+    NSError *e = error ?: self.error;
+    if (e) {
+        self.reject(@"ERR_DOWNLOAD", e.localizedDescription, e);
+    } else {
+        self.resolve(@(self.size));
+    }
+    [session finishTasksAndInvalidate]; // releases this delegate
+}
+
+@end
+
+/** Streaming SHA-256 of a file, or nil if it can't be read. */
+static NSData *RNBsPatchSHA256(NSString *path)
+{
+    NSInputStream *stream = [NSInputStream inputStreamWithFileAtPath:path];
+    if (!stream) return nil;
+    [stream open];
+    CC_SHA256_CTX ctx;
+    CC_SHA256_Init(&ctx);
+    uint8_t buffer[65536];
+    NSInteger n;
+    while ((n = [stream read:buffer maxLength:sizeof(buffer)]) > 0) {
+        CC_SHA256_Update(&ctx, buffer, (CC_LONG)n);
+    }
+    [stream close];
+    if (n < 0) return nil;
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256_Final(digest, &ctx);
+    return [NSData dataWithBytes:digest length:sizeof(digest)];
+}
+
+/** Runs block off the JS thread: resolves *result, or rejects with *error when it returns NO. */
+static void RNBsPatchIO(RCTPromiseResolveBlock resolve, RCTPromiseRejectBlock reject, BOOL (^block)(id *result, NSError **error))
+{
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        id result = nil;
+        NSError *error = nil;
+        if (block(&result, &error)) {
+            resolve(result);
+        } else {
+            reject(@"ERR_FS", error.localizedDescription ?: @"File operation failed", error);
+        }
+    });
+}
 
 @implementation RNBsPatch
 
@@ -141,32 +236,11 @@ RCT_EXPORT_METHOD(verifySignature:(NSString *)filePath
             return;
         }
 
-        // Calculate SHA256 of file stream
-        NSInputStream *stream = [NSInputStream inputStreamWithFileAtPath:filePath];
-        if (!stream) {
+        NSData *sha256Data = RNBsPatchSHA256(filePath);
+        if (!sha256Data) {
             resolve(@(NO));
             return;
         }
-        [stream open];
-
-        CC_SHA256_CTX shaCtx;
-        CC_SHA256_Init(&shaCtx);
-        uint8_t buffer[65536];
-        while ([stream hasBytesAvailable]) {
-            NSInteger bytesRead = [stream read:buffer maxLength:sizeof(buffer)];
-            if (bytesRead > 0) {
-                CC_SHA256_Update(&shaCtx, buffer, (CC_LONG)bytesRead);
-            } else if (bytesRead < 0) {
-                [stream close];
-                resolve(@(NO));
-                return;
-            }
-        }
-        [stream close];
-
-        unsigned char sha256[CC_SHA256_DIGEST_LENGTH];
-        CC_SHA256_Final(sha256, &shaCtx);
-        NSData *sha256Data = [NSData dataWithBytes:sha256 length:CC_SHA256_DIGEST_LENGTH];
 
         BOOL isRSA = NO;
         NSData *rawKey = RNBsPatchKeyFromSPKI(keyData, &isRSA);
@@ -207,13 +281,127 @@ RCT_EXPORT_METHOD(getAppVersion:(RCTPromiseResolveBlock)resolve
     }
 }
 
-// Don't compile this code when we build for the old architecture.
-#ifdef RCT_NEW_ARCH_ENABLED
+// ─── File I/O ─────────────────────────────────────────────────────────
+
+- (NSString *)getDocumentDir
+{
+    return NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+}
+
+- (void)downloadFile:(NSString *)url
+            destPath:(NSString *)destPath
+           timeoutMs:(double)timeoutMs
+             resolve:(RCTPromiseResolveBlock)resolve
+              reject:(RCTPromiseRejectBlock)reject
+{
+    NSURL *nsurl = [NSURL URLWithString:url];
+    if (!nsurl) {
+        reject(@"ERR_DOWNLOAD", [NSString stringWithFormat:@"Invalid URL: %@", url], nil);
+        return;
+    }
+    RNBsPatchDownload *download = [RNBsPatchDownload new];
+    download.destPath = destPath;
+    download.resolve = resolve;
+    download.reject = reject;
+    __weak RNBsPatch *weakSelf = self;
+    download.onProgress = ^(int64_t received, int64_t total) {
+        [weakSelf emitOnDownloadProgress:@{@"path": destPath, @"received": @(received), @"total": @(total)}];
+    };
+
+    NSURLSessionConfiguration *config = NSURLSessionConfiguration.defaultSessionConfiguration;
+    config.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+    config.timeoutIntervalForRequest = timeoutMs / 1000.0; // idle timeout, same as Android readTimeout
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:config delegate:download delegateQueue:nil];
+    [[session downloadTaskWithURL:nsurl] resume];
+}
+
+- (void)hashFile:(NSString *)path resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject
+{
+    RNBsPatchIO(resolve, reject, ^BOOL(id *result, NSError **error) {
+        NSData *digest = RNBsPatchSHA256(path);
+        if (!digest) {
+            *error = [NSError errorWithDomain:@"RNBsPatch" code:1 userInfo:@{NSLocalizedDescriptionKey: [@"Cannot read " stringByAppendingString:path]}];
+            return NO;
+        }
+        const uint8_t *b = (const uint8_t *)digest.bytes;
+        NSMutableString *hex = [NSMutableString stringWithCapacity:digest.length * 2];
+        for (NSUInteger i = 0; i < digest.length; i++) [hex appendFormat:@"%02x", b[i]];
+        *result = hex;
+        return YES;
+    });
+}
+
+- (void)exists:(NSString *)path resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject
+{
+    RNBsPatchIO(resolve, reject, ^BOOL(id *result, NSError **error) {
+        *result = @([NSFileManager.defaultManager fileExistsAtPath:path]);
+        return YES;
+    });
+}
+
+- (void)mkdir:(NSString *)path resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject
+{
+    RNBsPatchIO(resolve, reject, ^BOOL(id *result, NSError **error) {
+        return [NSFileManager.defaultManager createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:error];
+    });
+}
+
+- (void)removePath:(NSString *)path resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject
+{
+    RNBsPatchIO(resolve, reject, ^BOOL(id *result, NSError **error) {
+        NSFileManager *fm = NSFileManager.defaultManager;
+        return ![fm fileExistsAtPath:path] || [fm removeItemAtPath:path error:error];
+    });
+}
+
+- (void)moveFile:(NSString *)from to:(NSString *)to resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject
+{
+    RNBsPatchIO(resolve, reject, ^BOOL(id *result, NSError **error) {
+        // rename() replaces a file atomically; a non-empty directory must go first
+        if (rename(from.fileSystemRepresentation, to.fileSystemRepresentation) == 0) return YES;
+        NSFileManager *fm = NSFileManager.defaultManager;
+        [fm removeItemAtPath:to error:nil];
+        return [fm moveItemAtPath:from toPath:to error:error];
+    });
+}
+
+- (void)copyFile:(NSString *)from to:(NSString *)to resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject
+{
+    RNBsPatchIO(resolve, reject, ^BOOL(id *result, NSError **error) {
+        NSFileManager *fm = NSFileManager.defaultManager;
+        [fm removeItemAtPath:to error:nil];
+        return [fm copyItemAtPath:from toPath:to error:error];
+    });
+}
+
+- (void)readDir:(NSString *)path resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject
+{
+    RNBsPatchIO(resolve, reject, ^BOOL(id *result, NSError **error) {
+        *result = [NSFileManager.defaultManager contentsOfDirectoryAtPath:path error:error];
+        return *result != nil;
+    });
+}
+
+- (void)readFile:(NSString *)path resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject
+{
+    RNBsPatchIO(resolve, reject, ^BOOL(id *result, NSError **error) {
+        *result = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:error];
+        return *result != nil;
+    });
+}
+
+- (void)writeFile:(NSString *)path content:(NSString *)content resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject
+{
+    RNBsPatchIO(resolve, reject, ^BOOL(id *result, NSError **error) {
+        // atomically: temp file + rename, a kill mid-write never leaves a truncated file
+        return [content writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:error];
+    });
+}
+
 - (std::shared_ptr<facebook::react::TurboModule>)getTurboModule:
     (const facebook::react::ObjCTurboModule::InitParams &)params
 {
     return std::make_shared<facebook::react::NativeBsPatchSpecJSI>(params);
 }
-#endif
 
 @end

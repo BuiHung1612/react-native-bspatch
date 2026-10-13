@@ -25,15 +25,15 @@ Premium OTA update solution for React Native using **TurboModules** + **bsdiff b
 
 ## Requirements
 
-- React Native **0.76+** (New Architecture enabled by default)
-- `react-native-blob-util` **0.24.11+** — required peer dependency for file I/O (0.24.10 stops Android file downloads after the first 8 KB: "Download interrupted.")
+- React Native **0.80+** with the New Architecture (TurboModule event emitters for download progress)
+- No other runtime dependencies: downloads and file I/O are native to this module
 
 ---
 
 ## Installation
 
 ```bash
-npm install react-native-bspatch react-native-blob-util
+npm install react-native-bspatch
 cd ios && pod install
 ```
 

@@ -320,7 +320,7 @@ if [ "$ACTION" = "reset" ]; then
 fi
 
 # ── Ensure bsdiff compiled ───────────────────────────────────────────────────
-if [ ! -f "$BSDIFF" ]; then
+if [ ! -f "$BSDIFF" ] || [ "$SCRIPT_DIR/bsdiff.c" -nt "$BSDIFF" ]; then
   clang -O2 -D BSDIFF_EXECUTABLE -o "$BSDIFF" "$SCRIPT_DIR/bsdiff.c" -lbz2
   info bsdiff "compiled"
 fi

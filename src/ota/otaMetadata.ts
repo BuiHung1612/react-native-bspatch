@@ -1,10 +1,15 @@
 import { Platform } from 'react-native';
-import ReactNativeBlobUtil from 'react-native-blob-util';
+import NativeBsPatch from '../NativeBsPatch';
 import { OtaMetadata } from './types';
 
-const OTA_DIR = `${ReactNativeBlobUtil.fs.dirs.DocumentDir}/ota`;
+/** Same directory the native resolver reads `ota/` from */
+export const DOCUMENT_DIR = NativeBsPatch.getDocumentDir();
+export const OTA_DIR = `${DOCUMENT_DIR}/ota`;
 const METADATA_PATH = `${OTA_DIR}/metadata.json`;
 const METADATA_TMP_PATH = `${METADATA_PATH}.tmp`;
+const ASSET_STORE_DIR = `${OTA_DIR}/assets`;
+/** Per-version list of `hash.ext` store files the version uses (written by otaCore) */
+export const ASSET_LIST_FILE = 'assets.json';
 
 /** Serializes metadata updates (see updateMetadata). */
 let saveLock: Promise<void> = Promise.resolve();
@@ -12,11 +17,7 @@ let saveLock: Promise<void> = Promise.resolve();
 /**
  * Ensures the OTA root directory exists.
  */
-export const ensureOtaDir = async (): Promise<void> => {
-    if (!(await ReactNativeBlobUtil.fs.exists(OTA_DIR))) {
-        await ReactNativeBlobUtil.fs.mkdir(OTA_DIR);
-    }
-};
+export const ensureOtaDir = (): Promise<void> => NativeBsPatch.mkdir(OTA_DIR);
 
 /**
  * Loads the current OTA metadata from the local filesystem.
@@ -28,10 +29,10 @@ export const loadMetadata = async (
     defaultVersion: number,
 ): Promise<OtaMetadata> => {
     try {
-        // A crash between unlink and rename in saveMetadata leaves only the .tmp copy
+        // Versions before 4.0 could crash between unlink and rename, leaving only the .tmp copy
         for (const path of [METADATA_PATH, METADATA_TMP_PATH]) {
-            if (await ReactNativeBlobUtil.fs.exists(path)) {
-                return JSON.parse(await ReactNativeBlobUtil.fs.readFile(path, 'utf8'));
+            if (await NativeBsPatch.exists(path)) {
+                return JSON.parse(await NativeBsPatch.readFile(path));
             }
         }
     } catch (e) {
@@ -62,16 +63,8 @@ export const updateMetadata = async (
         await prevLock;
         const metadata = fn(await loadMetadata(defaultVersion));
         await ensureOtaDir();
-        // Write-then-rename so a kill mid-write never leaves truncated JSON
-        await ReactNativeBlobUtil.fs.writeFile(
-            METADATA_TMP_PATH,
-            JSON.stringify(metadata, null, 2),
-            'utf8',
-        );
-        if (await ReactNativeBlobUtil.fs.exists(METADATA_PATH)) {
-            await ReactNativeBlobUtil.fs.unlink(METADATA_PATH);
-        }
-        await ReactNativeBlobUtil.fs.mv(METADATA_TMP_PATH, METADATA_PATH);
+        // Native writeFile is atomic: a kill mid-write never leaves truncated JSON
+        await NativeBsPatch.writeFile(METADATA_PATH, JSON.stringify(metadata, null, 2));
         return metadata;
     } catch (e) {
         console.error('[otaMetadata] Failed to save metadata:', e);
@@ -125,8 +118,8 @@ export const cleanupOldVersions = async (
     baseVersion: number,
 ): Promise<void> => {
     try {
-        if (!(await ReactNativeBlobUtil.fs.exists(OTA_DIR))) return;
-        const items = await ReactNativeBlobUtil.fs.ls(OTA_DIR);
+        if (!(await NativeBsPatch.exists(OTA_DIR))) return;
+        const items = await NativeBsPatch.readDir(OTA_DIR);
 
         // Retain current active version and rollback versions
         const retainedVersions = new Set<number>([
@@ -139,9 +132,10 @@ export const cleanupOldVersions = async (
             const versionMatch = item.match(/^v(\d+)$/);
             if (versionMatch) {
                 const ver = parseInt(versionMatch[1], 10);
-                if (!retainedVersions.has(ver) && ver !== baseVersion) {
+                // Higher than current: may be an install in progress, not yet in metadata
+                if (!retainedVersions.has(ver) && ver !== baseVersion && ver < metadata.currentVersion) {
                     const dirPath = `${OTA_DIR}/${item}`;
-                    await ReactNativeBlobUtil.fs.unlink(dirPath).catch(() => {});
+                    await NativeBsPatch.removePath(dirPath).catch(() => {});
                     if (__DEV__) {
                         console.log(`[otaMetadata] Cleaned up obsolete OTA version: ${item}`);
                     }
@@ -149,11 +143,36 @@ export const cleanupOldVersions = async (
             }
             // Clean up leftover temporary bundle files (.tmp)
             if (item.endsWith('.tmp') && item !== 'metadata.json.tmp') {
-                await ReactNativeBlobUtil.fs.unlink(`${OTA_DIR}/${item}`).catch(() => {});
+                await NativeBsPatch.removePath(`${OTA_DIR}/${item}`).catch(() => {});
             }
         }
+        await cleanupAssetStore();
     } catch (e) {
         console.warn('[otaMetadata] Cleanup old versions failed:', e);
+    }
+};
+
+/**
+ * Deletes store files no remaining version lists. The store is only a download
+ * cache (each version holds its own copies), so this never breaks a version.
+ * ponytail: an install that reuses a store file between our read of its list and
+ * the unlink fails its asset sync; it is retried on the next check.
+ */
+const cleanupAssetStore = async (): Promise<void> => {
+    const fs = NativeBsPatch;
+    if (!(await fs.exists(ASSET_STORE_DIR))) return;
+    const keep = new Set<string>();
+    for (const item of await fs.readDir(OTA_DIR)) {
+        const list = `${OTA_DIR}/${item}/${ASSET_LIST_FILE}`;
+        if (/^v\d+$/.test(item) && (await fs.exists(list))) {
+            const files: string[] = JSON.parse(await fs.readFile(list));
+            files.forEach(f => keep.add(f));
+        }
+    }
+    for (const file of await fs.readDir(ASSET_STORE_DIR)) {
+        if (!keep.has(file)) {
+            await fs.removePath(`${ASSET_STORE_DIR}/${file}`).catch(() => {});
+        }
     }
 };
 

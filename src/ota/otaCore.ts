@@ -11,18 +11,19 @@
  *  - Structured telemetry logging
  */
 
-import { Platform } from 'react-native';
-import ReactNativeBlobUtil from 'react-native-blob-util';
 import NativeBsPatch from '../NativeBsPatch';
 import { createOtaLogger, OtaEvent } from './otaLogger';
 import {
+    ASSET_LIST_FILE,
+    DOCUMENT_DIR,
     ensureOtaDir,
+    OTA_DIR,
     getBundlePath,
     loadMetadata,
     registerNewVersion,
     updateMetadata,
 } from './otaMetadata';
-import { GitHubRawStorageProvider } from './storage/GitHubRawStorage';
+import { fetchJson, GitHubRawStorageProvider } from './storage/GitHubRawStorage';
 import {
     OtaStatus,
     type OtaAsset,
@@ -31,8 +32,6 @@ import {
     type OtaPatch,
     type OtaStorageProvider,
 } from './types';
-
-const OTA_DIR = `${ReactNativeBlobUtil.fs.dirs.DocumentDir}/ota`;
 
 // ─── Storage Provider Factory ──────────────────────────────────────────
 
@@ -97,7 +96,7 @@ export const verifyHash = async (
 ): Promise<boolean> => {
     if (!expectedHash) return true;
     try {
-        const hash = await ReactNativeBlobUtil.fs.hash(path, 'sha256');
+        const hash = await NativeBsPatch.hashFile(path);
         return hash.toLowerCase() === expectedHash.toLowerCase();
     } catch {
         return false;
@@ -125,66 +124,40 @@ const assertSigned = async (
 
 /**
  * Download a file with retry logic using exponential backoff.
- * Cancels any in-flight request before retrying to avoid resource leaks.
+ * Native streams to `${destPath}.part` and renames only on a 2xx response, so a
+ * cut-off download or an error page never sits at destPath looking complete.
+ * @returns Size of the downloaded file in bytes
  */
 const downloadWithRetry = async (
     url: string,
     destPath: string,
     config: OtaConfig,
     onProgress: (percent: number) => void,
-    headers: Record<string, string> = {},
-): Promise<void> => {
-    const retryLimit = config.network?.retry ?? 3;
+): Promise<number> => {
+    const retryLimit = Math.max(1, config.network?.retry ?? 3);
     const timeout = config.network?.timeoutMs ?? 30000;
-
-    for (let i = 0; i < retryLimit; i++) {
-        let taskRef: { cancel: () => void } | null = null;
-        // Download to .part and rename only on a 2xx response, so a cut-off
-        // download or an error page never sits at destPath looking complete.
-        const partPath = `${destPath}.part`;
-        try {
-            const task = ReactNativeBlobUtil.config({
-                fileCache: true,
-                path: partPath,
-                followRedirect: true,
-                timeout,
-            })
-                .fetch('GET', url, {
-                    'Cache-Control': 'no-cache',
-                    ...headers,
-                })
-                .progress((received: any, total: any) => {
-                    const percent = Math.floor(
-                        (Number(received) / Number(total)) * 100,
-                    );
-                    onProgress(percent);
-                });
-            taskRef = { cancel: () => task.cancel() };
-            const resp = await task;
-            const status = resp.respInfo.status;
-            if (status < 200 || status >= 300) {
-                throw new Error(`HTTP ${status} for ${url}`);
-            }
-            if (await ReactNativeBlobUtil.fs.exists(destPath)) {
-                await ReactNativeBlobUtil.fs.unlink(destPath);
-            }
-            await ReactNativeBlobUtil.fs.mv(partPath, destPath);
-            return;
-        } catch (e) {
-            // Cancel any lingering request before retrying
-            taskRef?.cancel();
-            await ReactNativeBlobUtil.fs.unlink(partPath).catch(() => {});
-            if (i === retryLimit - 1) throw e;
-            const delay = Math.pow(2, i) * 1000; // Exponential backoff: 1s, 2s, 4s...
-            if (__DEV__) {
-                console.warn(
-                    `[otaCore] Download attempt ${
-                        i + 1
-                    } failed. Retrying in ${delay}ms...`,
-                );
-            }
-            await new Promise<void>(resolve => setTimeout(resolve, delay));
+    const subscription = NativeBsPatch.onDownloadProgress(e => {
+        // total is -1 without a Content-Length
+        if (e.path === destPath && e.total > 0) {
+            onProgress(Math.min(100, Math.floor((e.received / e.total) * 100)));
         }
+    });
+
+    try {
+        for (let i = 0; ; i++) {
+            try {
+                return await NativeBsPatch.downloadFile(url, destPath, timeout);
+            } catch (e) {
+                if (i >= retryLimit - 1) throw e;
+                const delay = Math.pow(2, i) * 1000; // Exponential backoff: 1s, 2s, 4s...
+                if (__DEV__) {
+                    console.warn(`[otaCore] Download attempt ${i + 1} failed. Retrying in ${delay}ms...`);
+                }
+                await new Promise<void>(resolve => setTimeout(resolve, delay));
+            }
+        }
+    } finally {
+        subscription.remove();
     }
 };
 
@@ -204,7 +177,7 @@ export const fetchOtaManifest = (config: OtaConfig): Promise<OtaPatch[]> =>
 
 // ─── Hashed Asset Store ───────────────────────────────────────────────
 
-const ASSET_STORE_DIR = `${ReactNativeBlobUtil.fs.dirs.DocumentDir}/ota/assets`;
+const ASSET_STORE_DIR = `${OTA_DIR}/assets`;
 
 /** Relative path inside the version dir: no absolute paths, no `..` segments. */
 const isSafeRelativePath = (p: string): boolean =>
@@ -231,20 +204,13 @@ const downloadAndSyncAssets = async (
     ) => void,
     onProgress: (percent: number) => void,
 ): Promise<void> => {
-    const fs = ReactNativeBlobUtil.fs;
+    const fs = NativeBsPatch;
     onStatus(OtaStatus.SYNCING_ASSETS, 'Syncing assets...');
     const versionDir = `${OTA_DIR}/v${version}`;
 
     let assets: OtaAsset[] = [];
     try {
-        const resp = await ReactNativeBlobUtil.config({
-            followRedirect: true,
-            timeout: 10000,
-        }).fetch('GET', assetManifestUrl, { 'Cache-Control': 'no-cache' });
-        if (resp.respInfo.status !== 200) {
-            throw new Error(`status ${resp.respInfo.status}`);
-        }
-        const manifest = typeof resp.data === 'string' ? JSON.parse(resp.data) : resp.data;
+        const manifest = await fetchJson(assetManifestUrl, 10000);
         // Hash/ext/path become file names: reject anything unexpected
         assets = (manifest.assets || []).filter(
             (a: any) =>
@@ -258,13 +224,18 @@ const downloadAndSyncAssets = async (
         throw new Error(`Failed to fetch asset manifest: ${(e as Error).message}`);
     }
     if (assets.length === 0) return;
+    // Lets cleanupOldVersions keep the store files that retained versions use
+    await fs.writeFile(
+        `${versionDir}/${ASSET_LIST_FILE}`,
+        JSON.stringify(assets.map(a => `${a.hash}.${a.ext}`)),
+    );
 
     onStatus(OtaStatus.SYNCING_ASSETS, `Syncing ${assets.length} asset(s)...`);
-    // One promise per dir: parallel workers would otherwise race mkdir (EEXIST)
+    // Native mkdir creates parents and tolerates an existing dir; this just skips repeats
     const dirs = new Map<string, Promise<void>>();
     const ensureDir = (dir: string): Promise<void> => {
         if (!dirs.has(dir)) {
-            dirs.set(dir, fs.exists(dir).then(ok => (ok ? undefined : fs.mkdir(dir))));
+            dirs.set(dir, fs.mkdir(dir));
         }
         return dirs.get(dir)!;
     };
@@ -285,18 +256,14 @@ const downloadAndSyncAssets = async (
                     if (!url) throw new Error('no URL');
                     await downloadWithRetry(url, storePath, config, () => {});
                     if (!(await verifyHash(storePath, asset.hash))) {
-                        await fs.unlink(storePath).catch(() => {});
+                        await fs.removePath(storePath).catch(() => {});
                         throw new Error('hash mismatch');
                     }
                     downloaded++;
                 }
                 const dest = `${versionDir}/${asset.originalPath}`;
-                const parts = asset.originalPath.split('/').slice(0, -1);
-                for (let i = 1; i <= parts.length; i++) {
-                    await ensureDir(`${versionDir}/${parts.slice(0, i).join('/')}`);
-                }
-                if (await fs.exists(dest)) await fs.unlink(dest);
-                await fs.cp(storePath, dest);
+                await ensureDir(dest.slice(0, dest.lastIndexOf('/')));
+                await fs.copyFile(storePath, dest);
             } catch (e) {
                 if (__DEV__) {
                     console.warn(`[otaCore] Asset ${asset.originalPath} failed:`, e);
@@ -342,7 +309,7 @@ export const getLocalAssetPath = (hash: string, ext: string): string =>
  * Gets the local filesystem path for a downloaded patch file.
  *
  * @param patch - Patch metadata object
- * @param docDir - Document directory path (use `ReactNativeBlobUtil.fs.dirs.DocumentDir`)
+ * @param docDir - Document directory path (`DOCUMENT_DIR`)
  * @returns Absolute path to the patch file
  */
 export const getLocalPatchPath = (patch: OtaPatch, docDir: string): string =>
@@ -351,15 +318,14 @@ export const getLocalPatchPath = (patch: OtaPatch, docDir: string): string =>
 /**
  * Picks the registry entry for `localV → targetV`: a patch from the OTA bundle
  * already on disk, else the full-bundle entry (store build, or outside the patch window).
+ * `patchList` is already filtered to this platform (checkUpdates).
  */
 export const selectUpdate = (
     patchList: OtaPatch[],
     localV: number,
     targetV: number,
 ): OtaPatch | undefined => {
-    const forTarget = patchList.filter(
-        p => p.toVersion === targetV && (!p.platform || p.platform === Platform.OS),
-    );
+    const forTarget = patchList.filter(p => p.toVersion === targetV);
     return (
         forTarget.find(p => p.filename && p.fromVersion === localV) ??
         forTarget.find(p => !p.filename)
@@ -417,13 +383,13 @@ const runUpdatePipeline = async (
     const log = createOtaLogger(config.onEvent);
     await ensureOtaDir();
     const totalStart = Date.now();
-    const fs = ReactNativeBlobUtil.fs;
+    const fs = NativeBsPatch;
 
     const finalBundlePath =
         getBundlePath(patch.toVersion, config.baseAppVersion) || '';
     const tempBundle = `${finalBundlePath}.tmp`;
     const versionDir = `${OTA_DIR}/v${patch.toVersion}`;
-    const localPatchPath = getLocalPatchPath(patch, fs.dirs.DocumentDir);
+    const localPatchPath = getLocalPatchPath(patch, DOCUMENT_DIR);
 
     // ── Version Compatibility ──
     // Checked before anything else so an incompatible update can't reach the full-bundle path
@@ -448,16 +414,15 @@ const runUpdatePipeline = async (
         }
     }
 
-    if (!(await fs.exists(versionDir))) {
-        await fs.mkdir(versionDir);
-    }
+    await fs.mkdir(versionDir);
 
     const download = async (remoteName: string, dest: string) => {
         log.emit(OtaEvent.DOWNLOAD_START, { version: patch.toVersion });
         const dlStart = Date.now();
+        let sizeBytes: number;
         try {
             const url = await getStorage(config).getUpdateFileUrl(remoteName, config);
-            await downloadWithRetry(url, dest, config, onProgress);
+            sizeBytes = await downloadWithRetry(url, dest, config, onProgress);
         } catch (dlError) {
             log.emit(OtaEvent.DOWNLOAD_FAIL, {
                 error: (dlError as Error).message,
@@ -466,7 +431,6 @@ const runUpdatePipeline = async (
             throw dlError;
         }
         const downloadMs = Date.now() - dlStart;
-        const sizeBytes = Number((await fs.stat(dest)).size);
         log.emit(OtaEvent.DOWNLOAD_SUCCESS, {
             version: patch.toVersion,
             durationMs: downloadMs,
@@ -477,7 +441,7 @@ const runUpdatePipeline = async (
 
     const assertHash = async (path: string, expected: string | undefined, what: string) => {
         if (!expected || (await verifyHash(path, expected))) return;
-        const actual = await fs.hash(path, 'sha256').catch(() => '');
+        const actual = await fs.hashFile(path).catch(() => '');
         log.emit(OtaEvent.HASH_MISMATCH, {
             message: `${what} hash mismatch`,
             version: patch.toVersion,
@@ -503,10 +467,7 @@ const runUpdatePipeline = async (
             );
         }
 
-        if (await fs.exists(finalBundlePath)) {
-            await fs.unlink(finalBundlePath);
-        }
-        await fs.mv(tempBundle, finalBundlePath);
+        await fs.moveFile(tempBundle, finalBundlePath);
 
         // Native version, not config.appVersion: the native resolver compares against it on boot
         const nativeAppVersion = await NativeBsPatch.getAppVersion().catch(() => config.appVersion);
@@ -556,7 +517,7 @@ const runUpdatePipeline = async (
         const applyStart = Date.now();
         const success = await NativeBsPatch.applyPatch(sourcePath, tempBundle, localPatchPath);
         const applyMs = Date.now() - applyStart;
-        await fs.unlink(localPatchPath).catch(() => {});
+        await fs.removePath(localPatchPath).catch(() => {});
         if (!success) {
             log.emit(OtaEvent.PATCH_FAIL, {
                 message: 'BsPatch returned false',
@@ -583,8 +544,8 @@ const runUpdatePipeline = async (
     };
 
     const cleanup = async () => {
-        await fs.unlink(localPatchPath).catch(() => {});
-        await fs.unlink(tempBundle).catch(() => {});
+        await fs.removePath(localPatchPath).catch(() => {});
+        await fs.removePath(tempBundle).catch(() => {});
     };
 
     // Patch only from an OTA bundle we installed ourselves (byte-identical to the build output)

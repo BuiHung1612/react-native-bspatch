@@ -207,8 +207,9 @@ fi
 
     # 3. Commit and Push to GitHub
     cd "$GH_REPO_DIR"
-    git config user.name "hungbv-taureau" 2>/dev/null || true
-    git config user.email "hungbv@taureau.ai" 2>/dev/null || true
+    # Fallback identity only where none is configured (e.g. CI); never override the user's
+    git config user.name >/dev/null || git config user.name "react-native-bspatch"
+    git config user.email >/dev/null || git config user.email "react-native-bspatch@users.noreply.github.com"
     git add .
     if git diff --staged --quiet; then
         echo "  ✓ Storage repository is up to date (no changes)."

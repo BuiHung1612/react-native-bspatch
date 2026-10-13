@@ -1,5 +1,3 @@
-import { Platform } from 'react-native';
-import ReactNativeBlobUtil from 'react-native-blob-util';
 import type { OtaConfig, OtaPatch, OtaStorageProvider } from '../types';
 
 /**
@@ -18,6 +16,21 @@ import type { OtaConfig, OtaPatch, OtaStorageProvider } from '../types';
 
 /** Headers to bypass GitHub CDN cache on mutable files (registry, manifests) */
 const NO_CACHE_HEADERS = { 'Cache-Control': 'no-cache' };
+
+/** GET + JSON.parse with a timeout (fetch has none of its own); rejects on non-2xx. */
+export const fetchJson = async (url: string, timeoutMs: number): Promise<any> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const res = await fetch(url, { headers: NO_CACHE_HEADERS, signal: controller.signal });
+        if (!res.ok) {
+            throw new Error(`HTTP ${res.status} for ${url}`);
+        }
+        return await res.json();
+    } finally {
+        clearTimeout(timer);
+    }
+};
 
 /** Append a timestamp query param to defeat CDN caches on mutable URLs */
 const bustCache = (url: string): string =>
@@ -47,21 +60,7 @@ export class GitHubRawStorageProvider implements OtaStorageProvider {
         );
 
         try {
-            const res = await ReactNativeBlobUtil.config({ timeout: 15000 }).fetch(
-                'GET',
-                registryUrl,
-                NO_CACHE_HEADERS,
-            );
-            if (res.respInfo.status !== 200) {
-                throw new Error(
-                    `Registry fetch failed with status ${res.respInfo.status}`,
-                );
-            }
-
-            const registry =
-                typeof res.data === 'string'
-                    ? JSON.parse(res.data)
-                    : res.data;
+            const registry = await fetchJson(registryUrl, 15000);
 
             if (!config.appVersion) {
                 throw new Error(
@@ -71,11 +70,7 @@ export class GitHubRawStorageProvider implements OtaStorageProvider {
             const appGroup = registry?.apps?.[config.appVersion];
             const flavorGroup = appGroup?.flavors?.[channelName];
 
-            return (flavorGroup?.patches ?? []).filter(
-                (p: OtaPatch) =>
-                    !p.platform ||
-                    p.platform.toLowerCase() === Platform.OS.toLowerCase(),
-            );
+            return flavorGroup?.patches ?? [];
         } catch (error) {
             // Surface it: "no patches" would report a broken registry as up to date
             throw new Error(`[GitHubRawStorage] Manifest fetch error: ${(error as Error).message}`);

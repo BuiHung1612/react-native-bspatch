@@ -112,8 +112,9 @@ int apply_bspatch(const char *oldfile, const char *newfile, const char *patchfil
 		old = (uint8_t *)mmap(NULL, (size_t)oldsize, PROT_READ, MAP_SHARED, fd_old, 0);
 		if (old != MAP_FAILED) {
 			old_mmapped = 1;
-#if defined(MADV_SEQUENTIAL)
-			madvise(old, (size_t)oldsize, MADV_SEQUENTIAL);
+			/* Not SEQUENTIAL: ctrl[2] seeks old backwards, so prefetch it all instead */
+#if defined(MADV_WILLNEED)
+			madvise(old, (size_t)oldsize, MADV_WILLNEED);
 #endif
 		} else {
 			/* Fallback to malloc if mmap fails */

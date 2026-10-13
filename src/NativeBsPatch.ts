@@ -1,5 +1,13 @@
-import type { TurboModule } from 'react-native';
+import type { CodegenTypes, TurboModule } from 'react-native';
 import { TurboModuleRegistry } from 'react-native';
+
+export type DownloadProgress = {
+  /** destPath passed to downloadFile */
+  path: string;
+  received: number;
+  /** -1 when the server sends no Content-Length */
+  total: number;
+};
 
 export interface Spec extends TurboModule {
   /**
@@ -46,6 +54,41 @@ export interface Spec extends TurboModule {
    * Returns the native app version (versionName on Android, CFBundleShortVersionString on iOS)
    */
   getAppVersion(): Promise<string>;
+
+  // ─── File I/O ───────────────────────────────────────────────────────
+
+  /** Directory the native resolver reads `ota/` from (filesDir on Android, Documents on iOS) */
+  getDocumentDir(): string;
+
+  /**
+   * Streams `url` to `destPath` (via `destPath.part`, renamed only on a 2xx response,
+   * replacing any existing file). Rejects on network error or non-2xx status.
+   * @param timeoutMs Idle timeout: no bytes for this long fails the download
+   * @returns Size of the downloaded file in bytes
+   */
+  downloadFile(url: string, destPath: string, timeoutMs: number): Promise<number>;
+
+  /** Lowercase hex SHA-256 of a file */
+  hashFile(path: string): Promise<string>;
+
+  exists(path: string): Promise<boolean>;
+  /** Creates the directory and any missing parents */
+  mkdir(path: string): Promise<void>;
+  /** Deletes a file or directory tree; a missing path is not an error */
+  removePath(path: string): Promise<void>;
+  /** Renames a file or directory, replacing an existing destination */
+  moveFile(from: string, to: string): Promise<void>;
+  /** Copies a file, replacing an existing destination */
+  copyFile(from: string, to: string): Promise<void>;
+  /** Entry names in a directory */
+  readDir(path: string): Promise<string[]>;
+  /** Reads a UTF-8 file */
+  readFile(path: string): Promise<string>;
+  /** Writes a UTF-8 file atomically (temp file + rename) */
+  writeFile(path: string, content: string): Promise<void>;
+
+  /** Throttled (~250ms) progress for every downloadFile in flight */
+  readonly onDownloadProgress: CodegenTypes.EventEmitter<DownloadProgress>;
 }
 
 export default TurboModuleRegistry.getEnforcing<Spec>('BsPatch');

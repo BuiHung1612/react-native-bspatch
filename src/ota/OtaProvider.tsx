@@ -16,11 +16,10 @@ import {
   Text,
   View,
 } from 'react-native';
-import ReactNativeBlobUtil from 'react-native-blob-util';
 import NativeBsPatch from '../NativeBsPatch';
 import { applyOtaPatchInternal, fetchOtaManifest, selectUpdate, validateOtaConfig } from './otaCore';
 import { createOtaLogger, OtaEvent } from './otaLogger';
-import { loadMetadata, markHealthy } from './otaMetadata';
+import { DOCUMENT_DIR, loadMetadata, markHealthy, OTA_DIR } from './otaMetadata';
 import {
   OtaConfig,
   OtaMetrics,
@@ -109,11 +108,12 @@ export function OtaProvider({
    */
   const executeApplyUpdate = useCallback(
     async (patchList: OtaPatch[], currentVer: number, targetVer: number) => {
-      console.log('[OtaProvider] executeApplyUpdate | targetV:', targetVer, 'currentV:', currentVer);
       const directPatch = selectUpdate(patchList, currentVer, targetVer);
 
       if (!directPatch) {
-        console.warn('[OtaProvider] No update entry found for', currentVer, '->', targetVer);
+        if (__DEV__) {
+          console.warn('[OtaProvider] No update entry found for', currentVer, '->', targetVer);
+        }
         setStatus(OtaStatus.ERROR);
         setMessage('No upgrade path found.');
         return;
@@ -137,7 +137,9 @@ export function OtaProvider({
           },
         );
       } catch (error) {
-        console.error('[OtaProvider] Update error:', error);
+        if (__DEV__) {
+          console.error('[OtaProvider] Update error:', error);
+        }
         setStatus(OtaStatus.ERROR);
         setMessage(`Update failed: ${(error as Error).message}`);
       }
@@ -223,21 +225,20 @@ export function OtaProvider({
       const remotePatches = await fetchOtaManifest(effectiveConfig);
       const metadata = await loadMetadata(config.baseAppVersion);
       const localV = metadata.currentVersion;
-      console.log('[OtaProvider] checkUpdates | localV:', localV, 'remotePatches count:', remotePatches.length);
 
-      // Skip versions that crashed on boot and were rolled back by the native resolver
+      // The one platform filter (storage providers return every platform).
+      // Also skips versions that crashed on boot and were rolled back natively.
       const failed = metadata.failedVersions ?? [];
       const platformPatches = remotePatches.filter(
-        p => (!p.platform || p.platform === Platform.OS) && !failed.includes(p.toVersion),
+        p =>
+          (!p.platform || p.platform.toLowerCase() === Platform.OS) &&
+          !failed.includes(p.toVersion),
       );
-      console.log('[OtaProvider] platformPatches count:', platformPatches.length);
 
       const maxV =
         platformPatches.length > 0
           ? Math.max(...platformPatches.map(p => p.toVersion))
           : localV;
-      
-      console.log('[OtaProvider] latestV determined:', maxV);
 
       setPatches(platformPatches);
       setCurrentVersion(localV);
@@ -286,10 +287,10 @@ export function OtaProvider({
   useEffect(() => {
     const bootstrap = async () => {
       // Clean up any pending trash directories from previous resets (non-blocking)
-      ReactNativeBlobUtil.fs.ls(ReactNativeBlobUtil.fs.dirs.DocumentDir).then(dirs => {
+      NativeBsPatch.readDir(DOCUMENT_DIR).then(dirs => {
         for (const dir of dirs) {
           if (dir.startsWith('ota_trash_')) {
-            ReactNativeBlobUtil.fs.unlink(`${ReactNativeBlobUtil.fs.dirs.DocumentDir}/${dir}`).catch(() => {});
+            NativeBsPatch.removePath(`${DOCUMENT_DIR}/${dir}`).catch(() => {});
           }
         }
       }).catch(() => {});
@@ -367,24 +368,22 @@ export function OtaProvider({
     };
   }, [config.updateMode, checkUpdates]);
 
-  const markAsHealthy = async () => {
+  const markAsHealthy = useCallback(async () => {
     const log = createOtaLogger(config.onEvent);
     log.emit(OtaEvent.MARK_HEALTHY);
     const appVersion = await NativeBsPatch.getAppVersion().catch(() => config.appVersion);
     await markHealthy(config.baseAppVersion, runningVersionRef.current, appVersion);
-  };
+  }, [config]);
 
-  const resetToFactory = async () => {
+  const resetToFactory = useCallback(async () => {
     const log = createOtaLogger(config.onEvent);
     try {
       setStatus(OtaStatus.APPLYING);
       setMessage('Executing system wipe...');
       log.emit(OtaEvent.RESET_FACTORY);
-      const otaDir = `${ReactNativeBlobUtil.fs.dirs.DocumentDir}/ota`;
-      if (await ReactNativeBlobUtil.fs.exists(otaDir)) {
+      if (await NativeBsPatch.exists(OTA_DIR)) {
         // Fast atomic rename to prevent blocking the JS thread during deletion of potentially 1000s of files
-        const trashDir = `${ReactNativeBlobUtil.fs.dirs.DocumentDir}/ota_trash_${Date.now()}`;
-        await ReactNativeBlobUtil.fs.mv(otaDir, trashDir);
+        await NativeBsPatch.moveFile(OTA_DIR, `${DOCUMENT_DIR}/ota_trash_${Date.now()}`);
         // Deletion is deferred to the next app bootstrap to prevent blocking the bridge before reload
       }
       setMessage('Reset complete. Core reload initiated...');
@@ -393,9 +392,10 @@ export function OtaProvider({
       setStatus(OtaStatus.ERROR);
       setMessage(`Reset failed: ${(error as Error).message}`);
     }
-  };
+  }, [config]);
 
-  const value: OtaState = {
+  // Memoized: consumers re-render only when something they can see changes
+  const value = useMemo<OtaState>(() => ({
     status,
     message,
     progress,
@@ -410,7 +410,21 @@ export function OtaProvider({
     markAsHealthy,
     checkUpdate: checkUpdates,
     reloadBundle: () => NativeBsPatch.reloadBundle(),
-  };
+  }), [
+    status,
+    message,
+    progress,
+    currentVersion,
+    latestVersion,
+    pendingCount,
+    isChecking,
+    metrics,
+    isUpdateReady,
+    applyUpdate,
+    resetToFactory,
+    markAsHealthy,
+    checkUpdates,
+  ]);
 
   // Logic to determine if we should block the UI
   const isBlocking = useMemo(() => {

@@ -13,9 +13,6 @@ set(BZIP2_SOURCES
     "bzip2/bzlib.c"
 )
 
-# React Native includes
-set(REACT_NATIVE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../../node_modules/react-native)
-
 # Add our custom library
 add_library(
         bspatch

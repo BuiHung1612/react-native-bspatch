@@ -36,6 +36,9 @@ object OtaBundleResolver {
     private const val DEFAULT_BASE_VERSION = 1
     private const val MAX_ROLLBACK = 3
 
+    /** Version this process booted (set by resolve), so markAsHealthy verifies only that one */
+    @Volatile private var launchedVersion: Int? = null
+
     /**
      * Resolves the JS bundle path from OTA metadata.
      * Handles crash detection and rollback entirely on the native side.
@@ -46,6 +49,12 @@ object OtaBundleResolver {
      */
     @JvmStatic
     fun resolve(context: Context, baseVersion: Int = DEFAULT_BASE_VERSION): String? {
+        val path = resolveBundle(context, baseVersion)
+        launchedVersion = path?.let { File(it).parentFile?.name?.removePrefix("v")?.toIntOrNull() } ?: baseVersion
+        return path
+    }
+
+    private fun resolveBundle(context: Context, baseVersion: Int): String? {
         return try {
             val otaDir = File(context.filesDir, OTA_DIR_NAME)
             val metadataFile = File(otaDir, METADATA_FILE)
@@ -97,7 +106,7 @@ object OtaBundleResolver {
                 val rollbackBundle = File(rollbackVDir, "index.android.bundle")
                 if (!rollbackBundle.exists()) {
                     Log.w(TAG, "Rollback target index.android.bundle missing in V$newVersion → factory")
-                    resetToFactory(metadataFile, baseVersion)
+                    resetToFactory(metadataFile, baseVersion, metadata)
                     return null
                 }
 
@@ -122,7 +131,7 @@ object OtaBundleResolver {
             val bundleFile = File(vDir, "index.android.bundle")
             if (!bundleFile.exists()) {
                 Log.w(TAG, "index.android.bundle missing in V$currentVersion → APK bundle")
-                resetToFactory(metadataFile, baseVersion)
+                resetToFactory(metadataFile, baseVersion, metadata)
                 return null
             }
 
@@ -210,12 +219,15 @@ object OtaBundleResolver {
     /**
      * Resets metadata to factory defaults.
      */
-    private fun resetToFactory(metadataFile: File, baseVersion: Int) {
+    private fun resetToFactory(metadataFile: File, baseVersion: Int, old: JSONObject) {
         val factory = JSONObject().apply {
             put("currentVersion", baseVersion)
             put("previousVersions", JSONArray())
             put("rollbackCount", 0)
             put("lastLaunchSuccessful", true)
+            // Keep: otherwise JS re-downloads a version that crashed on boot
+            old.optJSONArray("failedVersions")?.let { put("failedVersions", it) }
+            old.optString("appVersion", "").takeIf { it.isNotEmpty() }?.let { put("appVersion", it) }
         }
         writeMetadata(metadataFile, factory)
     }
@@ -228,6 +240,12 @@ object OtaBundleResolver {
             if (!metadataFile.exists()) return
 
             val metadata = JSONObject(metadataFile.readText())
+            // Same rule as JS markHealthy: a version installed since boot hasn't run yet, leave it pending
+            val launched = launchedVersion
+            if (launched != null) {
+                if (metadata.optInt("currentVersion", launched) != launched) return
+                metadata.put("verifiedVersion", launched)
+            }
             metadata.put("lastLaunchSuccessful", true)
             metadata.put("rollbackCount", 0)
 

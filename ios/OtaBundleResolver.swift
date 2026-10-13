@@ -36,12 +36,21 @@ public class OtaBundleResolver: NSObject {
     private static let maxRollback = 3
     private static let maxRollbackIterations = 10 // Safety limit to prevent infinite loops
 
+    /// Version this process booted (set by resolve), so markAsHealthy verifies only that one
+    private static var launchedVersion: Int?
+
     /// Resolves the JS bundle path from OTA metadata.
     /// Handles crash detection and rollback entirely on the native side.
     ///
     /// - Parameter baseVersion: The OTA version baked into the IPA (default: 1)
     /// - Returns: URL to the OTA bundle, or nil to use the IPA default.
     @objc public static func resolve(baseVersion: Int = defaultBaseVersion) -> URL? {
+        let url = resolveBundle(baseVersion: baseVersion)
+        launchedVersion = url.flatMap { Int($0.deletingLastPathComponent().lastPathComponent.dropFirst()) } ?? baseVersion
+        return url
+    }
+
+    private static func resolveBundle(baseVersion: Int) -> URL? {
         guard let documentsDir = FileManager.default.urls(
             for: .documentDirectory,
             in: .userDomainMask
@@ -102,7 +111,7 @@ public class OtaBundleResolver: NSObject {
                 let rollbackBundle = rollbackVDir.appendingPathComponent("main.jsbundle")
                 if !FileManager.default.fileExists(atPath: rollbackBundle.path) {
                     NSLog("[OtaBundleResolver] Rollback target main.jsbundle missing in V\(newVersion) → factory")
-                    resetToFactory(url: metadataURL, baseVersion: baseVersion)
+                    resetToFactory(url: metadataURL, baseVersion: baseVersion, old: metadata)
                     return nil
                 }
 
@@ -127,7 +136,7 @@ public class OtaBundleResolver: NSObject {
             let bundleURL = vDir.appendingPathComponent("main.jsbundle")
             if !FileManager.default.fileExists(atPath: bundleURL.path) {
                 NSLog("[OtaBundleResolver] main.jsbundle missing in V\(currentVersion) → IPA bundle")
-                resetToFactory(url: metadataURL, baseVersion: baseVersion)
+                resetToFactory(url: metadataURL, baseVersion: baseVersion, old: metadata)
                 return nil
             }
 
@@ -212,13 +221,16 @@ public class OtaBundleResolver: NSObject {
         ]
     }
 
-    private static func resetToFactory(url: URL, baseVersion: Int) {
-        let factory: [String: Any] = [
+    private static func resetToFactory(url: URL, baseVersion: Int, old: [String: Any]) {
+        var factory: [String: Any] = [
             "currentVersion": baseVersion,
             "previousVersions": [Int](),
             "rollbackCount": 0,
             "lastLaunchSuccessful": true
         ]
+        // Keep: otherwise JS re-downloads a version that crashed on boot
+        factory["failedVersions"] = old["failedVersions"]
+        factory["appVersion"] = old["appVersion"]
         writeMetadata(url: url, metadata: factory)
     }
 
@@ -243,9 +255,14 @@ public class OtaBundleResolver: NSObject {
                 return
             }
 
+            // Same rule as JS markHealthy: a version installed since boot hasn't run yet, leave it pending
+            if let launched = launchedVersion {
+                if (metadata["currentVersion"] as? Int ?? launched) != launched { return }
+                metadata["verifiedVersion"] = launched
+            }
             metadata["lastLaunchSuccessful"] = true
             metadata["rollbackCount"] = 0
-            
+
             writeMetadata(url: metadataURL, metadata: metadata)
             NSLog("[OtaBundleResolver] App marked as healthy")
         } catch {
