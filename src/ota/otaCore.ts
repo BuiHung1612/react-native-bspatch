@@ -5,9 +5,9 @@
  *  - Download patches with retry
  *  - Verify integrity (SHA-256 hash)
  *  - Verify security (RSA/ECDSA signature)
- *  - Apply binary patch (bsdiff)
+ *  - Apply binary patch (bsdiff) from the installed OTA bundle
+ *  - Full bundle download (first OTA after a store install, or patch failure)
  *  - Atomic bundle swap
- *  - Full bundle fallback on failure
  *  - Structured telemetry logging
  */
 
@@ -20,7 +20,7 @@ import {
     getBundlePath,
     loadMetadata,
     registerNewVersion,
-    saveMetadata,
+    updateMetadata,
 } from './otaMetadata';
 import { GitHubRawStorageProvider } from './storage/GitHubRawStorage';
 import {
@@ -38,9 +38,25 @@ const OTA_DIR = `${ReactNativeBlobUtil.fs.dirs.DocumentDir}/ota`;
 
 const DEFAULT_STORAGE = new GitHubRawStorageProvider();
 
-/** Explicit `config.storage` (e.g. a future Cloudflare provider) or GitHub raw. */
+/** Explicit `config.storage` or the default static-host provider (GitHub raw, R2, CDN...). */
 const getStorage = (config: OtaConfig): OtaStorageProvider =>
     config.storage ?? DEFAULT_STORAGE;
+
+/**
+ * Returns a message for config the default provider can't work with, else null.
+ * No fallbacks: a missing env value must surface, not silently point somewhere else.
+ */
+export const validateOtaConfig = (config: OtaConfig): string | null => {
+    if (config.storage) return null;
+    const { baseUrl, channel } = config.customServer ?? {};
+    if (!baseUrl || !/^https?:\/\//.test(baseUrl)) {
+        return `customServer.baseUrl must be an http(s) URL, got ${JSON.stringify(baseUrl)}`;
+    }
+    if (!channel) {
+        return `customServer.channel is required, got ${JSON.stringify(channel)}`;
+    }
+    return null;
+};
 
 // ─── Helpers ──────────────────────────────────────────────────────────
 
@@ -181,22 +197,10 @@ const downloadWithRetry = async (
  * the app can still apply updates that were bundled at build time.
  *
  * @param config - OTA configuration containing storage provider and fallback patches
- * @returns Array of available patches, or bundled patches if remote fetch fails
+ * @returns Patches for this app version + channel; rejects if the registry can't be read
  */
-export const fetchOtaManifest = async (
-    config: OtaConfig,
-): Promise<OtaPatch[]> => {
-    try {
-        const storage = getStorage(config);
-        return await storage.fetchManifest(config);
-    } catch (error) {
-        console.warn(
-            '[otaCore] Manifest fetch error:',
-            (error as Error).message,
-        );
-        return config.bundledPatches || [];
-    }
-};
+export const fetchOtaManifest = (config: OtaConfig): Promise<OtaPatch[]> =>
+    getStorage(config).fetchManifest(config);
 
 // ─── Hashed Asset Store ───────────────────────────────────────────────
 
@@ -273,11 +277,9 @@ const downloadAndSyncAssets = async (
         }
 
         const manifest = JSON.parse(manifestData);
-        // Filter out base assets, we don't need to download them
         // Hash/ext become file names: reject anything that isn't a plain sha256 + extension
         assets = (manifest.assets || []).filter(
             (a: any) =>
-                !a.isBase &&
                 /^[a-f0-9]{64}$/i.test(a.hash) &&
                 /^[a-z0-9]+$/i.test(a.ext),
         );
@@ -416,24 +418,37 @@ export const getLocalAssetPath = (hash: string, ext: string): string =>
 export const getLocalPatchPath = (patch: OtaPatch, docDir: string): string =>
     `${docDir}/ota/patch-${patch.appVersion}-${patch.id}.patch`;
 
+/**
+ * Picks the registry entry for `localV → targetV`: a patch from the OTA bundle
+ * already on disk, else the full-bundle entry (store build, or outside the patch window).
+ */
+export const selectUpdate = (
+    patchList: OtaPatch[],
+    localV: number,
+    targetV: number,
+): OtaPatch | undefined => {
+    const forTarget = patchList.filter(
+        p => p.toVersion === targetV && (!p.platform || p.platform === Platform.OS),
+    );
+    return (
+        forTarget.find(p => p.filename && p.fromVersion === localV) ??
+        forTarget.find(p => !p.filename)
+    );
+};
+
 // ─── Main Update Pipeline ─────────────────────────────────────────────
 
 /**
- * Applies a single patch and reloads the bundle.
+ * Installs one OTA version.
  *
- * Pipeline:
- *  1. Version compatibility check
- *  2. Download patch (with retry)
- *  4. Security signature check
- *  5. Resolve source bundle
- *  6. Verify source hash
- *  7. Apply binary patch
- *  8. Verify result hash
- *  9. Atomic commit (mv)
- * 10. Update metadata
- * 11. Reload bundle
+ * Patch path (an OTA bundle for `patch.fromVersion` is on disk):
+ *   download patch → signature → source hash → bspatch → result hash/signature
+ * Full path (store build, no patch, or patch path failed):
+ *   download full bundle → hash → signature
+ * Both then: sync assets → atomic commit → metadata → mark healthy → reload.
  *
- * On failure → fallback to full bundle download if URL available.
+ * The store build's bundle is never used as a patch source: it can't be
+ * reproduced byte-for-byte at build time, so the first OTA is always a full download.
  */
 let updateInFlight = false;
 
@@ -472,263 +487,146 @@ const runUpdatePipeline = async (
     const log = createOtaLogger(config.onEvent);
     await ensureOtaDir();
     const totalStart = Date.now();
+    const fs = ReactNativeBlobUtil.fs;
 
     const finalBundlePath =
         getBundlePath(patch.toVersion, config.baseAppVersion) || '';
     const tempBundle = `${finalBundlePath}.tmp`;
-    const localPatchPath = getLocalPatchPath(
-        patch,
-        ReactNativeBlobUtil.fs.dirs.DocumentDir,
-    );
+    const versionDir = `${OTA_DIR}/v${patch.toVersion}`;
+    const localPatchPath = getLocalPatchPath(patch, fs.dirs.DocumentDir);
 
-    // Cached per asset hash, so calling it again in the fallback is cheap
-    const syncAssets = async () => {
-        if (!patch.assetManifestUrl) return;
-        const manifestUrl = await getStorage(config).getUpdateFileUrl(
-            patch.assetManifestUrl,
-            config,
-        );
-        await downloadAndSyncAssets(
-            manifestUrl,
-            patch.toVersion,
-            config,
-            log,
-            onStatus,
-            onProgress,
-        );
+    // ── Version Compatibility ──
+    // Checked before anything else so an incompatible update can't reach the full-bundle path
+    if (patch.minAppVersion) {
+        let currentAppVer = config.appVersion;
+        if (!currentAppVer) {
+            currentAppVer = await NativeBsPatch.getAppVersion().catch(() => undefined);
+        }
+        if (!currentAppVer) {
+            throw new Error(
+                '[otaCore] Cannot verify minAppVersion: Native App Version could not be determined.',
+            );
+        }
+        if (!semverGte(currentAppVer, patch.minAppVersion)) {
+            log.emit(OtaEvent.VERSION_INCOMPATIBLE, {
+                message: `App ${currentAppVer} < required ${patch.minAppVersion}`,
+                version: patch.toVersion,
+            });
+            throw new Error(
+                `Native app ${currentAppVer} is too old. Update to ${patch.minAppVersion}+ first.`,
+            );
+        }
+    }
+
+    if (!(await fs.exists(versionDir))) {
+        await fs.mkdir(versionDir);
+    }
+
+    const download = async (remoteName: string, dest: string) => {
+        log.emit(OtaEvent.DOWNLOAD_START, { version: patch.toVersion });
+        const dlStart = Date.now();
+        try {
+            const url = await getStorage(config).getUpdateFileUrl(remoteName, config);
+            await downloadWithRetry(url, dest, config, onProgress);
+        } catch (dlError) {
+            log.emit(OtaEvent.DOWNLOAD_FAIL, {
+                error: (dlError as Error).message,
+                version: patch.toVersion,
+            });
+            throw dlError;
+        }
+        const downloadMs = Date.now() - dlStart;
+        const sizeBytes = Number((await fs.stat(dest)).size);
+        log.emit(OtaEvent.DOWNLOAD_SUCCESS, {
+            version: patch.toVersion,
+            durationMs: downloadMs,
+            sizeKB: sizeBytes / 1024,
+        });
+        return { downloadMs, sizeBytes };
     };
 
-    try {
-        // ── Step 1: Version Compatibility ──
-        if (patch.minAppVersion) {
-            let currentAppVer = config.appVersion;
-            if (!currentAppVer && typeof NativeBsPatch.getAppVersion === 'function') {
-                try {
-                    currentAppVer = await NativeBsPatch.getAppVersion();
-                } catch {
-                    currentAppVer = undefined;
-                }
-            }
-            if (!currentAppVer) {
-                throw new Error(
-                    `[otaCore] Cannot verify minAppVersion: Native App Version could not be determined.`,
-                );
-            }
-            if (!semverGte(currentAppVer, patch.minAppVersion)) {
-                log.emit(OtaEvent.VERSION_INCOMPATIBLE, {
-                    message: `App ${currentAppVer} < required ${patch.minAppVersion}`,
-                    version: patch.toVersion,
-                });
-                throw new Error(
-                    `Native app ${currentAppVer} is too old. Update to ${patch.minAppVersion}+ first.`,
-                );
-            }
-        }
+    const assertHash = async (path: string, expected: string | undefined, what: string) => {
+        if (!expected || (await verifyHash(path, expected))) return;
+        const actual = await fs.hash(path, 'sha256').catch(() => '');
+        log.emit(OtaEvent.HASH_MISMATCH, {
+            message: `${what} hash mismatch`,
+            version: patch.toVersion,
+            metadata: { expected, actual, path },
+        });
+        throw new Error(`${what} hash mismatch`);
+    };
 
-        // ── Step 2: Download ──
-        let downloadMs = 0;
-        let patchSizeBytes = 0;
-        let fromCache = false;
-
-        if (await ReactNativeBlobUtil.fs.exists(localPatchPath)) {
-            const stat = await ReactNativeBlobUtil.fs.stat(localPatchPath);
-            patchSizeBytes = Number(stat.size);
-            fromCache = true;
-            onProgress(100);
-        } else {
-            log.emit(OtaEvent.DOWNLOAD_START, { version: patch.toVersion });
-            onStatus(
-                OtaStatus.DOWNLOADING,
-                `Downloading V${patch.toVersion}...`,
+    /** tempBundle is verified: sync assets, swap it in, record the version, reload. */
+    const commit = async (metrics: Omit<OtaMetrics, 'totalMs' | 'fromCache'>) => {
+        if (patch.assetManifestUrl) {
+            const manifestUrl = await getStorage(config).getUpdateFileUrl(
+                patch.assetManifestUrl,
+                config,
             );
-            const dlStart = Date.now();
-            try {
-                const storage = getStorage(config);
-                const url = await storage.getUpdateFileUrl(
-                    patch.filename,
-                    config,
-                );
-
-                await downloadWithRetry(
-                    url,
-                    localPatchPath,
-                    config,
-                    onProgress,
-                    {},
-                );
-                downloadMs = Date.now() - dlStart;
-                const stat = await ReactNativeBlobUtil.fs.stat(localPatchPath);
-                patchSizeBytes = Number(stat.size);
-                log.emit(OtaEvent.DOWNLOAD_SUCCESS, {
-                    version: patch.toVersion,
-                    durationMs: downloadMs,
-                    sizeKB: patchSizeBytes / 1024,
-                });
-            } catch (dlError) {
-                log.emit(OtaEvent.DOWNLOAD_FAIL, {
-                    error: (dlError as Error).message,
-                    version: patch.toVersion,
-                });
-                throw dlError;
-            }
+            await downloadAndSyncAssets(
+                manifestUrl,
+                patch.toVersion,
+                config,
+                log,
+                onStatus,
+                onProgress,
+            );
         }
 
-        // ── Step 4: Signature Verification ──
-        // Verify before feeding the patch to native bspatch
-        if (config.publicKey) {
-            onStatus(OtaStatus.APPLYING, 'Verifying signature...');
-            try {
-                await assertSigned(localPatchPath, patch.signature, config, 'Patch');
-            } catch (sigError) {
-                log.emit(OtaEvent.SIGNATURE_INVALID, { version: patch.toVersion });
-                throw sigError;
-            }
+        if (await fs.exists(finalBundlePath)) {
+            await fs.unlink(finalBundlePath);
         }
+        await fs.mv(tempBundle, finalBundlePath);
 
-        // ── Step 4.2: Download & Sync Assets ──
-        await syncAssets();
-
-        // ── Step 5: Resolve Source Bundle ──
-        onStatus(OtaStatus.APPLYING, 'Preparing source...');
-        const metadata = await loadMetadata(config.baseAppVersion);
-        const oldBundlePath = getBundlePath(
-            metadata.currentVersion,
-            config.baseAppVersion,
+        // Native version, not config.appVersion: the native resolver compares against it on boot
+        const nativeAppVersion = await NativeBsPatch.getAppVersion().catch(() => config.appVersion);
+        await updateMetadata(config.baseAppVersion, metadata =>
+            registerNewVersion(metadata, patch.toVersion, nativeAppVersion),
         );
 
-        // ── Resolve the actual old bundle path ──────────────────────────────
-        // getBundlePath returns null when currentVersion == baseAppVersion, meaning
-        // "use the APK's baked-in bundle". However, if BASE_APP_VERSION was bumped
-        // to match a version that was applied via OTA (not actually baked into the
-        // installed APK), direct APK extraction would produce a DIFFERENT file than
-        // what the build script recorded as the baseHash for the next patch.
-        //
-        // Strategy (in order of precedence):
-        //   1. Use the explicit OTA bundle path from getBundlePath (version > base) ✓
-        //   2. If null (version == base), check for a previously OTA-stored bundle
-        //      at ota/v{currentVersion}/ — its hash matches the server registry.
-        //   3. Fall back to APK extraction only if no OTA bundle exists on disk.
-        const bundleFilename =
-            Platform.OS === 'android'
-                ? 'index.android.bundle'
-                : 'main.jsbundle';
+        const totalMs = Date.now() - totalStart;
+        log.emit(OtaEvent.PATCH_SUCCESS, {
+            version: patch.toVersion,
+            durationMs: totalMs,
+            sizeKB: metrics.patchSizeKB,
+        });
+        onStatus(OtaStatus.SUCCESS, `Update V${patch.toVersion} Successful!`, {
+            ...metrics,
+            totalMs,
+            fromCache: false,
+        });
 
-        let actualOldPath = '';
-        if (!oldBundlePath) {
-            // currentVersion == baseAppVersion: prefer OTA-stored bundle for this
-            // version over APK extraction (handles BASE_APP_VERSION bump scenarios).
-            const otaStoredPath = `${OTA_DIR}/v${metadata.currentVersion}/${bundleFilename}`;
-            if (await ReactNativeBlobUtil.fs.exists(otaStoredPath)) {
-                if (__DEV__) {
-                    console.log(
-                        `[otaCore] Source: OTA-stored bundle for V${metadata.currentVersion} (BASE_APP_VERSION match)`,
-                    );
-                }
-                actualOldPath = otaStoredPath;
-            } else {
-                // True base: extract byte-for-byte from APK assets.
-                // RNFS.copyFileAssets is known to produce inconsistent bytes in some
-                // APK configurations (e.g., release signing + resource shrinking).
-                // Re-extract every time: a cached copy can be partial or left over
-                // from the previous store build. It's one local copy per update.
-                actualOldPath = `${OTA_DIR}/base.hbc`;
-                await NativeBsPatch.extractBundleFromAssets(
-                    bundleFilename,
-                    actualOldPath,
-                );
-            }
-        } else {
-            actualOldPath = oldBundlePath;
-        }
-
-        // ── Debug: log file sizes for diagnostic ──
-        try {
-            const oldStat = await ReactNativeBlobUtil.fs.stat(actualOldPath);
-            const patchStat = await ReactNativeBlobUtil.fs.stat(
-                localPatchPath,
+        // registerNewVersion left lastLaunchSuccessful=true: the native resolver marks the
+        // first launch of the new version pending, and JS marks it healthy once it renders.
+        if (options.autoReload !== false) {
+            NativeBsPatch.reloadBundle();
+        } else if (__DEV__) {
+            console.log(
+                `[otaCore] V${patch.toVersion} prepared in background — applies on next launch.`,
             );
-            if (__DEV__) {
-                console.log(
-                    `[otaCore] DEBUG old bundle size=${oldStat.size} path=${actualOldPath}`,
-                );
-                console.log(
-                    `[otaCore] DEBUG patch size=${patchStat.size} path=${localPatchPath}`,
-                );
-                console.log(
-                    `[otaCore] DEBUG baseHash expected=${patch.baseHash}`,
-                );
-            }
-        } catch {
-            // Non-fatal: stat is for diagnostic only
         }
+    };
 
-        // ── Step 6: Verify Source Integrity ──
-        if (patch.baseHash) {
-            log.emit(OtaEvent.HASH_VERIFY_START, {
-                message: 'Verifying source bundle',
-            });
-            onStatus(OtaStatus.APPLYING, 'Verifying source integrity...');
-            const isValid = await verifyHash(actualOldPath, patch.baseHash);
-            if (!isValid) {
-                // Re-hash only for the diagnostic log (verifyHash doesn't return the actual hash)
-                let actualSourceHash = '';
-                let srcSize = 'unknown';
-                try {
-                    actualSourceHash = await ReactNativeBlobUtil.fs.hash(
-                        actualOldPath,
-                        'sha256',
-                    );
-                    const srcStat = await ReactNativeBlobUtil.fs.stat(
-                        actualOldPath,
-                    );
-                    srcSize = `${srcStat.size} bytes`;
-                } catch {
-                    // stat failure is non-fatal for the error message
-                }
-                if (__DEV__) {
-                    console.error(
-                        '[otaCore] SOURCE HASH MISMATCH\n' +
-                            `  path:     ${actualOldPath}\n` +
-                            `  size:     ${srcSize}\n` +
-                            `  expected: ${patch.baseHash}\n` +
-                            `  actual:   ${actualSourceHash}\n` +
-                            `  patch.id: ${patch.id} (v${patch.fromVersion}→v${patch.toVersion})`,
-                    );
-                }
-                log.emit(OtaEvent.HASH_MISMATCH, {
-                    version: metadata.currentVersion,
-                    message: 'Source bundle hash mismatch',
-                    metadata: {
-                        expected: patch.baseHash,
-                        actual: actualSourceHash,
-                        path: actualOldPath,
-                    },
-                });
-                throw new Error(
-                    'Source bundle hash mismatch. Fallback required.',
-                );
-            }
-            log.emit(OtaEvent.HASH_VERIFY_SUCCESS, {
-                message: 'Source bundle verified',
-            });
-        }
+    const applyPatchFile = async (sourcePath: string) => {
+        onStatus(OtaStatus.DOWNLOADING, `Downloading V${patch.toVersion}...`);
+        const { downloadMs, sizeBytes } = await download(patch.filename!, localPatchPath);
 
-        // ── Step 7: Apply Patch ──
-        const versionDir = `${OTA_DIR}/v${patch.toVersion}`;
-        if (!(await ReactNativeBlobUtil.fs.exists(versionDir))) {
-            await ReactNativeBlobUtil.fs.mkdir(versionDir);
+        // Verify before feeding the patch to native bspatch
+        onStatus(OtaStatus.APPLYING, 'Verifying...');
+        try {
+            await assertSigned(localPatchPath, patch.signature, config, 'Patch');
+        } catch (sigError) {
+            log.emit(OtaEvent.SIGNATURE_INVALID, { version: patch.toVersion });
+            throw sigError;
         }
+        await assertHash(sourcePath, patch.baseHash, 'Source bundle');
 
         log.emit(OtaEvent.PATCH_START, { version: patch.toVersion });
         onStatus(OtaStatus.APPLYING, 'Applying binary patch...');
         const applyStart = Date.now();
-        const success = await NativeBsPatch.applyPatch(
-            actualOldPath,
-            tempBundle,
-            localPatchPath,
-        );
+        const success = await NativeBsPatch.applyPatch(sourcePath, tempBundle, localPatchPath);
         const applyMs = Date.now() - applyStart;
-
+        await fs.unlink(localPatchPath).catch(() => {});
         if (!success) {
             log.emit(OtaEvent.PATCH_FAIL, {
                 message: 'BsPatch returned false',
@@ -737,209 +635,57 @@ const runUpdatePipeline = async (
             throw new Error('BsPatch application failed');
         }
 
-        // ── Step 8: Verify Result Integrity ──
-        if (patch.bundleHash) {
-            log.emit(OtaEvent.HASH_VERIFY_START, {
-                message: 'Verifying result bundle',
-            });
-            onStatus(OtaStatus.APPLYING, 'Verifying integrity...');
-            const isValid = await verifyHash(tempBundle, patch.bundleHash);
-
-            if (!isValid) {
-                console.error(
-                    '[otaCore] Result bundle hash mismatch | expected:',
-                    patch.bundleHash,
-                    'path:',
-                    tempBundle,
-                );
-                log.emit(OtaEvent.HASH_MISMATCH, {
-                    message: 'Result bundle hash mismatch',
-                    version: patch.toVersion,
-                    metadata: {
-                        expected: patch.bundleHash,
-                        path: tempBundle,
-                    },
-                });
-                throw new Error('Result bundle hash mismatch');
-            }
-            log.emit(OtaEvent.HASH_VERIFY_SUCCESS, {
-                message: 'Result bundle verified',
-            });
-        }
-
+        await assertHash(tempBundle, patch.bundleHash, 'Result bundle');
         await assertSigned(tempBundle, patch.bundleSignature, config, 'Bundle');
+        await commit({ patchSizeKB: sizeBytes / 1024, downloadMs, applyMs });
+    };
 
-        // ── Step 9: Atomic Commit ──
-        if (await ReactNativeBlobUtil.fs.exists(finalBundlePath)) {
-            await ReactNativeBlobUtil.fs.unlink(finalBundlePath);
+    const installFullBundle = async () => {
+        if (!patch.fullBundleUrl) {
+            throw new Error(`No full bundle for V${patch.toVersion}`);
         }
-        await ReactNativeBlobUtil.fs.mv(tempBundle, finalBundlePath);
+        log.emit(OtaEvent.FALLBACK_FULL_BUNDLE, { version: patch.toVersion });
+        onStatus(OtaStatus.DOWNLOADING, `Downloading V${patch.toVersion} (full bundle)...`);
+        const { downloadMs, sizeBytes } = await download(patch.fullBundleUrl, tempBundle);
+        await assertHash(tempBundle, patch.bundleHash, 'Full bundle');
+        await assertSigned(tempBundle, patch.bundleSignature, config, 'Full bundle');
+        await commit({ patchSizeKB: sizeBytes / 1024, downloadMs, applyMs: 0 });
+    };
 
-        await ReactNativeBlobUtil.fs.unlink(localPatchPath).catch(() => {});
+    const cleanup = async () => {
+        await fs.unlink(localPatchPath).catch(() => {});
+        await fs.unlink(tempBundle).catch(() => {});
+    };
 
-        // ── Step 10: Update Metadata ──
-        const newMetadata = registerNewVersion(metadata, patch.toVersion, config.appVersion);
-        await saveMetadata(newMetadata);
+    // Patch only from an OTA bundle we installed ourselves (byte-identical to the build output)
+    const metadata = await loadMetadata(config.baseAppVersion);
+    const sourcePath = getBundlePath(metadata.currentVersion, config.baseAppVersion);
+    const canPatch =
+        !!patch.filename &&
+        patch.fromVersion === metadata.currentVersion &&
+        !!sourcePath &&
+        (await fs.exists(sourcePath));
 
-        const totalMs = Date.now() - totalStart;
-        log.emit(OtaEvent.PATCH_SUCCESS, {
-            version: patch.toVersion,
-            durationMs: totalMs,
-            sizeKB: patchSizeBytes / 1024,
-        });
-
-        onStatus(OtaStatus.SUCCESS, `Update V${patch.toVersion} Successful!`, {
-            patchSizeKB: patchSizeBytes / 1024,
-            downloadMs,
-            applyMs,
-            totalMs,
-            fromCache,
-        });
-
-        // ── Step 11: Reload ──
-        // Mark healthy BEFORE reload — reloadBundle() calls Runtime.exit(0)
-        NativeBsPatch.markAsHealthy();
-
-        if (options.autoReload !== false) {
+    if (canPatch) {
+        try {
+            await applyPatchFile(sourcePath!);
+            return;
+        } catch (error) {
+            await cleanup();
             if (__DEV__) {
-                console.log(
-                    `[otaCore] V${patch.toVersion} marked healthy — reloading.`,
-                );
+                console.warn('[otaCore] Patch failed, falling back to full bundle:', error);
             }
-            NativeBsPatch.reloadBundle();
-        } else {
-            if (__DEV__) {
-                console.log(
-                    `[otaCore] V${patch.toVersion} prepared silently in background — will apply on next launch.`,
-                );
+            if (!patch.fullBundleUrl) {
+                onStatus(OtaStatus.ERROR, `Error: ${(error as Error).message}`);
+                throw error;
             }
         }
+    }
+
+    try {
+        await installFullBundle();
     } catch (error) {
-        if (__DEV__) {
-            console.error('[otaCore] Pipeline failed:', error);
-        }
-        await ReactNativeBlobUtil.fs.unlink(localPatchPath).catch(() => {});
-        await ReactNativeBlobUtil.fs.unlink(tempBundle).catch(() => {});
-
-        // ── Fallback: Full Bundle Download ──
-        if (patch.fullBundleUrl) {
-            try {
-                onStatus(
-                    OtaStatus.DOWNLOADING,
-                    'Fallback: Downloading full bundle...',
-                );
-                const storage = getStorage(config);
-                const url = await storage.getUpdateFileUrl(
-                    patch.fullBundleUrl || patch.filename,
-                    config,
-                );
-
-                const versionDir = `${OTA_DIR}/v${patch.toVersion}`;
-                if (!(await ReactNativeBlobUtil.fs.exists(versionDir))) {
-                    await ReactNativeBlobUtil.fs.mkdir(versionDir);
-                }
-                await downloadWithRetry(
-                    url,
-                    tempBundle,
-                    config,
-                    onProgress,
-                    {},
-                );
-
-                // Verify full bundle hash
-                if (patch.bundleHash) {
-                    const isValid = await verifyHash(
-                        tempBundle,
-                        patch.bundleHash,
-                    );
-                    if (!isValid) {
-                        let actualHash = '';
-                        let size: number | undefined;
-                        try {
-                            actualHash = await ReactNativeBlobUtil.fs.hash(
-                                tempBundle,
-                                'sha256',
-                            );
-                            const stat = await ReactNativeBlobUtil.fs.stat(
-                                tempBundle,
-                            );
-                            size = stat.size;
-                        } catch {
-                            // stat failure is non-fatal
-                        }
-                        if (__DEV__) {
-                            console.error(
-                                '[otaCore] Full bundle hash mismatch | expected:',
-                                patch.bundleHash,
-                                'actual:',
-                                actualHash,
-                            );
-                        }
-                        log.emit(OtaEvent.HASH_MISMATCH, {
-                            message: 'Full bundle hash mismatch',
-                            metadata: {
-                                expected: patch.bundleHash,
-                                actual: actualHash,
-                                size,
-                            },
-                        });
-                        throw new Error(
-                            'Full bundle hash mismatch after fallback',
-                        );
-                    }
-                }
-
-                await assertSigned(tempBundle, patch.bundleSignature, config, 'Full bundle');
-                await syncAssets();
-
-                // Atomic swap
-                if (await ReactNativeBlobUtil.fs.exists(finalBundlePath)) {
-                    await ReactNativeBlobUtil.fs.unlink(finalBundlePath);
-                }
-                await ReactNativeBlobUtil.fs.mv(tempBundle, finalBundlePath);
-
-                const metadata = await loadMetadata(config.baseAppVersion);
-                const newMetadata = registerNewVersion(
-                    metadata,
-                    patch.toVersion,
-                    config.appVersion,
-                );
-                await saveMetadata(newMetadata);
-
-                // ── CRITICAL: Mark healthy BEFORE reload so native OtaBundleResolver
-                // does NOT see lastLaunchSuccessful=false on the very next boot and
-                // immediately rollback the version we just successfully downloaded.
-                // (reloadBundle() calls Runtime.exit(0) — JS won't run again before restart)
-                NativeBsPatch.markAsHealthy();
-                if (__DEV__) {
-                    console.log(
-                        `[otaCore] Fallback V${patch.toVersion} marked healthy — reloading.`,
-                    );
-                }
-
-                if (options.autoReload !== false) {
-                    onStatus(
-                        OtaStatus.SUCCESS,
-                        `Fallback successful! Reloading...`,
-                    );
-                    NativeBsPatch.reloadBundle();
-                } else {
-                    onStatus(
-                        OtaStatus.SUCCESS,
-                        `Fallback bundle prepared silently in background.`,
-                    );
-                }
-                return;
-            } catch (fallbackError) {
-                if (__DEV__) {
-                    console.error(
-                        '[otaCore] Full bundle fallback also failed:',
-                        fallbackError,
-                    );
-                }
-            }
-        }
-
+        await cleanup();
         onStatus(OtaStatus.ERROR, `Error: ${(error as Error).message}`);
         throw error;
     }

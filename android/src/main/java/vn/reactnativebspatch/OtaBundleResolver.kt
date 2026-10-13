@@ -19,8 +19,9 @@ import java.io.File
  *   2. If lastLaunchSuccessful == false → rollback to previous version
  *   3. Mark current launch as pending (lastLaunchSuccessful = false)
  *   4. Return the bundle path (or null for APK default)
- *   5. JS calls markAsHealthy() → sets lastLaunchSuccessful = true
- *   6. If crash before markAsHealthy → next boot sees false → rollback
+ *   5. JS marks healthy after first render → lastLaunchSuccessful = true, verifiedVersion = current
+ *   6. If crash before that → next boot sees false → rollback
+ *   7. A verified version is never marked pending again (later crashes/kills don't roll it back)
  *
  * Usage in MainApplication.kt:
  * ```
@@ -70,6 +71,8 @@ object OtaBundleResolver {
             val currentVersion = metadata.optInt("currentVersion", baseVersion)
             val lastLaunchOk = metadata.optBoolean("lastLaunchSuccessful", true)
             val rollbackCount = metadata.optInt("rollbackCount", 0)
+            // Verified = launched and rendered before; never pending, never rolled back
+            val verifiedVersion = metadata.optInt("verifiedVersion", -1)
 
             // ── Step 1: Crash detection & rollback ──────────────────────────
             if (!lastLaunchOk && currentVersion > baseVersion) {
@@ -80,6 +83,7 @@ object OtaBundleResolver {
                 metadata = performRollback(metadata, baseVersion, rollbackCount, otaDir)
                 metadata.put("failedVersions", failed)
                 metadata.put("appVersion", otaAppVersion)
+                if (verifiedVersion >= 0) metadata.put("verifiedVersion", verifiedVersion)
                 writeMetadata(metadataFile, metadata)
 
                 val newVersion = metadata.optInt("currentVersion", baseVersion)
@@ -98,8 +102,10 @@ object OtaBundleResolver {
                 }
 
                 // Mark this rollback attempt as pending
-                metadata.put("lastLaunchSuccessful", false)
-                writeMetadata(metadataFile, metadata)
+                if (newVersion != verifiedVersion) {
+                    metadata.put("lastLaunchSuccessful", false)
+                    writeMetadata(metadataFile, metadata)
+                }
 
                 Log.i(TAG, "Trying rollback bundle: ${rollbackBundle.absolutePath}")
                 return rollbackBundle.absolutePath
@@ -122,8 +128,10 @@ object OtaBundleResolver {
 
             // Mark launch as pending — if Hermes crashes loading this bundle,
             // the next boot will see false and trigger rollback
-            metadata.put("lastLaunchSuccessful", false)
-            writeMetadata(metadataFile, metadata)
+            if (currentVersion != verifiedVersion) {
+                metadata.put("lastLaunchSuccessful", false)
+                writeMetadata(metadataFile, metadata)
+            }
 
             Log.i(TAG, "Loading OTA bundle: ${bundleFile.absolutePath}")
             bundleFile.absolutePath

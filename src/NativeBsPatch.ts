@@ -15,11 +15,6 @@ export interface Spec extends TurboModule {
     patchPath: string,
   ): Promise<boolean>;
 
-  extractBundleFromAssets(
-    assetName: string,
-    destPath: string,
-  ): Promise<boolean>;
-
   /**
    * Mark the current boot as healthy to prevent rollback
    */

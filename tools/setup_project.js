@@ -3,8 +3,7 @@
 // react-native-bspatch Setup Script
 //
 // Automatically injects OTA integration into a React Native project:
-//   - iOS:     Patches project.pbxproj (Xcode build phase bundle sync)
-//              Patches AppDelegate.swift (import + bundleURL override)
+//   - iOS:     Patches AppDelegate.swift (import + bundleURL override)
 //   - Android: Patches MainApplication.kt (import + jsBundleFilePath)
 //
 // Idempotent: safe to run multiple times; skips already-patched files.
@@ -50,84 +49,17 @@ function patchFile(filePath, label, patchFn) {
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-// Plain shell; escaped below for the pbxproj shellScript string literal
-const XCODE_BUNDLE_SYNC_SNIPPET = [
-    '',
-    '# [react-native-bspatch] Sync compiled bundle to output/ for OTA builds',
-    'DEST_FILE="$PROJECT_DIR/output/main.jsbundle"',
-    'BUNDLE_RESULT="$CONFIGURATION_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/main.jsbundle"',
-    '',
-    'if [ -f "$BUNDLE_RESULT" ]; then',
-    '  mkdir -p "$(dirname "$DEST_FILE")"',
-    '  cp "$BUNDLE_RESULT" "$DEST_FILE"',
-    '  echo "Bundle synced to $DEST_FILE"',
-    '  if [ "$CONFIGURATION" = "Release" ]; then',
-    '    APP_VER="${MARKETING_VERSION:-1.0.0}"',
-    '    # v1 = the store build; never overwrite it (delete the file to re-capture)',
-    '    for FLAVOR in development staging production; do',
-    '      DEST_V1="$PROJECT_DIR/output/bundle_${APP_VER}_v1_ios_${FLAVOR}.hbc"',
-    '      if [ ! -f "$DEST_V1" ]; then',
-    '        cp "$BUNDLE_RESULT" "$DEST_V1"',
-    '        echo "[react-native-bspatch] ✓ Auto-captured iOS base bundle v1 ($FLAVOR)"',
-    '      fi',
-    '    done',
-    '  fi',
-    'else',
-    '  echo "Bundle not found at $BUNDLE_RESULT (skipping sync)"',
-    'fi',
-].join('\n').replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
+// Older versions injected these to capture the store bundle (v1) as a patch source.
+// OTA no longer patches from the store bundle, so setup removes them.
+const LEGACY_XCODE_MARKER = '\\n# [react-native-bspatch] Sync compiled bundle to output/';
+const LEGACY_GRADLE_MARKER = '// [react-native-bspatch] Auto-capture Base Bundle';
 
-// The escaped version as it appears in pbxproj shellScript value
-const XCODE_BUNDLE_SYNC_MARKER = 'react-native-bspatch] Sync compiled bundle to output/';
-
-const ANDROID_GRADLE_MARKER = '[react-native-bspatch] Auto-capture Base Bundle';
-const ANDROID_GRADLE_SNIPPET = `
-// [react-native-bspatch] Auto-capture Base Bundle on Release builds
-afterEvaluate {
-    android.applicationVariants.all { variant ->
-        if (variant.buildType.name == 'release') {
-            def flavorName = (variant.flavorName ?: 'development').toLowerCase()
-            if (flavorName == 'dev') flavorName = 'development'
-            if (flavorName == 'prod') flavorName = 'production'
-            def versionName = variant.versionName ?: '1.0.0'
-            def capVariant = variant.name.capitalize()
-            def bundleTask = tasks.findByName("createBundle\${capVariant}JsAndAssets")
-            if (bundleTask != null) {
-                def saveTask = tasks.register("saveOtaBaseBundle\${capVariant}") {
-                    doLast {
-                        def bundleDir = file("\$buildDir/generated/assets/react/\${variant.name}")
-                        def bundleFile = file("\$bundleDir/index.android.bundle")
-                        def outputDir = file("\$rootDir/output")
-                        // v1 = the store build; never overwrite it (delete the file to re-capture).
-                        // build_ota.sh runs this same bundle task for every OTA build.
-                        def destFile = file("\$outputDir/bundle_\${versionName}_v1_android_\${flavorName}.hbc")
-                        if (bundleFile.exists() && !destFile.exists()) {
-                            outputDir.mkdirs()
-                            def destName = "bundle_\${versionName}_v1_android_\${flavorName}.hbc"
-                            copy {
-                                from bundleFile
-                                into outputDir
-                                rename { destName }
-                            }
-                            println "[react-native-bspatch] ✓ Auto-captured base bundle: android/output/\${destName}"
-                        }
-                    }
-                }
-                bundleTask.finalizedBy(saveTask)
-            }
-        }
-    }
-}
-`;
-
-function patchAppBuildGradle(content) {
-    const markerIdx = content.indexOf('// ' + ANDROID_GRADLE_MARKER);
-    if (markerIdx === -1) return content.trimEnd() + '\n' + ANDROID_GRADLE_SNIPPET;
-
-    // Replace an older snippet in place: from the marker to the afterEvaluate block's closing brace
-    const end = findClosingParen(content, content.indexOf('{', content.indexOf('afterEvaluate', markerIdx)), '{', '}');
+function removeAppBuildGradleSnippet(content) {
+    const idx = content.indexOf(LEGACY_GRADLE_MARKER);
+    if (idx === -1) return content;
+    const end = findClosingParen(content, content.indexOf('{', content.indexOf('afterEvaluate', idx)), '{', '}');
     if (end === -1) return content;
-    return content.slice(0, markerIdx) + ANDROID_GRADLE_SNIPPET.trim() + content.slice(end + 1);
+    return content.slice(0, idx).trimEnd() + '\n' + content.slice(end + 1).trimStart();
 }
 
 const IOS_IMPORT = 'import react_native_bspatch';
@@ -165,34 +97,10 @@ function findClosingParen(source, openParenIdx, open = '(', close = ')') {
 
 // ── iOS: project.pbxproj ─────────────────────────────────────────────────────
 
-function patchPbxproj(content) {
-    if (content.includes(XCODE_BUNDLE_SYNC_SNIPPET)) return content;
-
-    // Older snippet present → replace it in place (it lacked the base bundle auto-capture)
-    const oldIdx = content.indexOf('\\n# [' + XCODE_BUNDLE_SYNC_MARKER);
-    if (oldIdx !== -1) {
-        const endIdx = content.indexOf('";', oldIdx);
-        return content.slice(0, oldIdx) + XCODE_BUNDLE_SYNC_SNIPPET + content.slice(endIdx);
-    }
-
-    // Search by phase name
-    const nameIdx = content.indexOf('name = "Bundle React Native code and images";');
-    if (nameIdx !== -1) {
-        const shellScriptIdx = content.indexOf('shellScript = "', nameIdx);
-        if (shellScriptIdx !== -1) {
-            const endIdx = content.indexOf('";', shellScriptIdx + 15);
-            if (endIdx !== -1) {
-                return (
-                    content.slice(0, endIdx) +
-                    XCODE_BUNDLE_SYNC_SNIPPET +
-                    content.slice(endIdx)
-                );
-            }
-        }
-    }
-
-    console.log('    ⚠  Could not find "Bundle React Native code and images" build phase in project.pbxproj.');
-    return content;
+function removePbxprojSnippet(content) {
+    const idx = content.indexOf(LEGACY_XCODE_MARKER);
+    if (idx === -1) return content;
+    return content.slice(0, idx) + content.slice(content.indexOf('";', idx));
 }
 
 // ── iOS: AppDelegate.swift ────────────────────────────────────────────────────
@@ -316,7 +224,7 @@ function main() {
         console.log('  ⚠  No project.pbxproj found. Is this an iOS project?');
     } else {
         const pbxproj = pbxprojFiles[0];
-        patchFile(pbxproj, 'project.pbxproj (Xcode build phase)', patchPbxproj);
+        patchFile(pbxproj, 'project.pbxproj (remove legacy bundle capture)', removePbxprojSnippet);
     }
 
     // AppDelegate.swift
@@ -347,7 +255,7 @@ function main() {
     if (appGradleFiles.length === 0) {
         console.log('  ⚠  No android/app/build.gradle found.');
     } else {
-        patchFile(appGradleFiles[0], 'android/app/build.gradle (auto-capture base bundle)', patchAppBuildGradle);
+        patchFile(appGradleFiles[0], 'android/app/build.gradle (remove legacy bundle capture)', removeAppBuildGradleSnippet);
     }
 
     // Ensure android/output/ exists
@@ -358,13 +266,7 @@ function main() {
     }
 
     console.log('\n=== Setup Complete ===');
-    console.log('Next steps:');
-    console.log('  1. Base bundles will now automatically be captured on Release builds (Gradle & Xcode).');
-    console.log('  2. Or seed directly from an existing Store binary:');
-    console.log('         yarn react-native-bspatch seed --apk path/to/release.apk');
-    console.log('         yarn react-native-bspatch seed --ipa path/to/release.ipa');
-    console.log('  3. Or create base release manually: yarn ota:init');
-    console.log('  4. Then publish OTA updates safely with: yarn ota:build\n');
+    console.log('Next: release the app to the store (v1), then publish OTA updates with: npx react-native-bspatch\n');
 }
 
 main();

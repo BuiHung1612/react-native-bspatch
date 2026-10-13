@@ -3,13 +3,17 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # OTA Build Script — incremental, one version per run
 #
-# Supports single-step updates (v1 -> v3 direct) and version grouping.
-# Generates SHA-256 hashes for integrity verification.
+# v1 is the store build. Every OTA version ships a full bundle; patches are built
+# only from earlier OTA versions (v2+), whose bundles are byte-identical on device.
+# Clients on the store build download the full bundle once, then patch.
 #
-# Usage:
-#   ./build_ota.sh              → build next OTA version for current App.tsx
-#   ./build_ota.sh base         → first build: create base APK/IPA + save base bundle
-#   ./build_ota.sh reset        → wipe registry and start fresh
+# Usage (npx react-native-bspatch ...):
+#   patch [android|ios] [--flavor staging] [--release-version 1.0.4] [-y]
+#                               → build + publish the next OTA (both platforms if omitted)
+#   reset [--flavor ...] [--push] → wipe this release's OTAs
+#   setup                       → wire OtaBundleResolver into AppDelegate / MainApplication
+#   version <x.y.z>             → set the native app version (package.json, Gradle, Xcode)
+# The release version is read from the native project and confirmed by a prompt (Enter keeps it).
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -e
@@ -21,25 +25,12 @@ while [ -L "$SOURCE" ]; do
   case "$SOURCE" in /*) ;; *) SOURCE="$LINK_DIR/$SOURCE" ;; esac
 done
 SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
-MODULE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ROOT="$PWD"
-BUNDLE_XCODE_IOS="$ROOT/ios/output/main.jsbundle"
 BSDIFF="$SCRIPT_DIR/bsdiff"
 
-# ── Load .env file if exists ─────────────────────────────────────────────────
-# Look in project root first, then module directory (fallback)
-ENV_FILE=""
-if [ -f "$ROOT/.env" ]; then
-    ENV_FILE="$ROOT/.env"
-elif [ -f "$MODULE_DIR/.env" ]; then
-    ENV_FILE="$MODULE_DIR/.env"
-fi
-
-if [ -n "$ENV_FILE" ]; then
-    echo "Loading environment variables from $(basename "$ENV_FILE")..."
-    set -a; . "$ENV_FILE"; set +a
-else
-    echo "  No .env file found in $ROOT or $MODULE_DIR"
+if [ "$1" = "version" ]; then
+  shift
+  exec node "$SCRIPT_DIR/bump_version.js" "$@" --root "$ROOT"
 fi
 
 # ── Parameters ─────────────────────────────────────────────────────────────
@@ -47,43 +38,25 @@ FLAVOR="dev"
 ACTION="ota"
 PLATFORM_ARG=""
 APP_VERSION_ARG=""
-NON_INTERACTIVE=false
-
-SEED_APK=""
-SEED_IPA=""
-SEED_BUNDLE=""
-FORCE_BASE=false
+CONFIRM_VERSION=true
 
 # Arg parsing
 while [[ "$#" -gt 0 ]]; do
   case $1 in
     --platform) PLATFORM_ARG="$2"; shift ;;
     --flavor) FLAVOR="$2"; shift ;;
-    --app-version) APP_VERSION_ARG="$2"; shift ;;
-    --apk) SEED_APK="$2"; ACTION="seed"; shift ;;
-    --ipa) SEED_IPA="$2"; ACTION="seed"; shift ;;
-    --bundle) SEED_BUNDLE="$2"; ACTION="seed"; shift ;;
-    --force) FORCE_BASE=true ;;
-    -y|--yes|--non-interactive) NON_INTERACTIVE=true ;;
+    --release-version|--app-version) APP_VERSION_ARG="$2"; shift ;;
+    -y|--yes|--non-interactive) CONFIRM_VERSION=false ;;
     --push) PUSH_REMOTE=true ;;
-    reset|base) ACTION="$1" ;;
-    setup) ACTION="$1" ;;
-    seed) ACTION="seed" ;;
-    apk|ipa) ACTION="base" ;; # Compatibility for legacy actions
+    patch) ACTION="ota" ;;
+    android|ios) PLATFORM_ARG="$1" ;;
+    reset|setup) ACTION="$1" ;;
+    base|seed|apk|ipa|--apk|--ipa|*.apk|*.aab|*.ipa)
+      # Removed in 3.0: falling through would silently build and publish an OTA
+      echo "❌ '$1' was removed: the first OTA after a store release is a full bundle, no base/seed needed."
+      exit 1 ;;
     dev|staging|production) FLAVOR="$1" ;; # Support positional flavor
-    [0-9]*) ;; # Ignore version if passed as $1 (pos 1 usually)
-    *)
-      if [[ "$1" == *.apk ]] || [[ "$1" == *.aab ]]; then
-        SEED_APK="$1"
-        ACTION="seed"
-      elif [[ "$1" == *.ipa ]]; then
-        SEED_IPA="$1"
-        ACTION="seed"
-      elif [[ "$1" == *.hbc ]] || [[ "$1" == *.bundle ]] || [[ "$1" == *.jsbundle ]]; then
-        SEED_BUNDLE="$1"
-        ACTION="seed"
-      fi
-      ;;
+    *) echo "❌ Unknown argument: $1"; exit 1 ;;
   esac
   shift
 done
@@ -91,6 +64,31 @@ done
 FLAVOR_LOWER=$(echo "$FLAVOR" | tr '[:upper:]' '[:lower:]')
 if [ "$FLAVOR_LOWER" = "dev" ]; then FLAVOR_LOWER="development"; fi
 if [ "$FLAVOR_LOWER" = "prod" ]; then FLAVOR_LOWER="production"; fi
+
+# ── Environment ──────────────────────────────────────────────────────────────
+# .env.<flavor>: OTA_BASE_URL / OTA_FOLDER, the same values react-native-config bakes into the app.
+# .env.ota: upload secrets (OTA_R2_*). Never put them in .env.<flavor>: react-native-config
+# ships every key of that file inside the APK/IPA.
+# Parsed like react-native-config (KEY=VALUE, optional quotes), never executed:
+# `APP_NAME=Baseform Dev` is valid dotenv but breaks `source`.
+load_env() {
+  echo "Loading $(basename "$1")..."
+  local line k v
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=(.*)$ ]] || continue
+    k="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]%$'\r'}"; v="${v#"${v%%[![:space:]]*}"}"
+    if [[ "$v" =~ ^\"(.*)\"$ ]] || [[ "$v" =~ ^\'(.*)\'$ ]]; then v="${BASH_REMATCH[1]}"; fi
+    export "$k=$v"
+  done < "$1"
+}
+if [ "$ACTION" != "setup" ]; then
+  if [ ! -f "$ROOT/.env.$FLAVOR_LOWER" ]; then
+    echo "❌ $ROOT/.env.$FLAVOR_LOWER not found (OTA_BASE_URL / OTA_FOLDER for flavor '$FLAVOR_LOWER')"
+    exit 1
+  fi
+  load_env "$ROOT/.env.$FLAVOR_LOWER"
+  if [ -f "$ROOT/.env.ota" ]; then load_env "$ROOT/.env.ota"; fi
+fi
 
 # ── Setup (project wiring only, no build env needed) ─────────────────────────
 if [ "$ACTION" = "setup" ]; then
@@ -128,40 +126,47 @@ if [ "$ACTION" != "setup" ]; then
     echo "  Using URL: $BASE_URL"
     echo "  Using Folder: $BASE_FOLDER"
 
-    # GitHub is the only storage backend for now
-    if [[ "$BASE_URL" != "https://raw.githubusercontent.com/"* ]]; then
-        echo "  ❌ OTA_BASE_URL must be https://raw.githubusercontent.com/<owner>/<repo>/<branch>"
-        exit 1
+    if [[ -n "${OTA_R2_BUCKET:-}" ]]; then
+        R2_URL="https://${OTA_R2_ACCOUNT_ID:?set OTA_R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${OTA_R2_BUCKET}"
+        r2() { curl -sS --aws-sigv4 "aws:amz:auto:s3" --user "${OTA_R2_ACCESS_KEY_ID:?}:${OTA_R2_SECRET_ACCESS_KEY:?}" "$@"; }
+        # S3 API, not the public URL: always the latest object, no CDN cache
+        API_HTTP=$(r2 -o "$REGISTRY_SHARED.tmp" -w "%{http_code}" "$R2_URL/$BASE_FOLDER/ota_registry.json" || echo 0)
+    else
+        if [[ "$BASE_URL" != "https://raw.githubusercontent.com/"* ]]; then
+            echo "  ❌ Set OTA_R2_* (Cloudflare R2) or OTA_BASE_URL=https://raw.githubusercontent.com/<owner>/<repo>/<branch>"
+            exit 1
+        fi
+        CLEAN_URL="${BASE_URL#https://raw.githubusercontent.com/}"
+        GH_OWNER=$(echo "$CLEAN_URL" | cut -d'/' -f1)
+        GH_REPO=$(echo  "$CLEAN_URL" | cut -d'/' -f2)
+        GH_BRANCH=$(echo "$CLEAN_URL" | cut -d'/' -f3)
+        if [[ -z "$GH_BRANCH" ]]; then GH_BRANCH="main"; fi
+
+        # Contents API (not the raw CDN) always returns the latest commit; the raw
+        # media type has no 1 MB limit and needs no base64 decoding.
+        GH_API_TOKEN="$(gh auth token 2>/dev/null || true)"
+        GH_API_TOKEN="${GH_API_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
+        GH_API_AUTH=()
+        if [[ -n "$GH_API_TOKEN" ]]; then GH_API_AUTH=(-H "Authorization: Bearer $GH_API_TOKEN"); fi
+
+        API_HTTP=$(curl -s -o "$REGISTRY_SHARED.tmp" -w "%{http_code}" "${GH_API_AUTH[@]}" \
+            -H "Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/contents/${BASE_FOLDER}/ota_registry.json?ref=${GH_BRANCH}" || echo 0)
     fi
-    echo "  Downloading remote registry from GitHub..."
-
-    CLEAN_URL="${BASE_URL#https://raw.githubusercontent.com/}"
-    GH_OWNER=$(echo "$CLEAN_URL" | cut -d'/' -f1)
-    GH_REPO=$(echo  "$CLEAN_URL" | cut -d'/' -f2)
-    GH_BRANCH=$(echo "$CLEAN_URL" | cut -d'/' -f3)
-    if [[ -z "$GH_BRANCH" ]]; then GH_BRANCH="main"; fi
-
-    # Contents API (not the raw CDN) always returns the latest commit; the raw
-    # media type has no 1 MB limit and needs no base64 decoding.
-    GH_API_TOKEN="$(gh auth token 2>/dev/null || true)"
-    GH_API_TOKEN="${GH_API_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
-    GH_API_AUTH=()
-    if [[ -n "$GH_API_TOKEN" ]]; then GH_API_AUTH=(-H "Authorization: Bearer $GH_API_TOKEN"); fi
-
-    API_HTTP=$(curl -s -o "$REGISTRY_SHARED.tmp" -w "%{http_code}" "${GH_API_AUTH[@]}" \
-        -H "Accept: application/vnd.github.raw" \
-        "https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/contents/${BASE_FOLDER}/ota_registry.json?ref=${GH_BRANCH}" || echo 0)
 
     if [[ "$API_HTTP" == "200" ]] && node -e "JSON.parse(require('fs').readFileSync(process.argv[1],'utf8'))" "$REGISTRY_SHARED.tmp" 2>/dev/null; then
         mv "$REGISTRY_SHARED.tmp" "$REGISTRY_SHARED"
-        echo "  ✓ Remote registry synced (via GitHub API)"
+        echo "  ✓ Remote registry synced"
     elif [[ "$API_HTTP" == "404" ]]; then
         rm -f "$REGISTRY_SHARED.tmp"
-        echo "  Notice: No remote registry yet (HTTP 404) — starting fresh with local state."
+        # Remote is the source of truth: a local registry from another storage would publish
+        # entries for files that don't exist here
+        echo '{"apps":{}}' > "$REGISTRY_SHARED"
+        echo "  Notice: No remote registry yet (HTTP 404) — starting a new one."
     else
         # Continuing would later push a stale local registry over the remote one
         rm -f "$REGISTRY_SHARED.tmp"
-        echo "  ❌ Registry sync failed (HTTP $API_HTTP). Check network / gh auth and retry."
+        echo "  ❌ Registry sync failed (HTTP $API_HTTP). Check network / credentials and retry."
         exit 1
     fi
 fi
@@ -170,8 +175,14 @@ fi
 download_remote() {
   local REMOTE_PATH="$1"
   local DEST="$2"
-  # no-cache + timestamp query bypasses the GitHub CDN 5-min cache
-  if curl -s -f -H "Cache-Control: no-cache" -o "$DEST.tmp" "$BASE_URL/$REMOTE_PATH?cb=$(date +%s)"; then
+  local OK=0
+  if [[ -n "${OTA_R2_BUCKET:-}" ]]; then
+    r2 -f -o "$DEST.tmp" "$R2_URL/$REMOTE_PATH" 2>/dev/null || OK=1
+  else
+    # no-cache + timestamp query bypasses the GitHub CDN 5-min cache
+    curl -s -f -H "Cache-Control: no-cache" -o "$DEST.tmp" "$BASE_URL/$REMOTE_PATH?cb=$(date +%s)" || OK=1
+  fi
+  if [ $OK -eq 0 ]; then
     mv "$DEST.tmp" "$DEST"
   else
     rm -f "$DEST.tmp"
@@ -184,110 +195,55 @@ sha256() {
   shasum -a 256 "$1" | awk '{print $1}'
 }
 
-# ── Auto-Detect APP_VERSION ──────────────────────────────────────────────────
-APP_VERSION_INFO=$(node -e "
-  const fs = require('fs');
-  const path = require('path');
-  const root = '$ROOT';
-  const cliOverride = '$APP_VERSION_ARG';
+# ── Progress helpers (exported: upload_ota.sh uses them too) ──────────────────
+human_size() {
+  awk -v b="$1" 'BEGIN { split("B KB MB GB", u); i = 1; while (b >= 1024 && i < 4) { b /= 1024; i++ }
+    printf (i == 1 ? "%d %s" : "%.1f %s"), b, u[i] }'
+}
+file_size() { wc -c < "$1" | tr -d ' '; }
+STEP=0
+STEP_TOTAL=5
+step() { STEP=$((STEP + 1)); STEP_START=$SECONDS; echo ""; echo "  [$STEP/$STEP_TOTAL] $*"; }
+step_done() { echo "      ✓ $* ($((SECONDS - STEP_START))s)"; }
+export -f human_size file_size
 
-  if (cliOverride && cliOverride !== '') {
-    console.log(JSON.stringify({ version: cliOverride, source: 'CLI --app-version' }));
-    process.exit(0);
-  }
+# ── Release version (native app version the OTA targets) ─────────────────────
+android_version() {
+  sed -nE "s/^[[:space:]]*versionName[[:space:]]+[\"']([^\"']+)[\"'].*/\1/p" "$ROOT/android/app/build.gradle" 2>/dev/null | head -n 1
+}
+ios_version() {
+  grep -ho 'MARKETING_VERSION = [^;]*' "$ROOT"/ios/*.xcodeproj/project.pbxproj 2>/dev/null | head -n 1 | sed 's/.*= //'
+}
 
-  // 1. Try android/app/build.gradle (most reliable for Android release)
-  try {
-    const gradlePath = path.join(root, 'android/app/build.gradle');
-    if (fs.existsSync(gradlePath)) {
-      const content = fs.readFileSync(gradlePath, 'utf8');
-      const match = content.match(/versionName\\s+[\"']([^\"']+)[\"']/);
-      if (match && match[1] !== '0.0.0' && match[1] !== '0.0.1') {
-        console.log(JSON.stringify({ version: match[1], source: 'android/app/build.gradle' }));
-        process.exit(0);
-      }
-    }
-  } catch (e) {}
-
-  // 2. Try ios project.pbxproj (most reliable for iOS release)
-  try {
-    const iosDir = path.join(root, 'ios');
-    if (fs.existsSync(iosDir)) {
-      const files = fs.readdirSync(iosDir);
-      for (const f of files) {
-        if (f.endsWith('.xcodeproj')) {
-          const pbxPath = path.join(iosDir, f, 'project.pbxproj');
-          if (fs.existsSync(pbxPath)) {
-            const content = fs.readFileSync(pbxPath, 'utf8');
-            const match = content.match(/MARKETING_VERSION\\s*=\\s*([^;]+);/);
-            if (match && match[1].trim() !== '0.0.0' && match[1].trim() !== '0.0.1') {
-              console.log(JSON.stringify({ version: match[1].trim(), source: 'ios/' + f }));
-              process.exit(0);
-            }
-          }
-        }
-      }
-    }
-  } catch (e) {}
-
-  // 3. Try package.json
-  try {
-    const pkgPath = path.join(root, 'package.json');
-    if (fs.existsSync(pkgPath)) {
-      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-      if (pkg.version && pkg.version !== '0.0.0' && pkg.version !== '0.0.1') {
-        console.log(JSON.stringify({ version: pkg.version, source: 'package.json' }));
-        process.exit(0);
-      }
-    }
-  } catch (e) {}
-
-  // 4. Fallback: src/ota/otaConfig.ts
-  try {
-    const otaConfigPath = path.join(root, 'src/ota/otaConfig.ts');
-    if (fs.existsSync(otaConfigPath)) {
-      const content = fs.readFileSync(otaConfigPath, 'utf8');
-      const match = content.match(/export const APP_VERSION = ['\"](.+?)['\"]/);
-      if (match) {
-        console.log(JSON.stringify({ version: match[1], source: 'src/ota/otaConfig.ts' }));
-        process.exit(0);
-      }
-    }
-  } catch (e) {}
-
-  console.log(JSON.stringify({ version: 'unknown', source: 'none' }));
-")
-
-APP_VERSION=$(node -e "try { console.log(JSON.parse('$APP_VERSION_INFO').version); } catch(e) { console.log('unknown'); }")
-APP_VERSION_SOURCE=$(node -e "try { console.log(JSON.parse('$APP_VERSION_INFO').source); } catch(e) { console.log('none'); }")
-
-# Interactive confirmation / prompt:
-# Prompt if running in an interactive terminal, not in reset mode, and no explicit flags passed
-if [ -t 0 ] && [ -z "$APP_VERSION_ARG" ] && [ "$NON_INTERACTIVE" = false ] && [ "$ACTION" != "reset" ]; then
-  echo ""
-  echo "────────────────────────────────────────────────────────"
-  if [ "$APP_VERSION" != "unknown" ]; then
-    echo "  Detected Native App Version: $APP_VERSION ($APP_VERSION_SOURCE)"
-    read -p "  Enter App Version to build [Press Enter for '$APP_VERSION']: " USER_INPUT_VER
-  else
-    read -p "  Enter Native App Version to build (e.g. 1.0.0): " USER_INPUT_VER
+if [ -n "$APP_VERSION_ARG" ]; then
+  APP_VERSION="$APP_VERSION_ARG"
+elif [ "$PLATFORM_ARG" = "android" ]; then
+  APP_VERSION=$(android_version)
+elif [ "$PLATFORM_ARG" = "ios" ]; then
+  APP_VERSION=$(ios_version)
+else
+  AV=$(android_version); IV=$(ios_version)
+  if [ -n "$AV" ] && [ -n "$IV" ] && [ "$AV" != "$IV" ]; then
+    # One registry key per release version: publishing both under one would strand one platform
+    echo "❌ Android is $AV but iOS is $IV. Run 'patch android' and 'patch ios' separately."
+    exit 1
   fi
-  echo "────────────────────────────────────────────────────────"
-  echo ""
-
-  if [ -n "$USER_INPUT_VER" ]; then
-    APP_VERSION=$(echo "$USER_INPUT_VER" | tr -d ' ')
-    APP_VERSION_SOURCE="User Input"
-  fi
+  APP_VERSION="${AV:-$IV}"
 fi
 
-if [ "$APP_VERSION" == "unknown" ] || [ -z "$APP_VERSION" ]; then
-  echo "ERROR: Native App Version is required to build OTA updates."
-  echo "       Please enter a valid version or use: ./build_ota.sh --app-version <version>"
+# Confirm in a terminal (Enter keeps the detected version); CI / -y / --release-version skip it
+if [ -t 0 ] && [ "$CONFIRM_VERSION" = true ] && [ -z "$APP_VERSION_ARG" ]; then
+  echo ""
+  read -r -p "  Release version for ${PLATFORM_ARG:-android + ios} [${APP_VERSION:-none detected}]: " INPUT_VERSION
+  INPUT_VERSION="${INPUT_VERSION// /}"
+  APP_VERSION="${INPUT_VERSION:-$APP_VERSION}"
+fi
+
+if [ -z "$APP_VERSION" ]; then
+  echo "❌ Could not read the native app version. Pass --release-version <x.y.z>."
   exit 1
 fi
-
-echo "  ✓ Building OTA for APP_VERSION=$APP_VERSION (Source: $APP_VERSION_SOURCE)"
+echo "  ✓ Release version: $APP_VERSION"
 
 # ── Reset ─────────────────────────────────────────────────────────────────────
 if [ "$ACTION" = "reset" ]; then
@@ -299,8 +255,11 @@ if [ "$ACTION" = "reset" ]; then
       try {
         const fs = require('fs');
         const reg = JSON.parse(fs.readFileSync('$REGISTRY_SHARED', 'utf8'));
-        if (reg.apps && reg.apps['$APP_VERSION'] && reg.apps['$APP_VERSION'].flavors) {
-          delete reg.apps['$APP_VERSION'].flavors['$FLAVOR_LOWER'];
+        const flavors = reg.apps?.['$APP_VERSION']?.flavors;
+        if (flavors?.['$FLAVOR_LOWER']) {
+          // Keep the counter: reused numbers would make clients on an old vN skip the new vN,
+          // and reused file names would serve stale cached bundles
+          flavors['$FLAVOR_LOWER'] = { latestOtaVersion: flavors['$FLAVOR_LOWER'].latestOtaVersion || 1, patches: [] };
         }
         fs.writeFileSync('$REGISTRY_SHARED', JSON.stringify(reg, null, 4));
       } catch(e) {}
@@ -309,15 +268,13 @@ if [ "$ACTION" = "reset" ]; then
     echo '{"apps":{}}' > "$REGISTRY_SHARED"
   fi
 
-  # Delete only this app version + flavor. Base bundles (v1 = store binary) are kept:
-  # the next build re-registers them automatically. Delete them by hand to re-seed.
+  # Delete only this app version + flavor
   for D in "$ROOT/android/output" "$ROOT/ios/output"; do
-    find "$D" -maxdepth 1 -type f -name "*_${APP_VERSION}_*" -name "*_${FLAVOR_LOWER}[._]*" \
-      -not -name "bundle_${APP_VERSION}_v1_*" -delete 2>/dev/null || true
+    find "$D" -maxdepth 1 -type f -name "*_${APP_VERSION}_*" -name "*_${FLAVOR_LOWER}[._]*" -delete 2>/dev/null || true
     find "$D" -maxdepth 1 -type f -name "asset-manifest-v*_${FLAVOR_LOWER}.json" -delete 2>/dev/null || true # legacy names
   done
 
-  echo "  ✓ Registry and output cleared for $APP_VERSION/$FLAVOR_LOWER (base bundle v1 + base-assets kept)"
+  echo "  ✓ Registry and output cleared for $APP_VERSION/$FLAVOR_LOWER "
 
   if [ "$PUSH_REMOTE" = true ]; then
       echo "  Syncing reset state for flavor '$FLAVOR_LOWER' to remote storage..."
@@ -365,12 +322,8 @@ build_platform() {
 
   echo ""
   echo ">>> Building $PLATFORM | Version: $APP_VERSION | OTA: v$CURRENT → v$NEXT"
-  if [ "$PLATFORM" == "ios" ]; then
-    local IOS_VER=$(grep -ho 'MARKETING_VERSION = [^;]*' "$ROOT"/ios/*.xcodeproj/project.pbxproj 2>/dev/null | head -n 1 | sed 's/.*= //')
-    if [ -n "$IOS_VER" ] && [ "$IOS_VER" != "$APP_VERSION" ]; then
-      echo "  ⚠ iOS MARKETING_VERSION is $IOS_VER but building for $APP_VERSION — iOS clients on $IOS_VER won't see this OTA"
-    fi
-  fi
+  STEP=0
+  local PLATFORM_START=$SECONDS
 
   # ── Bundle ──
   # Workspace for building
@@ -378,37 +331,23 @@ build_platform() {
   mkdir -p "$WORKSPACE"
 
   # Determine source bundle
+  local BUILD_LOG="$WORKSPACE/bundle.log"
   if [ "$PLATFORM" == "android" ]; then
-    cd "$ROOT/android"
-    ./gradlew ":app:createBundle${FLAVOR_CAP}ReleaseJsAndAssets" -Pkotlin.incremental=false --quiet
-    cd "$ROOT"
+    step "Bundling JS (Gradle createBundle${FLAVOR_CAP}ReleaseJsAndAssets)..."
+    # Gradle's config noise goes to a log; shown only on failure
+    if ! (cd "$ROOT/android" && ./gradlew ":app:createBundle${FLAVOR_CAP}ReleaseJsAndAssets" -Pkotlin.incremental=false --quiet) > "$BUILD_LOG" 2>&1; then
+      tail -n 40 "$BUILD_LOG"; echo "  ❌ Gradle bundle failed (full log: $BUILD_LOG)"; exit 1
+    fi
     BUNDLE_SOURCE="$ROOT/android/app/build/generated/assets/react/${FLAVOR_LOWER}Release/index.android.bundle"
   else
-    local XCODE_STALE=""
-    if [ -f "$BUNDLE_XCODE_IOS" ]; then
-      # ponytail: mtime check, any source edit/checkout after the last Xcode build marks it stale
-      XCODE_STALE=$(find "$ROOT/src" "$ROOT/App.tsx" "$ROOT/index.js" "$ROOT/package.json" -type f -newer "$BUNDLE_XCODE_IOS" -print -quit 2>/dev/null)
-      if [ -n "$XCODE_STALE" ] && [ "$ACTION" = "base" ]; then
-        echo "  ⚠ Xcode bundle ($(stat -f '%Sm' "$BUNDLE_XCODE_IOS")) is older than $XCODE_STALE — ignoring it"
-      fi
-    fi
-    if [ -f "$BUNDLE_XCODE_IOS" ] && [ -z "$XCODE_STALE" ] && [ "$ACTION" = "base" ] && [ $CURRENT -eq 0 ]; then
-      # Base action: use Xcode-compiled bundle (already Hermes-compiled, matches IPA exactly)
-      echo "  Using Xcode bundle as base source..."
-      cp "$BUNDLE_XCODE_IOS" "$WORKSPACE/source.bundle"
-      # Also discover assets for base manifest
-      echo "  Discovering assets from project (shadow bundle)..."
-      npx react-native bundle --platform ios --dev false --entry-file index.js \
-        --bundle-output "$WORKSPACE/shadow.bundle.tmp" --assets-dest "$OUTPUT/assets"
-      rm -f "$WORKSPACE/shadow.bundle.tmp"
-    else
-      # OTA update: always generate fresh bundle from current code + discover assets
-      echo "  Generating fresh iOS bundle from current code..."
-      npx react-native bundle --platform ios --dev false --entry-file index.js \
-        --bundle-output "$WORKSPACE/source.bundle" --assets-dest "$OUTPUT/assets"
+    step "Bundling JS (react-native bundle)..."
+    if ! npx react-native bundle --platform ios --dev false --entry-file index.js \
+      --bundle-output "$WORKSPACE/source.bundle" --assets-dest "$OUTPUT/assets" > "$BUILD_LOG" 2>&1; then
+      tail -n 40 "$BUILD_LOG"; echo "  ❌ Bundle failed (full log: $BUILD_LOG)"; exit 1
     fi
     BUNDLE_SOURCE="$WORKSPACE/source.bundle"
   fi
+  step_done "$(human_size "$(file_size "$BUNDLE_SOURCE")")"
 
   # Ensure Hermes bytecode format (for both iOS and Android OTA bundles)
   find_hermesc
@@ -419,14 +358,14 @@ build_platform() {
     if [ "$FIRST_BYTE" == "c6" ]; then IS_HBC=true; fi
   fi
 
+  step "Hermes bytecode..."
   if [ "$IS_HBC" = true ]; then
-    echo "  Bundle is already in Hermes bytecode format."
+    echo "      already Hermes bytecode"
   else
-    echo "  Compiling to Hermes bytecode..."
     if [ -z "$HERMESC_PATH" ] || [ ! -f "$HERMESC_PATH" ]; then
       echo "  ❌ ERROR: hermesc not found"; exit 1
     fi
-    # -O matches what Xcode/Gradle use for release, keeping patches against the store bundle small
+    # -O matches what Xcode/Gradle use for release
     "$HERMESC_PATH" -emit-binary -O -out "$WORKSPACE/source.hbc" "$BUNDLE_SOURCE"
     mv "$WORKSPACE/source.hbc" "$BUNDLE_SOURCE"
   fi
@@ -434,47 +373,20 @@ build_platform() {
   local BUNDLE_NAME="bundle_${APP_VERSION}_v${NEXT}_${PLATFORM}_${FLAVOR_LOWER}.hbc"
   local NEW_BUNDLE_PATH="$OUTPUT/$BUNDLE_NAME"
 
-  if [ $CURRENT -eq 0 ] && [ "$ACTION" = "base" ] && [ "$PLATFORM" == "android" ]; then
-    echo "Building base Release APK for $FLAVOR_CAP..."
-    cd "$ROOT/android"
-    ./gradlew "assemble${FLAVOR_CAP}Release" -Pkotlin.incremental=false --quiet
-    cd "$ROOT"
-    # Locate the APK dynamically as flavor names can vary in path
-    APK_PATH=$(find "$ROOT/android/app/build/outputs/apk" -name "app-${FLAVOR_LOWER}-release.apk" | head -n 1)
-    if [ -f "$APK_PATH" ]; then
-      unzip -p "$APK_PATH" assets/index.android.bundle > "$NEW_BUNDLE_PATH"
-    else
-      echo "  ⚠ Warning: Could not find base APK at $APK_PATH. Using generated bundle directly."
-      cp "$BUNDLE_SOURCE" "$NEW_BUNDLE_PATH"
-    fi
-  else
-    cp "$BUNDLE_SOURCE" "$NEW_BUNDLE_PATH"
-  fi
+  cp "$BUNDLE_SOURCE" "$NEW_BUNDLE_PATH"
+  step_done "$BUNDLE_NAME, $(human_size "$(file_size "$NEW_BUNDLE_PATH")")"
 
   # ── Assets ──
   local ASSET_MANIFEST_FILE="$OUTPUT/asset-manifest_${APP_VERSION}_v${NEXT}_${PLATFORM}_${FLAVOR_LOWER}.json"
-  local BASE_ASSET_MANIFEST="$OUTPUT/base-assets_${PLATFORM}_${FLAVOR_LOWER}.json"
   local ASSET_STORE_DIR="$OUTPUT/asset-store"
   mkdir -p "$ASSET_STORE_DIR"
   local ASSETS_SRC_DIR="$ROOT/android/app/build/generated/res/react/${FLAVOR_LOWER}Release"
   if [ "$PLATFORM" == "ios" ]; then ASSETS_SRC_DIR="$OUTPUT/assets"; fi
 
-  # Load base assets — try server if missing locally (e.g. after ota:clean)
-  if [ ! -f "$BASE_ASSET_MANIFEST" ]; then
-    local REMOTE_BASE_ASSET_PATH="$BASE_FOLDER/$APP_VERSION/$FLAVOR_LOWER/$(basename "$BASE_ASSET_MANIFEST")"
-    echo "  Base asset manifest missing locally, downloading from server..."
-    download_remote "$REMOTE_BASE_ASSET_PATH" "$BASE_ASSET_MANIFEST" || true
-    if [ -f "$BASE_ASSET_MANIFEST" ]; then
-      echo "  ✓ base-assets manifest restored from server"
-    else
-      echo "  ⚠ base-assets manifest not found on server — all assets will be treated as new"
-    fi
-  fi
-
   local ASSET_JSON_LIST="["
   local FIRST=true
-  local NEW_BASE_ASSETS="{"
-  
+  local ASSET_COUNT=0
+  step "Hashing assets..."
   if [ -d "$ASSETS_SRC_DIR" ]; then
     while IFS= read -r -d '' ASSET_FILE; do
       local HASH=$(sha256 "$ASSET_FILE")
@@ -482,200 +394,68 @@ build_platform() {
       local EX="${FNAME##*.}"
       # Capture relative path for resolver matching
       local REL_PATH="${ASSET_FILE#$ASSETS_SRC_DIR/}"
-      
-      # Track for the new base manifest
-      if [ "$NEW_BASE_ASSETS" != "{" ]; then NEW_BASE_ASSETS+=", "; fi
-      NEW_BASE_ASSETS+="\"$REL_PATH\": \"$HASH\""
-
-      # Optimization: Skip if hash matches the base APK version (client already has it)
-      local IS_IN_BASE=false
-      if [ -f "$BASE_ASSET_MANIFEST" ] && grep -qF "\"$REL_PATH\": \"$HASH\"" "$BASE_ASSET_MANIFEST"; then
-        IS_IN_BASE=true
-      fi
-      # Always add ALL assets to the manifest so the resolver can find them at runtime.
-      # Only skip the file copy if the asset is unchanged from base (avoids redundant uploads).
-      local ASSET_IS_BASE="false"
-      if [ "$IS_IN_BASE" != "true" ] || [ "$ACTION" = "base" ]; then
-        cp "$ASSET_FILE" "$ASSET_STORE_DIR/${HASH}.${EX}"
-      else
-        ASSET_IS_BASE="true"
-      fi
+      # ponytail: every asset ships via the content-addressed store (clients download each hash once);
+      # skipping assets already in the store binary needs a manifest of that binary
+      cp "$ASSET_FILE" "$ASSET_STORE_DIR/${HASH}.${EX}"
 
       if [ "$FIRST" = true ]; then FIRST=false; else ASSET_JSON_LIST+=", "; fi
-      ASSET_JSON_LIST+="{\"hash\": \"$HASH\", \"ext\": \"$EX\", \"originalPath\": \"$REL_PATH\", \"isBase\": $ASSET_IS_BASE}"
+      ASSET_JSON_LIST+="{\"hash\": \"$HASH\", \"ext\": \"$EX\", \"originalPath\": \"$REL_PATH\"}"
+      ASSET_COUNT=$((ASSET_COUNT + 1))
+      if [ -t 1 ]; then printf "\r      %d assets" "$ASSET_COUNT"; fi
     done < <(find "$ASSETS_SRC_DIR" -type f -print0 2>/dev/null)
+    if [ -t 1 ]; then printf "\r\033[K"; fi
   fi
   ASSET_JSON_LIST+="]"
-  NEW_BASE_ASSETS+="}"
-
-  # If base action, save the manifest to local disk for future comparisons
-  if [ "$ACTION" = "base" ]; then
-    echo "$NEW_BASE_ASSETS" > "$BASE_ASSET_MANIFEST"
-    echo "  ✓ Base asset manifest saved locally"
-  fi
+  step_done "$ASSET_COUNT assets"
 
   cat > "$ASSET_MANIFEST_FILE" << EOF
 { "version": $NEXT, "appVersion": "$APP_VERSION", "platform": "$PLATFORM", "flavor": "$FLAVOR_LOWER", "assets": $ASSET_JSON_LIST }
 EOF
 
   # ── Patches ──
-  local PATCHES_JSON="[]"
+  # From the last 5 OTA versions only (never v1 = store build). Clients on the
+  # store build or further behind download the full bundle.
   local NEW_HASH=$(sha256 "$NEW_BUNDLE_PATH")
-  if [ $CURRENT -gt 0 ]; then
-    PATCHES_JSON="["
-    # Patches from v1 (fresh store installs) + the last 5 versions. Older clients
-    # fall back to the full bundle instead of bsdiff-ing every version each build.
-    for (( i=1; i<$NEXT; i++ )); do
-      if [ $i -gt 1 ] && [ $i -lt $((NEXT - 5)) ]; then continue; fi
-      local OLD_B="bundle_${APP_VERSION}_v${i}_${PLATFORM}_${FLAVOR_LOWER}.hbc"
-      local OLD_P="$OUTPUT/$OLD_B"
-      if [ ! -f "$OLD_P" ]; then 
-        echo "  Missing local bundle for v$i. Attempting to download from server..."
-        local REMOTE_BUNDLE_PATH="$BASE_FOLDER/$APP_VERSION/$FLAVOR_LOWER/$OLD_B"
-        download_remote "$REMOTE_BUNDLE_PATH" "$OLD_P" || true
-      fi
-      if [ ! -f "$OLD_P" ]; then 
-        echo "  ⚠ Warning: Could not find or download bundle v$i. Skipping patch generation from v$i."
-        continue
-      fi
-      local PNAME="patch_${APP_VERSION}_v${i}_to_v${NEXT}_${FLAVOR_LOWER}_${PLATFORM}.patch"
-      "$BSDIFF" "$OLD_P" "$NEW_BUNDLE_PATH" "$OUTPUT/$PNAME"
-      if [ "$PATCHES_JSON" != "[" ]; then PATCHES_JSON+=", "; fi
-      PATCHES_JSON+="{\"from\": $i, \"to\": $NEXT, \"file\": \"$PNAME\", \"baseHash\": \"$(sha256 "$OLD_P")\", \"bundleHash\": \"$NEW_HASH\"}"
-    done
-    PATCHES_JSON+="]"
+  local PATCHES_JSON="["
+  local FIRST_FROM=$((NEXT - 5)); if [ $FIRST_FROM -lt 2 ]; then FIRST_FROM=2; fi
+  local PATCH_TOTAL=$((NEXT - FIRST_FROM)) PATCH_N=0 PATCH_MADE=0
+  if [ $PATCH_TOTAL -gt 0 ]; then
+    step "Creating $PATCH_TOTAL patch(es) from v$FIRST_FROM..v$((NEXT - 1))..."
+  else
+    step "Patches: none (first OTA of this release — clients take the full bundle)"
   fi
+  for (( i=FIRST_FROM; i<NEXT; i++ )); do
+    PATCH_N=$((PATCH_N + 1))
+    local OLD_B="bundle_${APP_VERSION}_v${i}_${PLATFORM}_${FLAVOR_LOWER}.hbc"
+    local OLD_P="$OUTPUT/$OLD_B"
+    if [ ! -f "$OLD_P" ]; then
+      echo "      ($PATCH_N/$PATCH_TOTAL) v$i: downloading base bundle..."
+      local REMOTE_BUNDLE_PATH="$BASE_FOLDER/$APP_VERSION/$FLAVOR_LOWER/$OLD_B"
+      download_remote "$REMOTE_BUNDLE_PATH" "$OLD_P" || true
+    fi
+    if [ ! -f "$OLD_P" ]; then
+      echo "      ($PATCH_N/$PATCH_TOTAL) v$i: ⚠ bundle not found, skipped (v$i clients take the full bundle)"
+      continue
+    fi
+    local PNAME="patch_${APP_VERSION}_v${i}_to_v${NEXT}_${FLAVOR_LOWER}_${PLATFORM}.patch"
+    local PATCH_START=$SECONDS
+    if [ -t 1 ]; then printf "      (%d/%d) v%d → v%d ..." "$PATCH_N" "$PATCH_TOTAL" "$i" "$NEXT"; fi
+    "$BSDIFF" "$OLD_P" "$NEW_BUNDLE_PATH" "$OUTPUT/$PNAME"
+    if [ -t 1 ]; then printf "\r\033[K"; fi
+    echo "      ($PATCH_N/$PATCH_TOTAL) v$i → v$NEXT: $(human_size "$(file_size "$OUTPUT/$PNAME")") ($((SECONDS - PATCH_START))s)"
+    PATCH_MADE=$((PATCH_MADE + 1))
+    if [ "$PATCHES_JSON" != "[" ]; then PATCHES_JSON+=", "; fi
+    PATCHES_JSON+="{\"from\": $i, \"to\": $NEXT, \"file\": \"$PNAME\", \"baseHash\": \"$(sha256 "$OLD_P")\", \"bundleHash\": \"$NEW_HASH\"}"
+  done
+  PATCHES_JSON+="]"
+  if [ $PATCH_TOTAL -gt 0 ]; then step_done "$PATCH_MADE patch(es)"; fi
 
   # ── Finalize ──
+  step "Registry + upload..."
   node "$SCRIPT_DIR/update_registry.js" "$REGISTRY_SHARED" "$APP_VERSION" "$NEXT" "$PATCHES_JSON" "$PLATFORM" "$ASSET_MANIFEST_FILE" "$FLAVOR_LOWER"
   bash "$SCRIPT_DIR/upload_ota.sh" "$APP_VERSION" "$FLAVOR_LOWER" "$NEXT" "$NEW_BUNDLE_PATH" "$PLATFORM"
-}
-
-seed_platform() {
-  local PLATFORM="$1"
-  local FLAVOR="$2"
-  local BINARY_PATH="$3"
-  local FLAVOR_LOWER=$(echo "$FLAVOR" | tr '[:upper:]' '[:lower:]')
-  if [ "$FLAVOR_LOWER" = "dev" ]; then FLAVOR_LOWER="development"; fi
-  if [ "$FLAVOR_LOWER" = "prod" ]; then FLAVOR_LOWER="production"; fi
-
-  local OUTPUT="$ROOT/android/output"
-  if [ "$PLATFORM" == "ios" ]; then OUTPUT="$ROOT/ios/output"; fi
-  mkdir -p "$OUTPUT"
-
   echo ""
-  echo ">>> Seeding Base Bundle (v1) | Platform: $PLATFORM | App: $APP_VERSION | Flavor: $FLAVOR_LOWER"
-  echo "  Source binary: $BINARY_PATH"
-
-  if [ ! -f "$BINARY_PATH" ]; then
-    echo "  ❌ ERROR: Source binary file not found: $BINARY_PATH"
-    exit 1
-  fi
-
-  local TARGET_BUNDLE="$OUTPUT/bundle_${APP_VERSION}_v1_${PLATFORM}_${FLAVOR_LOWER}.hbc"
-  local BASE_ASSET_MANIFEST="$OUTPUT/base-assets_${PLATFORM}_${FLAVOR_LOWER}.json"
-  local ASSET_MANIFEST_FILE="$OUTPUT/asset-manifest_${APP_VERSION}_v1_${PLATFORM}_${FLAVOR_LOWER}.json"
-  local TMP_DIR=$(mktemp -d)
-
-  if [ "$PLATFORM" == "android" ]; then
-    echo "  Extracting index.android.bundle from Android binary..."
-    if unzip -l "$BINARY_PATH" 2>/dev/null | grep -q "assets/index.android.bundle"; then
-      unzip -p "$BINARY_PATH" assets/index.android.bundle > "$TMP_DIR/extracted.bundle"
-    elif unzip -l "$BINARY_PATH" 2>/dev/null | grep -q "base/assets/index.android.bundle"; then
-      unzip -p "$BINARY_PATH" base/assets/index.android.bundle > "$TMP_DIR/extracted.bundle"
-    elif [[ "$BINARY_PATH" == *.bundle ]] || [[ "$BINARY_PATH" == *.hbc ]]; then
-      cp "$BINARY_PATH" "$TMP_DIR/extracted.bundle"
-    else
-      echo "  ❌ ERROR: Could not find 'assets/index.android.bundle' inside $BINARY_PATH"
-      rm -rf "$TMP_DIR"
-      exit 1
-    fi
-  else
-    echo "  Extracting main.jsbundle from iOS binary..."
-    local IPA_ENTRY=$(unzip -l "$BINARY_PATH" 2>/dev/null | grep -o 'Payload/[^/]*\.app/main\.jsbundle' | head -n 1)
-    if [ -n "$IPA_ENTRY" ]; then
-      unzip -p "$BINARY_PATH" "$IPA_ENTRY" > "$TMP_DIR/extracted.bundle"
-    elif unzip -l "$BINARY_PATH" 2>/dev/null | grep -q "main.jsbundle"; then
-      local ANY_BUNDLE=$(unzip -l "$BINARY_PATH" 2>/dev/null | grep -o '[^ ]*main\.jsbundle' | head -n 1)
-      unzip -p "$BINARY_PATH" "$ANY_BUNDLE" > "$TMP_DIR/extracted.bundle"
-    elif [[ "$BINARY_PATH" == *.bundle ]] || [[ "$BINARY_PATH" == *.hbc ]] || [[ "$BINARY_PATH" == *.jsbundle ]]; then
-      cp "$BINARY_PATH" "$TMP_DIR/extracted.bundle"
-    else
-      echo "  ❌ ERROR: Could not find 'main.jsbundle' inside $BINARY_PATH"
-      rm -rf "$TMP_DIR"
-      exit 1
-    fi
-  fi
-
-  # Check Hermes bytecode format (0xc6 magic number)
-  FIRST_BYTE=$(od -An -N1 -t x1 "$TMP_DIR/extracted.bundle" | tr -d ' ' || echo "")
-  if [ "$FIRST_BYTE" == "c6" ]; then
-    echo "  ✓ Bundle is verified Hermes bytecode format."
-    cp "$TMP_DIR/extracted.bundle" "$TARGET_BUNDLE"
-  else
-    echo "  Bundle is JavaScript text. Compiling to Hermes bytecode..."
-    find_hermesc
-    if [ -z "$HERMESC_PATH" ] || [ ! -f "$HERMESC_PATH" ]; then
-      echo "  ❌ ERROR: hermesc compiler not found. Cannot compile bundle to bytecode."
-      rm -rf "$TMP_DIR"
-      exit 1
-    fi
-    "$HERMESC_PATH" -emit-binary -O -out "$TARGET_BUNDLE" "$TMP_DIR/extracted.bundle"
-  fi
-
-  # Extract base assets manifest
-  echo "  Scanning assets from binary for base manifest..."
-  local NEW_BASE_ASSETS="{"
-  local ASSET_JSON_LIST="["
-  local FIRST=true
-
-  if [ "$PLATFORM" == "android" ]; then
-    unzip -q -o "$BINARY_PATH" "res/drawable*/*" "res/raw/*" "base/res/drawable*/*" "base/res/raw/*" -d "$TMP_DIR/assets_unzipped" 2>/dev/null || true
-  else
-    unzip -q -o "$BINARY_PATH" "Payload/*.app/assets/*" -d "$TMP_DIR/assets_unzipped" 2>/dev/null || true
-  fi
-
-  if [ -d "$TMP_DIR/assets_unzipped" ]; then
-    while IFS= read -r -d '' ASSET_FILE; do
-      local HASH=$(sha256 "$ASSET_FILE")
-      local FNAME=$(basename "$ASSET_FILE")
-      local EX="${FNAME##*.}"
-      local REL_PATH="${ASSET_FILE#$TMP_DIR/assets_unzipped/}"
-      # Same keys as build_platform: iOS "assets/...", Android "drawable-*/..." / "raw/..."
-      REL_PATH=$(echo "$REL_PATH" | sed -E 's#^Payload/[^/]+\.app/##; s#^(base/)?res/##')
-
-      if [ "$NEW_BASE_ASSETS" != "{" ]; then NEW_BASE_ASSETS+=", "; fi
-      NEW_BASE_ASSETS+="\"$REL_PATH\": \"$HASH\""
-
-      if [ "$FIRST" = true ]; then FIRST=false; else ASSET_JSON_LIST+=", "; fi
-      ASSET_JSON_LIST+="{\"hash\": \"$HASH\", \"ext\": \"$EX\", \"originalPath\": \"$REL_PATH\", \"isBase\": true}"
-    done < <(find "$TMP_DIR/assets_unzipped" -type f -print0 2>/dev/null)
-  fi
-
-  NEW_BASE_ASSETS+="}"
-  ASSET_JSON_LIST+="]"
-
-  echo "$NEW_BASE_ASSETS" > "$BASE_ASSET_MANIFEST"
-  cat > "$ASSET_MANIFEST_FILE" << EOF
-{ "version": 1, "appVersion": "$APP_VERSION", "platform": "$PLATFORM", "flavor": "$FLAVOR_LOWER", "assets": $ASSET_JSON_LIST }
-EOF
-
-  rm -rf "$TMP_DIR"
-
-  local BUNDLE_HASH=$(sha256 "$TARGET_BUNDLE")
-  echo "  ✓ Base bundle v1 successfully created: $(basename "$TARGET_BUNDLE")"
-  echo "    SHA-256: $BUNDLE_HASH"
-
-  # Update registry for v1
-  node "$SCRIPT_DIR/update_registry.js" "$REGISTRY_SHARED" "$APP_VERSION" "1" "[]" "$PLATFORM" "$ASSET_MANIFEST_FILE" "$FLAVOR_LOWER"
-
-  # Push if requested
-  if [ "$PUSH_REMOTE" = true ]; then
-    echo "  Pushing seeded base bundle to remote..."
-    bash "$SCRIPT_DIR/upload_ota.sh" "$APP_VERSION" "$FLAVOR_LOWER" "1" "$TARGET_BUNDLE" "$PLATFORM"
-  fi
-
-  echo "  ✓ Seeding complete for $PLATFORM!"
+  echo "  ✓ $PLATFORM v$NEXT published in $((SECONDS - PLATFORM_START))s"
 }
 
 # ── Main ───────────────────────────────────────────────────────────────────
@@ -684,26 +464,6 @@ echo "=== OTA Build Pipeline | App: $APP_VERSION | Flavor: $FLAVOR ==="
 FLAVOR_LOWER=$(echo "$FLAVOR" | tr '[:upper:]' '[:lower:]')
 if [ "$FLAVOR_LOWER" = "dev" ]; then FLAVOR_LOWER="development"; fi
 if [ "$FLAVOR_LOWER" = "prod" ]; then FLAVOR_LOWER="production"; fi
-
-# ── Seed Action ────────────────────────────────────────────────────────────
-if [ "$ACTION" = "seed" ]; then
-  if [ -n "$SEED_APK" ]; then
-    seed_platform "android" "$FLAVOR_LOWER" "$SEED_APK"
-  elif [ -n "$SEED_IPA" ]; then
-    seed_platform "ios" "$FLAVOR_LOWER" "$SEED_IPA"
-  elif [ -n "$SEED_BUNDLE" ]; then
-    PLATFORM="${PLATFORM_ARG:-android}"
-    seed_platform "$PLATFORM" "$FLAVOR_LOWER" "$SEED_BUNDLE"
-  else
-    echo "❌ Please provide a binary file to seed:"
-    echo "   ./build_ota.sh seed --apk <path-to-apk>"
-    echo "   ./build_ota.sh seed --ipa <path-to-ipa>"
-    exit 1
-  fi
-  echo ""
-  echo "=== Base Seeding Complete ==="
-  exit 0
-fi
 
 # Read current version once to coordinate across platforms
 CURRENT_TOTAL=0
@@ -716,78 +476,8 @@ if [ -f "$REGISTRY_SHARED" ]; then
   ")
 fi
 
-# ── Fail-Safe Guard for OTA Updates ────────────────────────────────────────
-# If building an OTA patch but no base version (v1) exists in the registry:
-if [ "$ACTION" = "ota" ] && [ $CURRENT_TOTAL -eq 0 ]; then
-  echo "Checking for pre-existing Base Bundle v1..."
-  
-  CHECK_PLATFORMS=()
-  if [ -n "$PLATFORM_ARG" ]; then
-    CHECK_PLATFORMS=("$PLATFORM_ARG")
-  else
-    CHECK_PLATFORMS=("android" "ios")
-  fi
-
-  ALL_FOUND=true
-  MISSING_PLATFORM=""
-  for P in "${CHECK_PLATFORMS[@]}"; do
-    P_OUTPUT="$ROOT/$P/output"
-    P_BASE_BUNDLE="$P_OUTPUT/bundle_${APP_VERSION}_v1_${P}_${FLAVOR_LOWER}.hbc"
-    
-    # Check if local exists
-    if [ ! -f "$P_BASE_BUNDLE" ]; then
-      # Try downloading from remote if available
-      REMOTE_BASE_PATH="$BASE_FOLDER/$APP_VERSION/$FLAVOR_LOWER/$(basename "$P_BASE_BUNDLE")"
-      download_remote "$REMOTE_BASE_PATH" "$P_BASE_BUNDLE" || true
-    fi
-
-    if [ -f "$P_BASE_BUNDLE" ]; then
-      echo "  ✓ Found Base Bundle v1 for $P: $(basename "$P_BASE_BUNDLE")"
-      # Auto-adopt base bundle in registry
-      node "$SCRIPT_DIR/update_registry.js" "$REGISTRY_SHARED" "$APP_VERSION" "1" "[]" "$P" "" "$FLAVOR_LOWER"
-    else
-      ALL_FOUND=false
-      MISSING_PLATFORM="$P"
-    fi
-  done
-
-  if [ "$ALL_FOUND" = true ]; then
-    echo "  ✓ Base bundle v1 verified and registered. Proceeding with incremental OTA update..."
-    CURRENT_TOTAL=1
-  else
-    if [ "$FORCE_BASE" = true ]; then
-      echo "  ⚠ Warning: --force flag detected. Creating base bundle v1 from current working tree..."
-      ACTION="base"
-    else
-      echo ""
-      echo "╔══════════════════════════════════════════════════════════════════════════════════════════╗"
-      echo "║ ❌ CANNOT BUILD OTA: MISSING BASE BUNDLE (v1)                                            ║"
-      echo "╠══════════════════════════════════════════════════════════════════════════════════════════╣"
-      echo "║ App Version: $APP_VERSION | Flavor: $FLAVOR_LOWER | Missing: $MISSING_PLATFORM"
-      echo "║"
-      echo "║ No base bundle (v1) was found for this app version (neither locally nor on remote).     ║"
-      echo "║ If an OTA update is built now, it would generate a base bundle from your current         ║"
-      echo "║ working tree, which will MISMATCH the version installed on user devices and force a      ║"
-      echo "║ 100% full-bundle download (wasting bandwidth and bypassing patch benefits).              ║"
-      echo "║"
-      echo "║ How to resolve:                                                                          ║"
-      echo "║ 1. If you already have the release APK/IPA submitted to Google Play / App Store:         ║"
-      echo "║    Seed the exact base bundle from your release binary:                                  ║"
-      echo "║      ./build_ota.sh seed --apk <path-to-apk>                                             ║"
-      echo "║      ./build_ota.sh seed --ipa <path-to-ipa>                                             ║"
-      echo "║"
-      echo "║ 2. If you are preparing a brand new Store release right now from this commit:            ║"
-      echo "║      ./build_ota.sh base                                                                 ║"
-      echo "║"
-      echo "║ 3. If you really want to force create base v1 from current code:                         ║"
-      echo "║      ./build_ota.sh --force                                                              ║"
-      echo "╚══════════════════════════════════════════════════════════════════════════════════════════╝"
-      echo ""
-      exit 1
-    fi
-  fi
-fi
-
+# v1 is the store build: the first OTA build is v2
+if [ "$CURRENT_TOTAL" -lt 1 ]; then CURRENT_TOTAL=1; fi
 TARGET_OTA=$((CURRENT_TOTAL + 1))
 
 if [ -n "$PLATFORM_ARG" ]; then

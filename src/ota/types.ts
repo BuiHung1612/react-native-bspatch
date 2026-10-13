@@ -35,10 +35,8 @@ export type OtaPatch = {
     label: string;
     /** App version this patch belongs to */
     appVersion: string;
-    /** Release tag (legacy, keep for type compatibility) */
-    releaseTag?: string;
-    /** Filename on the server (e.g. "v1-to-v3.patch") */
-    filename: string;
+    /** Patch file on the server; absent on the full-bundle entry (installs `fullBundleUrl`) */
+    filename?: string;
     /** Version the app must be at to apply this patch */
     fromVersion: number;
     /** Version this patch upgrades to */
@@ -49,14 +47,12 @@ export type OtaPatch = {
     bundleHash?: string;
     /** Minimum native app version required (semver) */
     minAppVersion?: string;
-    /** URL for full bundle download (fallback when patch fails) */
+    /** Full bundle file: used when there is no OTA bundle to patch from, or the patch fails */
     fullBundleUrl?: string;
     /** RSA/ECDSA SHA-256 signature (base64) of the patch file */
     signature?: string;
     /** RSA/ECDSA SHA-256 signature (base64) of the resulting bundle */
     bundleSignature?: string;
-    /** Whether this update is mandatory */
-    mandatory?: boolean;
     /** URL to the asset manifest JSON for this version */
     assetManifestUrl?: string;
     /** Target platform for this patch */
@@ -77,15 +73,6 @@ export type OtaAsset = {
     originalPath: string;
 };
 
-export type OtaRemotePatch = {
-    version: number;
-    minAppVersion: string;
-    patchUrl: string;
-    bundleHash: string;
-    baseHash: string;
-    mandatory: boolean;
-};
-
 export type OtaMetadata = {
     currentVersion: number;
     previousVersions: number[];
@@ -95,6 +82,8 @@ export type OtaMetadata = {
     appVersion?: string;
     /** Versions that crashed on boot and were rolled back; never re-applied */
     failedVersions?: number[];
+    /** Last version that launched and rendered successfully; the native resolver never rolls it back */
+    verifiedVersion?: number;
 };
 
 export type OtaMetrics = {
@@ -108,7 +97,6 @@ export type OtaMetrics = {
 export type OtaNetworkStrategy = {
     retry?: number;
     timeoutMs?: number;
-    wifiOnly?: boolean;
 };
 
 export type OtaConfig = {
@@ -116,8 +104,6 @@ export type OtaConfig = {
     appVersion?: string;
     /** Initial version baked into the APK (usually 1) */
     baseAppVersion: number;
-    /** Default patches if manifest fetch fails */
-    bundledPatches?: OtaPatch[];
     /**
      * Allow OTA checks and patch application while React Native is running in
      * development mode (`__DEV__`). Disabled by default for safety.
@@ -126,7 +112,6 @@ export type OtaConfig = {
 
     /** Enterprise configurations */
     updateMode?: OtaUpdateMode;
-    maxRollback?: number;
     network?: OtaNetworkStrategy;
 
     /** Telemetry: structured event callback for analytics */

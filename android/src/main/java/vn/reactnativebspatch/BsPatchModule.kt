@@ -8,9 +8,7 @@ import com.facebook.react.bridge.Callback
 import com.facebook.react.bridge.Promise
 import java.io.File
 import java.io.FileInputStream
-import java.io.FileOutputStream
 import java.io.BufferedInputStream
-import java.io.BufferedOutputStream
 import java.util.concurrent.Executors
 
 class BsPatchModule(private val reactContext: ReactApplicationContext) : NativeBsPatchSpec(reactContext) {
@@ -38,29 +36,6 @@ class BsPatchModule(private val reactContext: ReactApplicationContext) : NativeB
                 promise.resolve(result)
             } catch (e: Exception) {
                 promise.reject("ERR_BSPATCH", e.message, e)
-            }
-        }
-    }
-
-    /**
-     * Extracts the JS bundle from APK assets using Android AssetManager.
-     * Guarantees byte-exact copy — RNFS.copyFileAssets can produce different
-     * bytes in certain APK configurations.
-     */
-    override fun extractBundleFromAssets(assetName: String, destPath: String, promise: Promise) {
-        backgroundExecutor.execute {
-            try {
-                val assetManager = reactContext.assets
-                assetManager.open(assetName).use { input ->
-                    val destFile = File(destPath)
-                    destFile.parentFile?.mkdirs()
-                    BufferedOutputStream(FileOutputStream(destFile), IO_BUFFER_SIZE).use { output ->
-                        input.copyTo(output, bufferSize = IO_BUFFER_SIZE)
-                    }
-                }
-                promise.resolve(true)
-            } catch (e: Exception) {
-                promise.reject("ERR_EXTRACT_ASSET", e.message, e)
             }
         }
     }

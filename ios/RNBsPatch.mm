@@ -57,33 +57,6 @@ RCT_EXPORT_METHOD(applyPatch:(NSString *)oldPath
     });
 }
 
-RCT_EXPORT_METHOD(extractBundleFromAssets:(NSString *)assetName
-                  destPath:(NSString *)destPath
-                  resolve:(RCTPromiseResolveBlock)resolve
-                  reject:(RCTPromiseRejectBlock)reject)
-{
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSString *resourceName = [assetName stringByDeletingPathExtension];
-        NSString *resourceType = [assetName pathExtension];
-        if (resourceType.length == 0) resourceType = @"jsbundle";
-        
-        NSString *bundlePath = [[NSBundle mainBundle] pathForResource:resourceName ofType:resourceType];
-        if (!bundlePath) {
-            reject(@"ERR_EXTRACT_ASSET", [NSString stringWithFormat:@"%@ not found in main bundle", assetName], nil);
-            return;
-        }
-        NSError *error = nil;
-        // copyItemAtPath fails if the destination exists (base.hbc is re-extracted on every update)
-        [[NSFileManager defaultManager] removeItemAtPath:destPath error:nil];
-        BOOL success = [[NSFileManager defaultManager] copyItemAtPath:bundlePath toPath:destPath error:&error];
-        if (success) {
-            resolve(@(YES));
-        } else {
-            reject(@"ERR_EXTRACT_ASSET", error.localizedDescription, error);
-        }
-    });
-}
-
 RCT_EXPORT_METHOD(reloadBundle)
 {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -125,7 +98,7 @@ static NSData *RNBsPatchKeyFromSPKI(NSData *spki, BOOL *isRSA)
 {
     static const uint8_t rsaOID[] = {0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01};
     static const uint8_t ecOID[] = {0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01};
-    const uint8_t *b = spki.bytes;
+    const uint8_t *b = (const uint8_t *)spki.bytes;
     NSUInteger len = spki.length, pos = 0, inner;
     uint8_t tag;
     NSRange outer, algo, oid, bits;

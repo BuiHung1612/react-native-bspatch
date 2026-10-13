@@ -6,7 +6,7 @@ const OTA_DIR = `${ReactNativeBlobUtil.fs.dirs.DocumentDir}/ota`;
 const METADATA_PATH = `${OTA_DIR}/metadata.json`;
 const METADATA_TMP_PATH = `${METADATA_PATH}.tmp`;
 
-/** Promise-based lock to prevent concurrent metadata writes (double-tap guard). */
+/** Serializes metadata updates (see updateMetadata). */
 let saveLock: Promise<void> = Promise.resolve();
 
 /**
@@ -47,18 +47,20 @@ export const loadMetadata = async (
 };
 
 /**
- * Persists OTA metadata to the local filesystem.
- *
- * @param metadata - The metadata object to save.
+ * Atomically updates metadata: load → fn → save, serialized with every other
+ * update so a background install and markHealthy can't overwrite each other.
  */
-export const saveMetadata = async (metadata: OtaMetadata): Promise<void> => {
-    // Wait for any in-flight save to complete before starting our own
+export const updateMetadata = async (
+    defaultVersion: number,
+    fn: (metadata: OtaMetadata) => OtaMetadata,
+): Promise<OtaMetadata> => {
     const prevLock = saveLock;
-    let settleFn: (() => void) | undefined;
-    saveLock = new Promise<void>(resolve => { settleFn = resolve; });
+    let release!: () => void;
+    saveLock = new Promise<void>(resolve => (release = resolve));
 
     try {
         await prevLock;
+        const metadata = fn(await loadMetadata(defaultVersion));
         await ensureOtaDir();
         // Write-then-rename so a kill mid-write never leaves truncated JSON
         await ReactNativeBlobUtil.fs.writeFile(
@@ -70,11 +72,12 @@ export const saveMetadata = async (metadata: OtaMetadata): Promise<void> => {
             await ReactNativeBlobUtil.fs.unlink(METADATA_PATH);
         }
         await ReactNativeBlobUtil.fs.mv(METADATA_TMP_PATH, METADATA_PATH);
+        return metadata;
     } catch (e) {
         console.error('[otaMetadata] Failed to save metadata:', e);
         throw new Error(`Failed to save metadata: ${(e as Error).message}`);
     } finally {
-        settleFn!();
+        release();
     }
 };
 
@@ -155,26 +158,33 @@ export const cleanupOldVersions = async (
 };
 
 /**
- * Marks the current session as healthy, indicating a successful boot.
- * This prevents the native bridge from rolling back the version on the next launch.
+ * Marks the running version healthy: the native resolver stops treating its
+ * launches as pending, so it is never rolled back afterwards (crash on first
+ * launch → rollback; crash after a verified launch → app bug, not a bad bundle).
  * Also cleans up obsolete version directories from disk.
  *
  * @param defaultVersion - Base version for metadata lookup fallback.
+ * @param runningVersion - Version loaded at boot. If a background install has
+ *   since switched currentVersion, the new version hasn't run yet and is left pending.
  * @returns The updated metadata.
  */
 export const markHealthy = async (
     defaultVersion: number,
+    runningVersion: number,
     appVersion?: string,
 ): Promise<OtaMetadata> => {
-    const metadata = await loadMetadata(defaultVersion);
-    const updated: OtaMetadata = {
-        ...metadata,
-        // Stamp legacy metadata so the native resolver can detect a store update later
-        appVersion: metadata.appVersion ?? appVersion,
-        lastLaunchSuccessful: true,
-        rollbackCount: 0,
-    };
-    await saveMetadata(updated);
+    const updated = await updateMetadata(defaultVersion, metadata =>
+        metadata.currentVersion !== runningVersion
+            ? metadata
+            : {
+                  ...metadata,
+                  // Stamp legacy metadata so the native resolver can detect a store update later
+                  appVersion: metadata.appVersion ?? appVersion,
+                  lastLaunchSuccessful: true,
+                  rollbackCount: 0,
+                  verifiedVersion: runningVersion,
+              },
+    );
 
     // Garbage collect older versions on disk to free storage
     await cleanupOldVersions(updated, defaultVersion);

@@ -3,17 +3,17 @@ import ReactNativeBlobUtil from 'react-native-blob-util';
 import type { OtaConfig, OtaPatch, OtaStorageProvider } from '../types';
 
 /**
- * Storage Provider for fetching OTA updates directly from a GitHub Raw repository.
+ * Storage Provider for any static host with this layout: GitHub raw, a public
+ * Cloudflare R2 bucket (r2.dev or custom domain), S3, a CDN...
  *
  * Direct URL mapping:
  * - Manifest: `${baseUrl}/${baseFolder}/ota_registry.json`
  * - Patch file: `${baseUrl}/${baseFolder}/${appVersion}/${channel}/${filename}`
  * - Assets: `${baseUrl}/${baseFolder}/assets/${hash}.${ext}`
  *
- * NOTE: All manifest/registry fetches include Cache-Control: no-cache and a
- * timestamp query param to bypass GitHub CDN's 5-minute (max-age=300) cache.
- * Asset URLs are content-addressed (hash-named) so they are immutable and
- * intentionally NOT cache-busted.
+ * NOTE: Only the registry is mutable: it is fetched with Cache-Control: no-cache
+ * and a timestamp query param (GitHub's CDN caches for 5 minutes). Bundles,
+ * patches, manifests and assets are never overwritten, so they stay cacheable.
  */
 
 /** Headers to bypass GitHub CDN cache on mutable files (registry, manifests) */
@@ -32,7 +32,9 @@ const normalizeChannel = (channel: string): string => {
 
 export class GitHubRawStorageProvider implements OtaStorageProvider {
     async fetchManifest(config: OtaConfig): Promise<OtaPatch[]> {
-        if (!config.customServer) return config.bundledPatches || [];
+        if (!config.customServer) {
+            throw new Error('[GitHubRawStorage] customServer configuration missing');
+        }
 
         const { baseUrl, channel, baseFolder = 'ota' } = config.customServer;
         const channelName = normalizeChannel(channel);
@@ -69,21 +71,14 @@ export class GitHubRawStorageProvider implements OtaStorageProvider {
             const appGroup = registry?.apps?.[config.appVersion];
             const flavorGroup = appGroup?.flavors?.[channelName];
 
-            if (!flavorGroup?.patches?.length) {
-                return config.bundledPatches || [];
-            }
-
-            return (flavorGroup.patches || []).filter(
+            return (flavorGroup?.patches ?? []).filter(
                 (p: OtaPatch) =>
                     !p.platform ||
                     p.platform.toLowerCase() === Platform.OS.toLowerCase(),
             );
         } catch (error) {
-            console.warn(
-                '[GitHubRawStorage] Manifest fetch error:',
-                (error as Error).message,
-            );
-            return config.bundledPatches || [];
+            // Surface it: "no patches" would report a broken registry as up to date
+            throw new Error(`[GitHubRawStorage] Manifest fetch error: ${(error as Error).message}`);
         }
     }
 
@@ -101,11 +96,8 @@ export class GitHubRawStorageProvider implements OtaStorageProvider {
             : baseUrl;
         const channelName = normalizeChannel(channel);
 
-        // Cache-bust: patch files are versioned by name but GitHub CDN may
-        // serve a stale 404 response for newly uploaded files within 5 min.
-        return bustCache(
-            `${normalizedBaseUrl}/${baseFolder}/${config.appVersion}/${channelName}/${filename}`,
-        );
+        // Versioned names, never overwritten: no cache-bust, so a CDN can cache them
+        return `${normalizedBaseUrl}/${baseFolder}/${config.appVersion}/${channelName}/${filename}`;
     }
 
     async getAssetUrl(

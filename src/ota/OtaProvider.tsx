@@ -19,7 +19,7 @@ import {
 import ReactNativeBlobUtil from 'react-native-blob-util';
 import NativeBsPatch from '../NativeBsPatch';
 import { initOtaAssetResolver } from './otaAssetResolver';
-import { applyOtaPatchInternal, fetchOtaManifest } from './otaCore';
+import { applyOtaPatchInternal, fetchOtaManifest, selectUpdate, validateOtaConfig } from './otaCore';
 import { createOtaLogger, OtaEvent } from './otaLogger';
 import { loadMetadata, markHealthy } from './otaMetadata';
 import {
@@ -65,8 +65,20 @@ export function OtaProvider({
   const isCheckingRef = useRef(false);
   const pendingReloadRef = useRef(false);
   const bootstrapDone = useRef(false);
+  /** Version the native resolver loaded for this JS session */
+  const runningVersionRef = useRef(config.baseAppVersion);
   const progressRef = useRef(0);
   const isDebugUpdateEnabled = !__DEV__ || config.allowDebugUpdates === true;
+
+  // No fallbacks: a missing env value disables OTA instead of silently pointing elsewhere.
+  // Dev: throw during render (red box). Release: the app runs, OTA never checks or downloads.
+  const configError = useMemo(() => {
+    const e = validateOtaConfig(config);
+    return e && `[react-native-bspatch] OTA disabled: ${e}`;
+  }, [config]);
+  if (__DEV__ && configError) {
+    throw new Error(configError);
+  }
 
   const setProgressIfChanged = useCallback((nextProgress: number) => {
     if (progressRef.current === nextProgress) {
@@ -99,16 +111,12 @@ export function OtaProvider({
   const executeApplyUpdate = useCallback(
     async (patchList: OtaPatch[], currentVer: number, targetVer: number) => {
       console.log('[OtaProvider] executeApplyUpdate | targetV:', targetVer, 'currentV:', currentVer);
-      const directPatch = patchList.find(
-        p => p.fromVersion === currentVer &&
-             p.toVersion === targetVer &&
-             (!p.platform || p.platform === Platform.OS),
-      );
+      const directPatch = selectUpdate(patchList, currentVer, targetVer);
 
       if (!directPatch) {
-        console.warn('[OtaProvider] No direct patch found for', currentVer, '->', targetVer);
+        console.warn('[OtaProvider] No update entry found for', currentVer, '->', targetVer);
         setStatus(OtaStatus.ERROR);
-        setMessage('No direct upgrade path found.');
+        setMessage('No upgrade path found.');
         return;
       }
 
@@ -167,11 +175,7 @@ export function OtaProvider({
       localV: number,
       targetV: number,
     ) => {
-      const directPatch = patchList.find(
-        p => p.fromVersion === localV &&
-             p.toVersion === targetV &&
-             (!p.platform || p.platform === Platform.OS),
-      );
+      const directPatch = selectUpdate(patchList, localV, targetV);
       if (!directPatch) return;
 
       try {
@@ -185,10 +189,8 @@ export function OtaProvider({
               pendingReloadRef.current = true;
               setStatus(OtaStatus.UP_TO_DATE);
               setMessage(`Update V${targetV} ready for next launch`);
-              if (m) {
-                setMetrics(m);
-                initOtaAssetResolver(targetV);
-              }
+              // Not initOtaAssetResolver: the running bundle still needs its own manifest
+              if (m) setMetrics(m);
             }
           },
           () => {}, // silent: background doesn't spam progress
@@ -208,7 +210,7 @@ export function OtaProvider({
    * Uses a ref to guard against concurrent calls (avoids stale closure).
    */
   const checkUpdates = useCallback(async () => {
-    if (isCheckingRef.current) return;
+    if (isCheckingRef.current || configError) return;
     if (!isDebugUpdateEnabled) {
       setPendingCount(0);
       setIsChecking(false);
@@ -274,7 +276,7 @@ export function OtaProvider({
       isCheckingRef.current = false;
       setIsChecking(false);
     }
-  }, [config, executeApplyUpdate, isDebugUpdateEnabled, downloadBackgroundUpdate, getEffectiveConfig]);
+  }, [config, configError, executeApplyUpdate, isDebugUpdateEnabled, downloadBackgroundUpdate, getEffectiveConfig]);
 
   /**
    * Bootstrap: runs once on mount.
@@ -299,6 +301,7 @@ export function OtaProvider({
       }).catch(() => {});
 
       const metadata = await loadMetadata(config.baseAppVersion);
+      runningVersionRef.current = metadata.currentVersion;
 
       // Display current version immediately
       setCurrentVersion(metadata.currentVersion);
@@ -309,7 +312,12 @@ export function OtaProvider({
       }
 
       // (Native layer handled crash detection and any necessary rollback)
-      // We just mark bootstrap as done
+      if (configError) {
+        console.error(configError);
+        setMessage(configError);
+        setStatus(OtaStatus.ERROR);
+        return;
+      }
       bootstrapDone.current = true;
 
       // Mode-based auto-check
@@ -373,9 +381,8 @@ export function OtaProvider({
   const markAsHealthy = async () => {
     const log = createOtaLogger(config.onEvent);
     log.emit(OtaEvent.MARK_HEALTHY);
-    const { appVersion } = await getEffectiveConfig().catch(() => config);
-    await markHealthy(config.baseAppVersion, appVersion);
-    NativeBsPatch.markAsHealthy();
+    const appVersion = await NativeBsPatch.getAppVersion().catch(() => config.appVersion);
+    await markHealthy(config.baseAppVersion, runningVersionRef.current, appVersion);
   };
 
   const resetToFactory = async () => {

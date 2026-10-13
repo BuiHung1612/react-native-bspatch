@@ -1,16 +1,13 @@
 #!/bin/bash
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OTA Upload Script — GitHub storage repository
+# OTA Upload Script — Cloudflare R2 (when OTA_R2_BUCKET is set) or a GitHub storage repository
 # Uploads:  1) All .patch & .hbc files  →  {baseFolder}/{appVersion}/{channel}/
 #           2) ota_registry.json         →  {baseFolder}/ota_registry.json
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Load environment variables if .env exists
+# Env (.env.<flavor> + .env.ota) is loaded and exported by build_ota.sh
 ROOT_DIR=$(pwd)
-if [ -f "$ROOT_DIR/.env" ]; then
-    set -a; . "$ROOT_DIR/.env"; set +a
-fi
 
 BASE_URL="${OTA_BASE_URL:-}"
 BASE_FOLDER="${OTA_FOLDER:-${6:-ota}}"
@@ -26,9 +23,6 @@ if [[ "$PLATFORM" == "ios" ]]; then
     OUTPUT_DIR="$ROOT_DIR/ios/output"
 fi
 
-echo ""
-echo "=== OTA Upload | App: $APP_VERSION | Channel: $CHANNEL | V$OTA_VERSION | Platform: $PLATFORM ==="
-echo "  Output dir: $OUTPUT_DIR"
 
 # Validate
 if [[ -z "$APP_VERSION" || -z "$OTA_VERSION" ]]; then
@@ -48,13 +42,67 @@ for ARG in "$@"; do
     fi
 done
 
-# Files of this app version + channel only (bundle_/patch_/asset-manifest_ carry both;
-# base-assets_<platform>_<channel>.json carries just the channel)
+# Files of this app version + channel only (bundle_/patch_/asset-manifest_ carry both)
 is_release_file() {
     local FNAME="$1"
-    if [[ "$FNAME" == "base-assets_"*"_${CHANNEL}.json" ]]; then return 0; fi
     [[ "$FNAME" == *"_${APP_VERSION}_"* ]] && [[ "$FNAME" == *"_${CHANNEL}."* || "$FNAME" == *"_${CHANNEL}_"* ]]
 }
+
+# ── Cloudflare R2 (S3 API, signed by curl --aws-sigv4; no CLI needed) ────────
+if [[ -n "${OTA_R2_BUCKET:-}" ]]; then
+    : "${OTA_R2_ACCOUNT_ID:?set OTA_R2_ACCOUNT_ID}" "${OTA_R2_ACCESS_KEY_ID:?set OTA_R2_ACCESS_KEY_ID}" "${OTA_R2_SECRET_ACCESS_KEY:?set OTA_R2_SECRET_ACCESS_KEY}"
+    R2_URL="https://${OTA_R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${OTA_R2_BUCKET}"
+    r2() { curl -sS --aws-sigv4 "aws:amz:auto:s3" --user "$OTA_R2_ACCESS_KEY_ID:$OTA_R2_SECRET_ACCESS_KEY" "$@"; }
+    r2_put() { # <file> <key> <cache-control> [label]
+        local SIZE PROGRESS=(-s)
+        SIZE=$(wc -c < "$1" | tr -d ' ')
+        # Progress bar for big files (bundles) in a terminal
+        if [ -t 2 ] && [ "$SIZE" -gt 1048576 ]; then echo "      ↑ ${4:-$2}"; PROGRESS=(-#); fi
+        curl -S "${PROGRESS[@]}" -f --aws-sigv4 "aws:amz:auto:s3" --user "$OTA_R2_ACCESS_KEY_ID:$OTA_R2_SECRET_ACCESS_KEY" \
+            -X PUT -T "$1" -H "Cache-Control: $3" "$R2_URL/$2" -o /dev/null || { echo "  ❌ Upload failed: $2"; exit 1; }
+        echo "      ✓ ${4:-$2} ($(human_size "$SIZE"))"
+    }
+    RELEASE_PREFIX="$BASE_FOLDER/$APP_VERSION/$CHANNEL"
+    IMMUTABLE="public, max-age=31536000, immutable"
+
+    echo "      → Cloudflare R2: $OTA_R2_BUCKET/$RELEASE_PREFIX"
+    if [ "$CLEAN_REMOTE" = true ]; then
+        echo "  Deleting $RELEASE_PREFIX/ ..."
+        # ponytail: one ListObjectsV2 page (1000 keys); a release+channel holds far fewer
+        for KEY in $(r2 -f "$R2_URL?list-type=2&prefix=$RELEASE_PREFIX/" | grep -o '<Key>[^<]*</Key>' | sed 's/<[^>]*>//g'); do
+            r2 -f -X DELETE "$R2_URL/$KEY" -o /dev/null && echo "  ✗ $KEY"
+        done
+    else
+        # Only this version's files: earlier bundles/patches are already uploaded and never change
+        RELEASE_FILES=()
+        for FILE in "$OUTPUT_DIR"/*_v"${OTA_VERSION}"_*.{patch,hbc,json}; do
+            [[ -f "$FILE" ]] && is_release_file "$(basename "$FILE")" && RELEASE_FILES+=("$FILE")
+        done
+        N=0
+        for FILE in "${RELEASE_FILES[@]}"; do
+            N=$((N + 1)); FNAME=$(basename "$FILE")
+            r2_put "$FILE" "$RELEASE_PREFIX/$FNAME" "$IMMUTABLE" "($N/${#RELEASE_FILES[@]}) $FNAME"
+        done
+        # Content-addressed assets: upload only hashes the bucket doesn't have yet
+        ASSETS=("$OUTPUT_DIR"/asset-store/*)
+        [[ -f "${ASSETS[0]}" ]] || ASSETS=()
+        N=0; NEW=0; NEW_BYTES=0
+        for FILE in "${ASSETS[@]}"; do
+            N=$((N + 1))
+            KEY="$BASE_FOLDER/assets/$(basename "$FILE")"
+            if ! r2 -f -I "$R2_URL/$KEY" -o /dev/null 2>/dev/null; then
+                r2 -f -X PUT -T "$FILE" -H "Cache-Control: $IMMUTABLE" "$R2_URL/$KEY" -o /dev/null || { echo "  ❌ Upload failed: $KEY"; exit 1; }
+                NEW=$((NEW + 1)); NEW_BYTES=$((NEW_BYTES + $(wc -c < "$FILE")))
+            fi
+            if [ -t 1 ]; then printf "\r      assets %d/%d checked, %d uploaded" "$N" "${#ASSETS[@]}" "$NEW"; fi
+        done
+        if [ -t 1 ] && [ ${#ASSETS[@]} -gt 0 ]; then printf "\r\033[K"; fi
+        echo "      ✓ assets: ${#ASSETS[@]} total, $NEW uploaded ($(human_size "$NEW_BYTES")), $((${#ASSETS[@]} - NEW)) already on R2"
+    fi
+    # Registry last: clients never see a version whose files aren't uploaded yet
+    r2_put "$REGISTRY_FILE" "$BASE_FOLDER/ota_registry.json" "no-cache" "ota_registry.json"
+    exit 0
+fi
 
 # ── GitHub Auto-Push Integration ──────────────────────────────────────────────
 if [[ "$BASE_URL" != "https://raw.githubusercontent.com/"* ]]; then
@@ -108,9 +156,8 @@ fi
 
     # 2. Copy generated files into storage repo (or reset remote)
     if [ "$CLEAN_REMOTE" = true ]; then
-        echo "  Resetting remote storage state for channel '$CHANNEL' (base bundle v1 + base-assets kept)..."
-        find "$GH_REPO_DIR/$BASE_FOLDER/$APP_VERSION/$CHANNEL" -type f \
-            -not -name "bundle_${APP_VERSION}_v1_*" -not -name 'base-assets_*' -delete 2>/dev/null || true
+        echo "  Resetting remote storage state for channel '$CHANNEL' ..."
+        rm -rf "$GH_REPO_DIR/$BASE_FOLDER/$APP_VERSION/${CHANNEL:?}"
         mkdir -p "$GH_REPO_DIR/$BASE_FOLDER"
         cp "$REGISTRY_FILE" "$GH_REPO_DIR/$BASE_FOLDER/ota_registry.json"
         cp "$REGISTRY_FILE" "$GH_REPO_DIR/ota_registry.json" 2>/dev/null || true

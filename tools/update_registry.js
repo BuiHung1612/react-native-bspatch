@@ -6,8 +6,7 @@
  * 1. Reads  : android/output/ota_registry.json (or ios/output/...)
  * 2. Scopes to : appVersion (e.g. "1.0.0")
  * 3. Scopes to : flavor (e.g. "dev", "staging", "production")
- * 4. Updates patches and latestOtaVersion for that specific app+flavor combination.
- * 5. Writes : otaPatches.generated.ts (flattened across all app versions/flavors)
+ * 4. Writes the full-bundle entry + patch entries and latestOtaVersion for that app+flavor.
  */
 
 const fs = require('fs');
@@ -32,10 +31,6 @@ const flavor = flavorInput.toLowerCase();
 const registryPath = projectRoot.endsWith('.json') 
   ? projectRoot 
   : path.join(projectRoot, 'ota_registry.json');
-
-const generatedPath = projectRoot.endsWith('.json')
-  ? path.join(path.dirname(projectRoot), 'src/ota/otaPatches.generated.ts')
-  : path.join(projectRoot, 'src/ota/otaPatches.generated.ts');
 
 // ── Load or init registry ───────────────────────────────────────────────────
 let registry = { apps: {} };
@@ -80,8 +75,9 @@ if (!signingKey) {
   }
 }
 
-// ── Update patches ──────────────────────────────────────────────────────────
-if (newPatches.length > 0) {
+// ── Update entries ──────────────────────────────────────────────────────────
+// One full-bundle entry (no `filename`) + one entry per patch from an earlier OTA version
+{
   // We merge patches by platform to avoid overwriting between Android and iOS
   const otherPlatformPatches = flavorGroup.patches.filter(p => p.platform !== platform);
   
@@ -107,33 +103,36 @@ if (newPatches.length > 0) {
   // path and the full-bundle fallback, so a tampered registry can't swap bundles.
   const bundleSignature = sign(fullBundleName);
 
-  const mappedNewPatches = newPatches.map(p => {
-    const signature = sign(p.file);
+  const bundleHash = crypto
+    .createHash('sha256')
+    .update(fs.readFileSync(path.join(outputDir, fullBundleName)))
+    .digest('hex');
 
-    const patchObj = {
-      id: `v${p.from}-to-v${p.to}-${flavor}-${platform}`,
-      label: `V${p.from} → V${p.to} (${flavor} ${platform})`,
-      appVersion,
-      filename: p.file,
-      fromVersion: p.from,
-      toVersion: p.to,
-      platform,
-      baseHash: p.baseHash || '',
-      bundleHash: p.bundleHash || '',
-      fullBundleUrl: fullBundleName,
-      assetManifestUrl: manifestName,
-      flavor: flavor,
-    };
-
-    if (signature) {
-      patchObj.signature = signature;
-      patchObj.bundleSignature = bundleSignature;
-    }
-
-    return patchObj;
+  const entry = (from, extra) => ({
+    id: `v${from}-to-v${toOtaVersion}-${flavor}-${platform}`,
+    label: `V${from} → V${toOtaVersion} (${flavor} ${platform})`,
+    appVersion,
+    fromVersion: from,
+    toVersion: toOtaVersion,
+    platform,
+    bundleHash,
+    fullBundleUrl: fullBundleName,
+    assetManifestUrl: manifestName,
+    flavor,
+    bundleSignature,
+    ...extra,
   });
 
-  flavorGroup.patches = [...otherPlatformPatches, ...mappedNewPatches];
+  // fromVersion 1 = the store build, whose clients always take the full bundle
+  const fullEntry = entry(1, {
+    id: `full-to-v${toOtaVersion}-${flavor}-${platform}`,
+    label: `Full V${toOtaVersion} (${flavor} ${platform})`,
+  });
+  const patchEntries = newPatches.map(p =>
+    entry(p.from, { filename: p.file, baseHash: p.baseHash, signature: sign(p.file) }),
+  );
+
+  flavorGroup.patches = [...otherPlatformPatches, fullEntry, ...patchEntries];
 }
 
 // ── Write updated registry ───────────────────────────────────────────────────

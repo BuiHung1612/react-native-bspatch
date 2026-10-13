@@ -1,4 +1,4 @@
-import { Image, Platform } from 'react-native';
+import { Image } from 'react-native';
 import ReactNativeBlobUtil from 'react-native-blob-util';
 import NativeBsPatch from '../NativeBsPatch';
 
@@ -8,7 +8,6 @@ interface AssetMetadata {
     originalPath: string;
     hash: string;
     ext: string;
-    isBase?: boolean;
     _normPath: string;
 }
 
@@ -143,21 +142,6 @@ const patchAssetResolver = (): void => {
             }
 
             if (found) {
-                if (found.isBase) {
-                    if (Platform.OS === 'ios') {
-                        // iOS: OTA bundle generates wrong relative paths for base assets, redirect to MainBundleDir
-                        const finalUri = `file://${ReactNativeBlobUtil.fs.dirs.MainBundleDir}/${found.originalPath}`;
-                        log(`REDIRECTED (BASE): ${uri} -> (MainBundle: ${finalUri})`);
-                        return { ...res, uri: finalUri };
-                    } else {
-                        // Android: with a file-based bundle RN points at ota/vN/drawable-*/x.png,
-                        // which doesn't exist. Base assets live in the APK as drawable/raw
-                        // resources, addressed by name (originalPath: "drawable-mdpi/name.png").
-                        const resName = found.originalPath.split('/').pop()!.replace(/\.[^.]+$/, '');
-                        return { ...res, uri: resName };
-                    }
-                }
-
                 const localPath = `${ASSET_STORE_DIR}/${found.hash}.${found.ext}`;
                 // iOS & Android: requires file:// prefix for absolute filesystem paths
                 const finalUri = `file://${localPath}`;
