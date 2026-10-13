@@ -45,7 +45,7 @@ export class GitHubRawStorageProvider implements OtaStorageProvider {
         );
 
         try {
-            const res = await ReactNativeBlobUtil.fetch(
+            const res = await ReactNativeBlobUtil.config({ timeout: 15000 }).fetch(
                 'GET',
                 registryUrl,
                 NO_CACHE_HEADERS,

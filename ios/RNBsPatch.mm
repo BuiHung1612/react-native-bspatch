@@ -1,13 +1,10 @@
 #import "RNBsPatch.h"
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <zlib.h>
-#import <CommonCrypto/CommonHMAC.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <Security/Security.h>
 #import <React/RCTLog.h>
 #import <React/RCTReloadCommand.h>
-#import <SSZipArchive/SSZipArchive.h>
 
 #if __has_include(<react_native_bspatch/react_native_bspatch-Swift.h>)
 #import <react_native_bspatch/react_native_bspatch-Swift.h>
@@ -60,21 +57,6 @@ RCT_EXPORT_METHOD(applyPatch:(NSString *)oldPath
     });
 }
 
-RCT_EXPORT_METHOD(unzip:(NSString *)source
-                  targetDir:(NSString *)targetDir
-                  resolve:(RCTPromiseResolveBlock)resolve
-                  reject:(RCTPromiseRejectBlock)reject)
-{
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        BOOL success = [SSZipArchive unzipFileAtPath:source toDestination:targetDir];
-        if (success) {
-            resolve(@(YES));
-        } else {
-            reject(@"ERR_UNZIP", @"Failed to unzip file", nil);
-        }
-    });
-}
-
 RCT_EXPORT_METHOD(extractBundleFromAssets:(NSString *)assetName
                   destPath:(NSString *)destPath
                   resolve:(RCTPromiseResolveBlock)resolve
@@ -91,6 +73,8 @@ RCT_EXPORT_METHOD(extractBundleFromAssets:(NSString *)assetName
             return;
         }
         NSError *error = nil;
+        // copyItemAtPath fails if the destination exists (base.hbc is re-extracted on every update)
+        [[NSFileManager defaultManager] removeItemAtPath:destPath error:nil];
         BOOL success = [[NSFileManager defaultManager] copyItemAtPath:bundlePath toPath:destPath error:&error];
         if (success) {
             resolve(@(YES));
@@ -117,41 +101,48 @@ RCT_EXPORT_METHOD(markAsHealthy)
     [OtaBundleResolver markAsHealthy];
 }
 
-RCT_EXPORT_METHOD(decompressGzip:(NSString *)sourcePath
-                  destPath:(NSString *)destPath
-                  resolve:(RCTPromiseResolveBlock)resolve
-                  reject:(RCTPromiseRejectBlock)reject)
+// Reads one DER TLV at *pos; returns content range and advances *pos past it.
+static BOOL RNBsPatchReadDER(const uint8_t *b, NSUInteger len, NSUInteger *pos, uint8_t *tag, NSRange *content)
 {
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSString *src = sourcePath;
-        NSString *dst = destPath;
+    if (*pos + 2 > len) return NO;
+    *tag = b[(*pos)++];
+    NSUInteger l = b[(*pos)++];
+    if (l & 0x80) {
+        NSUInteger n = l & 0x7f;
+        if (n == 0 || n > 4 || *pos + n > len) return NO;
+        l = 0;
+        for (NSUInteger i = 0; i < n; i++) l = (l << 8) | b[(*pos)++];
+    }
+    if (l > len - *pos) return NO;
+    *content = NSMakeRange(*pos, l);
+    *pos += l;
+    return YES;
+}
 
-        // Remove existing destination file if present
-        [[NSFileManager defaultManager] removeItemAtPath:dst error:nil];
-
-        // Read the compressed data
-        NSData *compressed = [NSData dataWithContentsOfFile:src];
-        if (!compressed) {
-            reject(@"ERR_GZIP_DECOMPRESS", @"Failed to read source file", nil);
-            return;
-        }
-
-        // Decompress using zlib (Compression framework handles gzip automatically)
-        // COMPRESSION_ZLIB wrapper detects gzip format from the header
-        NSData *decompressed = [self decompressGzipData:compressed];
-        if (!decompressed) {
-            reject(@"ERR_GZIP_DECOMPRESS", @"Failed to decompress gzip data", nil);
-            return;
-        }
-
-        NSError *error = nil;
-        BOOL success = [decompressed writeToFile:dst options:NSDataWritingAtomic error:&error];
-        if (success) {
-            resolve(@(YES));
-        } else {
-            reject(@"ERR_GZIP_DECOMPRESS", error.localizedDescription, error);
-        }
-    });
+// SubjectPublicKeyInfo (PEM "PUBLIC KEY") → raw key bytes SecKeyCreateWithData accepts
+// (PKCS#1 for RSA, X9.63 point for EC). Returns nil if not a valid SPKI.
+static NSData *RNBsPatchKeyFromSPKI(NSData *spki, BOOL *isRSA)
+{
+    static const uint8_t rsaOID[] = {0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01};
+    static const uint8_t ecOID[] = {0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01};
+    const uint8_t *b = spki.bytes;
+    NSUInteger len = spki.length, pos = 0, inner;
+    uint8_t tag;
+    NSRange outer, algo, oid, bits;
+    if (!RNBsPatchReadDER(b, len, &pos, &tag, &outer) || tag != 0x30) return nil;
+    pos = outer.location;
+    if (!RNBsPatchReadDER(b, len, &pos, &tag, &algo) || tag != 0x30) return nil;
+    if (!RNBsPatchReadDER(b, len, &pos, &tag, &bits) || tag != 0x03 || bits.length < 2 || b[bits.location] != 0) return nil;
+    inner = algo.location;
+    if (!RNBsPatchReadDER(b, len, &inner, &tag, &oid) || tag != 0x06) return nil;
+    if (oid.length == sizeof(rsaOID) && memcmp(b + oid.location, rsaOID, sizeof(rsaOID)) == 0) {
+        *isRSA = YES;
+    } else if (oid.length == sizeof(ecOID) && memcmp(b + oid.location, ecOID, sizeof(ecOID)) == 0) {
+        *isRSA = NO;
+    } else {
+        return nil;
+    }
+    return [spki subdataWithRange:NSMakeRange(bits.location + 1, bits.length - 1)];
 }
 
 RCT_EXPORT_METHOD(verifySignature:(NSString *)filePath
@@ -204,80 +195,31 @@ RCT_EXPORT_METHOD(verifySignature:(NSString *)filePath
         CC_SHA256_Final(sha256, &shaCtx);
         NSData *sha256Data = [NSData dataWithBytes:sha256 length:CC_SHA256_DIGEST_LENGTH];
 
-        // 1. Try RSA Public Key
-        NSDictionary *rsaParams = @{
-            (id)kSecAttrKeyType: (id)kSecAttrKeyTypeRSA,
-            (id)kSecAttrKeyClass: (id)kSecAttrKeyClassPublic,
-        };
-        CFErrorRef rsaErr = NULL;
-        SecKeyRef rsaKey = SecKeyCreateWithData((__bridge CFDataRef)keyData, (__bridge CFDictionaryRef)rsaParams, &rsaErr);
-        if (rsaKey) {
-            CFErrorRef verifyErr = NULL;
-            Boolean isValid = SecKeyVerifySignature(
-                rsaKey,
-                kSecKeyAlgorithmRSASignatureDigestPKCS1v15SHA256,
-                (__bridge CFDataRef)sha256Data,
-                (__bridge CFDataRef)expectedSig,
-                &verifyErr
-            );
-            CFRelease(rsaKey);
-            if (!verifyErr) {
-                resolve(@(isValid ? YES : NO));
-                return;
-            }
-        }
-
-        // 2. Try ECDSA Public Key
-        NSDictionary *ecParams = @{
-            (id)kSecAttrKeyType: (id)kSecAttrKeyTypeECSECPrimeRandom,
-            (id)kSecAttrKeyClass: (id)kSecAttrKeyClassPublic,
-        };
-        CFErrorRef ecErr = NULL;
-        SecKeyRef ecKey = SecKeyCreateWithData((__bridge CFDataRef)keyData, (__bridge CFDictionaryRef)ecParams, &ecErr);
-        if (ecKey) {
-            CFErrorRef verifyErr = NULL;
-            Boolean isValid = SecKeyVerifySignature(
-                ecKey,
-                kSecKeyAlgorithmECDSASignatureDigestX962SHA256,
-                (__bridge CFDataRef)sha256Data,
-                (__bridge CFDataRef)expectedSig,
-                &verifyErr
-            );
-            CFRelease(ecKey);
-            if (!verifyErr) {
-                resolve(@(isValid ? YES : NO));
-                return;
-            }
-        }
-
-        // 3. Fallback: HMAC-SHA256
-        NSInputStream *hmacStream = [NSInputStream inputStreamWithFileAtPath:filePath];
-        if (!hmacStream) {
+        BOOL isRSA = NO;
+        NSData *rawKey = RNBsPatchKeyFromSPKI(keyData, &isRSA);
+        if (!rawKey) {
             resolve(@(NO));
             return;
         }
-        [hmacStream open];
-
-        CCHmacContext ctx;
-        CCHmacInit(&ctx, kCCHmacAlgSHA256, keyData.bytes, keyData.length);
-        while ([hmacStream hasBytesAvailable]) {
-            NSInteger bytesRead = [hmacStream read:buffer maxLength:sizeof(buffer)];
-            if (bytesRead > 0) {
-                CCHmacUpdate(&ctx, buffer, (CC_LONG)bytesRead);
-            } else if (bytesRead < 0) {
-                [hmacStream close];
-                resolve(@(NO));
-                return;
-            }
+        NSDictionary *params = @{
+            (id)kSecAttrKeyType: isRSA ? (id)kSecAttrKeyTypeRSA : (id)kSecAttrKeyTypeECSECPrimeRandom,
+            (id)kSecAttrKeyClass: (id)kSecAttrKeyClassPublic,
+        };
+        SecKeyRef key = SecKeyCreateWithData((__bridge CFDataRef)rawKey, (__bridge CFDictionaryRef)params, NULL);
+        if (!key) {
+            resolve(@(NO));
+            return;
         }
-        [hmacStream close];
-
-        unsigned char hmac[CC_SHA256_DIGEST_LENGTH];
-        CCHmacFinal(&ctx, hmac);
-
-        BOOL isValid = (expectedSig.length == CC_SHA256_DIGEST_LENGTH) &&
-                       (memcmp(expectedSig.bytes, hmac, CC_SHA256_DIGEST_LENGTH) == 0);
-        resolve(@(isValid));
+        // Fail closed: any verification error counts as an invalid signature
+        Boolean isValid = SecKeyVerifySignature(
+            key,
+            isRSA ? kSecKeyAlgorithmRSASignatureDigestPKCS1v15SHA256 : kSecKeyAlgorithmECDSASignatureDigestX962SHA256,
+            (__bridge CFDataRef)sha256Data,
+            (__bridge CFDataRef)expectedSig,
+            NULL
+        );
+        CFRelease(key);
+        resolve(@(isValid ? YES : NO));
     });
 }
 
@@ -290,41 +232,6 @@ RCT_EXPORT_METHOD(getAppVersion:(RCTPromiseResolveBlock)resolve
     } else {
         resolve(version);
     }
-}
-
-- (NSData *)decompressGzipData:(NSData *)compressed {
-    // Decompress gzip using zlib directly
-    // gzip adds a 10-byte header + 8-byte footer over the raw zlib stream
-    const size_t chunkSize = 65536;
-    z_stream strm;
-    memset(&strm, 0, sizeof(strm));
-
-    strm.next_in = (Bytef *)compressed.bytes;
-    strm.avail_in = (uInt)compressed.length;
-
-    // 16 + MAX_WBITS = automatic gzip/zlib header detection
-    if (inflateInit2(&strm, 16 + MAX_WBITS) != Z_OK) {
-        return nil;
-    }
-
-    NSMutableData *decompressed = [NSMutableData dataWithCapacity:compressed.length * 4];
-    unsigned char out[chunkSize];
-    int ret;
-
-    do {
-        strm.next_out = out;
-        strm.avail_out = chunkSize;
-        ret = inflate(&strm, Z_FINISH);
-        if (ret != Z_STREAM_END && ret != Z_OK && ret != Z_BUF_ERROR) {
-            inflateEnd(&strm);
-            return nil;
-        }
-        size_t have = chunkSize - strm.avail_out;
-        [decompressed appendBytes:out length:have];
-    } while (ret != Z_STREAM_END);
-
-    inflateEnd(&strm);
-    return [decompressed copy];
 }
 
 // Don't compile this code when we build for the old architecture.

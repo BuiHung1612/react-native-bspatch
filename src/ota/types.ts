@@ -28,15 +28,6 @@ export enum OtaUpdateMode {
     BACKGROUND_DOWNLOAD = 'BACKGROUND_DOWNLOAD',
 }
 
-export enum OtaStorageType {
-    /** Custom storage server (primary) */
-    CUSTOM = 'CUSTOM',
-    /** GitHub Releases — public or token-authenticated */
-    GITHUB = 'GITHUB',
-    /** GitHub Raw repository storage */
-    GITHUB_RAW = 'GITHUB_RAW',
-}
-
 export type OtaPatch = {
     /** Unique ID: `v{from}-to-v{to}` */
     id: string;
@@ -60,10 +51,10 @@ export type OtaPatch = {
     minAppVersion?: string;
     /** URL for full bundle download (fallback when patch fails) */
     fullBundleUrl?: string;
-    /** Whether the patch/bundle is gzip compressed */
-    compressed?: boolean;
-    /** HMAC-SHA256 signature for security verification */
+    /** RSA/ECDSA SHA-256 signature (base64) of the patch file */
     signature?: string;
+    /** RSA/ECDSA SHA-256 signature (base64) of the resulting bundle */
+    bundleSignature?: string;
     /** Whether this update is mandatory */
     mandatory?: boolean;
     /** URL to the asset manifest JSON for this version */
@@ -100,6 +91,10 @@ export type OtaMetadata = {
     previousVersions: number[];
     rollbackCount: number;
     lastLaunchSuccessful: boolean;
+    /** Native app version the OTA bundles were built for; native resolver drops OTA state when it changes */
+    appVersion?: string;
+    /** Versions that crashed on boot and were rolled back; never re-applied */
+    failedVersions?: number[];
 };
 
 export type OtaMetrics = {
@@ -136,59 +131,25 @@ export type OtaConfig = {
 
     /** Telemetry: structured event callback for analytics */
     onEvent?: OtaEventCallback;
-    /** Public key for signature verification (base64) */
+    /**
+     * SPKI public key (PEM or base64) for RSA/ECDSA signature verification.
+     * When set, patches and bundles without a valid signature are rejected.
+     */
     publicKey?: string;
-    /** Base URL for the shared hashed asset store (e.g. a GitHub release URL) */
-    assetBaseUrl?: string;
 
-    /** Storage strategy */
-    storageType?: OtaStorageType;
-
-    /** GitHub Releases configuration (used when storageType === GITHUB) */
-    githubRelease?: {
-        /** Owner / repo in the format "owner/repo" */
-        repo: string;
-        /** Tag name of the release to fetch updates from */
-        tag: string;
-        /**
-         * Path inside the release where ota_registry.json lives.
-         * If your release contains the file at root, set to "ota_registry.json".
-         * If it's inside a folder "ota/", set to "ota/ota_registry.json".
-         */
-        registryPath?: string;
-        /**
-         * Optional GitHub personal access token for private repos or higher rate limits.
-         * For public repos this is optional.
-         */
-        token?: string;
-        /**
-         * Asset base URL for content-addressed assets.
-         * Supports CDN URLs (jsDelivr, GitHub raw) or a custom base.
-         * Example: "https://cdn.jsdelivr.net/gh/owner/repo@tag/assets"
-         */
-        assetBaseUrl?: string;
-    };
-
-    /** Custom storage server configuration */
+    /**
+     * Static storage layout read by the default provider: `${baseUrl}/${baseFolder}/...`.
+     * Any static host/CDN serving the same layout works (e.g. a public bucket).
+     * Read-only and public: never put upload credentials here, they ship inside the app.
+     */
     customServer?: {
+        /** e.g. https://raw.githubusercontent.com/<owner>/<repo>/<branch> */
         baseUrl: string;
-        username: string;
-        password: string;
         channel: string;
         baseFolder?: string;
-        useMinio?: boolean;
-        /** Override default API endpoints for non-standard servers */
-        endpoints?: {
-            /** Auth login endpoint (default: /public/authen/login) */
-            login?: string;
-            /** Generate download link endpoint (default: /api/minio/gen-download-link) */
-            genDownloadLink?: string;
-            /** Direct file download endpoint (default: /files/downloadStreamFile) */
-            downloadFile?: string;
-        };
     };
 
-    /** Storage provider instance (optional, defaults to CustomStorageProvider) */
+    /** Storage provider instance (optional, defaults to GitHubRawStorageProvider) */
     storage?: OtaStorageProvider;
 };
 

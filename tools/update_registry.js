@@ -85,35 +85,30 @@ if (newPatches.length > 0) {
   // We merge patches by platform to avoid overwriting between Android and iOS
   const otherPlatformPatches = flavorGroup.patches.filter(p => p.platform !== platform);
   
-  const mappedNewPatches = newPatches.map(p => {
-    // Naming convention from build_ota.sh
-    const fullBundleName = `bundle_${appVersion}_v${toOtaVersion}_${platform}_${flavor}.hbc`;
-    const manifestName = path.basename(_assetManifestFile);
+  // Patches and bundles live next to the asset manifest (android/output or ios/output)
+  const outputDir = path.dirname(_assetManifestFile);
+  const fullBundleName = `bundle_${appVersion}_v${toOtaVersion}_${platform}_${flavor}.hbc`;
+  const manifestName = path.basename(_assetManifestFile);
 
-    let signature = undefined;
-    if (signingKey) {
-      try {
-        const patchFileCandidates = [
-          path.join(path.dirname(registryPath), p.file),
-          path.join(process.cwd(), p.file),
-        ];
-        let patchData = null;
-        for (const pfc of patchFileCandidates) {
-          if (fs.existsSync(pfc)) {
-            patchData = fs.readFileSync(pfc);
-            break;
-          }
-        }
-        if (patchData) {
-          const signer = crypto.createSign('SHA256');
-          signer.update(patchData);
-          signature = signer.sign(signingKey, 'base64');
-          console.log(`  ✓ Signed patch ${p.file} with asymmetric private key`);
-        }
-      } catch (signErr) {
-        console.warn(`  ⚠ Could not sign patch ${p.file}: ${signErr.message}`);
-      }
+  const sign = (file) => {
+    if (!signingKey) return undefined;
+    const filePath = path.join(outputDir, file);
+    if (!fs.existsSync(filePath)) {
+      console.error(`  ❌ Cannot sign ${file}: not found at ${filePath}`);
+      process.exit(1);
     }
+    const signer = crypto.createSign('SHA256');
+    signer.update(fs.readFileSync(filePath));
+    console.log(`  ✓ Signed ${file}`);
+    return signer.sign(signingKey, 'base64');
+  };
+
+  // Signature of the resulting bundle: verified by the client on BOTH the patch
+  // path and the full-bundle fallback, so a tampered registry can't swap bundles.
+  const bundleSignature = sign(fullBundleName);
+
+  const mappedNewPatches = newPatches.map(p => {
+    const signature = sign(p.file);
 
     const patchObj = {
       id: `v${p.from}-to-v${p.to}-${flavor}-${platform}`,
@@ -132,6 +127,7 @@ if (newPatches.length > 0) {
 
     if (signature) {
       patchObj.signature = signature;
+      patchObj.bundleSignature = bundleSignature;
     }
 
     return patchObj;

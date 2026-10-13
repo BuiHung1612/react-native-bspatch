@@ -102,7 +102,7 @@ export function OtaProvider({
       const directPatch = patchList.find(
         p => p.fromVersion === currentVer &&
              p.toVersion === targetVer &&
-             p.platform === Platform.OS,
+             (!p.platform || p.platform === Platform.OS),
       );
 
       if (!directPatch) {
@@ -170,7 +170,7 @@ export function OtaProvider({
       const directPatch = patchList.find(
         p => p.fromVersion === localV &&
              p.toVersion === targetV &&
-             p.platform === Platform.OS,
+             (!p.platform || p.platform === Platform.OS),
       );
       if (!directPatch) return;
 
@@ -221,17 +221,19 @@ export function OtaProvider({
     setStatus(OtaStatus.CHECKING);
     setMessage('Checking for updates...');
 
-    const effectiveConfig = await getEffectiveConfig();
-    const log = createOtaLogger(effectiveConfig.onEvent);
-    log.emit(OtaEvent.CHECK_UPDATE);
-
     try {
+      const effectiveConfig = await getEffectiveConfig();
+      createOtaLogger(effectiveConfig.onEvent).emit(OtaEvent.CHECK_UPDATE);
       const remotePatches = await fetchOtaManifest(effectiveConfig);
       const metadata = await loadMetadata(config.baseAppVersion);
       const localV = metadata.currentVersion;
       console.log('[OtaProvider] checkUpdates | localV:', localV, 'remotePatches count:', remotePatches.length);
 
-      const platformPatches = remotePatches.filter(p => p.platform === Platform.OS);
+      // Skip versions that crashed on boot and were rolled back by the native resolver
+      const failed = metadata.failedVersions ?? [];
+      const platformPatches = remotePatches.filter(
+        p => (!p.platform || p.platform === Platform.OS) && !failed.includes(p.toVersion),
+      );
       console.log('[OtaProvider] platformPatches count:', platformPatches.length);
 
       const maxV =
@@ -310,20 +312,6 @@ export function OtaProvider({
       // We just mark bootstrap as done
       bootstrapDone.current = true;
 
-      // Always mark as healthy after a successful JS bootstrap.
-      //
-      // The native OtaBundleResolver uses its own baseVersion (DEFAULT_BASE_VERSION=1),
-      // independent of the JS-side config.baseAppVersion. It marks
-      // lastLaunchSuccessful=false before loading ANY OTA bundle (even when
-      // JS baseAppVersion has been bumped to match currentVersion). If we only
-      // call markAsHealthy when currentVersion > JS baseAppVersion, we miss this
-      // case and the native layer will rollback on the very next cold boot.
-      //
-      // markAsHealthy() is safe to call unconditionally — it's a no-op when
-      // the metadata already has lastLaunchSuccessful=true.
-      console.log(`[OtaProvider] Marking V${metadata.currentVersion} as healthy`);
-      await markAsHealthy();
-
       // Mode-based auto-check
       const mode = config.updateMode ?? OtaUpdateMode.MANUAL;
       if (
@@ -355,7 +343,8 @@ export function OtaProvider({
         // When going into background: if update is downloaded and ready, reload bundle silently
         if (
           appState.current === 'active' &&
-          nextAppState.match(/inactive|background/) &&
+          // Not 'inactive': iOS fires it for Control Center, calls, Face ID prompts
+          nextAppState === 'background' &&
           pendingReloadRef.current
         ) {
           pendingReloadRef.current = false;
@@ -384,7 +373,8 @@ export function OtaProvider({
   const markAsHealthy = async () => {
     const log = createOtaLogger(config.onEvent);
     log.emit(OtaEvent.MARK_HEALTHY);
-    await markHealthy(config.baseAppVersion);
+    const { appVersion } = await getEffectiveConfig().catch(() => config);
+    await markHealthy(config.baseAppVersion, appVersion);
     NativeBsPatch.markAsHealthy();
   };
 
@@ -439,6 +429,17 @@ export function OtaProvider({
             status === OtaStatus.UPDATE_AVAILABLE)))
     );
   }, [useLoadingView, isInitialized, config.updateMode, status]);
+
+  // Mark healthy only after the app's own tree has committed its first render.
+  // This effect runs after all child effects, so a bundle that throws while
+  // rendering never gets here and the native resolver rolls it back next boot.
+  const healthyMarkedRef = useRef(false);
+  useEffect(() => {
+    if (isBlocking || !isInitialized || healthyMarkedRef.current) return;
+    healthyMarkedRef.current = true;
+    markAsHealthy().catch(e => console.warn('[OtaProvider] markAsHealthy failed:', e));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isBlocking, isInitialized]);
 
   return (
     <OtaContext.Provider value={value}>

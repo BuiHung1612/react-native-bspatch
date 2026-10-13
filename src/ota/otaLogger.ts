@@ -24,8 +24,6 @@ export enum OtaEvent {
   RESET_FACTORY = 'reset_factory',
   VERSION_INCOMPATIBLE = 'version_incompatible',
   SIGNATURE_INVALID = 'signature_invalid',
-  DECOMPRESS_START = 'decompress_start',
-  DECOMPRESS_SUCCESS = 'decompress_success',
 }
 
 export type OtaLogEntry = {

@@ -62,6 +62,17 @@ public class OtaBundleResolver: NSObject {
                 return nil
             }
 
+            // ── Step 0: Store update → OTA bundles were built for another native version ──
+            let otaAppVersion = metadata["appVersion"] as? String ?? ""
+            let installedAppVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
+            if !otaAppVersion.isEmpty && otaAppVersion != installedAppVersion {
+                NSLog("[OtaBundleResolver] Native app \(otaAppVersion) → \(installedAppVersion): discarding OTA state")
+                // JS bootstrap deletes ota_trash_* in the background
+                let trash = documentsDir.appendingPathComponent("ota_trash_\(Int(Date().timeIntervalSince1970 * 1000))")
+                try? FileManager.default.moveItem(at: otaDir, to: trash)
+                return nil
+            }
+
             let currentVersion = metadata["currentVersion"] as? Int ?? baseVersion
             let lastLaunchOk = metadata["lastLaunchSuccessful"] as? Bool ?? true
             let rollbackCount = metadata["rollbackCount"] as? Int ?? 0
@@ -70,7 +81,11 @@ public class OtaBundleResolver: NSObject {
             if !lastLaunchOk && currentVersion > baseVersion {
                 NSLog("[OtaBundleResolver] Previous launch failed! Rolling back from V\(currentVersion)...")
                 
+                // Remember the crashing version so JS never re-applies it
+                let failed = (metadata["failedVersions"] as? [Int] ?? []) + [currentVersion]
                 metadata = performRollback(metadata: metadata, baseVersion: baseVersion, currentRollbackCount: rollbackCount, otaDir: otaDir)
+                metadata["failedVersions"] = failed
+                metadata["appVersion"] = otaAppVersion
                 writeMetadata(url: metadataURL, metadata: metadata)
 
                 let newVersion = metadata["currentVersion"] as? Int ?? baseVersion
@@ -233,7 +248,7 @@ public class OtaBundleResolver: NSObject {
     private static func writeMetadata(url: URL, metadata: [String: Any]) {
         do {
             let data = try JSONSerialization.data(withJSONObject: metadata, options: .prettyPrinted)
-            try data.write(to: url)
+            try data.write(to: url, options: .atomic)
         } catch {
             NSLog("[OtaBundleResolver] Failed to write metadata: \(error.localizedDescription)")
         }

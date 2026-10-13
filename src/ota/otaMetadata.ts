@@ -4,6 +4,7 @@ import { OtaMetadata } from './types';
 
 const OTA_DIR = `${ReactNativeBlobUtil.fs.dirs.DocumentDir}/ota`;
 const METADATA_PATH = `${OTA_DIR}/metadata.json`;
+const METADATA_TMP_PATH = `${METADATA_PATH}.tmp`;
 
 /** Promise-based lock to prevent concurrent metadata writes (double-tap guard). */
 let saveLock: Promise<void> = Promise.resolve();
@@ -27,12 +28,11 @@ export const loadMetadata = async (
     defaultVersion: number,
 ): Promise<OtaMetadata> => {
     try {
-        if (await ReactNativeBlobUtil.fs.exists(METADATA_PATH)) {
-            const content = await ReactNativeBlobUtil.fs.readFile(
-                METADATA_PATH,
-                'utf8',
-            );
-            return JSON.parse(content);
+        // A crash between unlink and rename in saveMetadata leaves only the .tmp copy
+        for (const path of [METADATA_PATH, METADATA_TMP_PATH]) {
+            if (await ReactNativeBlobUtil.fs.exists(path)) {
+                return JSON.parse(await ReactNativeBlobUtil.fs.readFile(path, 'utf8'));
+            }
         }
     } catch (e) {
         console.warn('[otaMetadata] Failed to load metadata:', e);
@@ -60,11 +60,16 @@ export const saveMetadata = async (metadata: OtaMetadata): Promise<void> => {
     try {
         await prevLock;
         await ensureOtaDir();
+        // Write-then-rename so a kill mid-write never leaves truncated JSON
         await ReactNativeBlobUtil.fs.writeFile(
-            METADATA_PATH,
+            METADATA_TMP_PATH,
             JSON.stringify(metadata, null, 2),
             'utf8',
         );
+        if (await ReactNativeBlobUtil.fs.exists(METADATA_PATH)) {
+            await ReactNativeBlobUtil.fs.unlink(METADATA_PATH);
+        }
+        await ReactNativeBlobUtil.fs.mv(METADATA_TMP_PATH, METADATA_PATH);
     } catch (e) {
         console.error('[otaMetadata] Failed to save metadata:', e);
         throw new Error(`Failed to save metadata: ${(e as Error).message}`);
@@ -87,6 +92,7 @@ export const MAX_VERSION_HISTORY = 3;
 export const registerNewVersion = (
     metadata: OtaMetadata,
     newVersion: number,
+    appVersion?: string,
 ): OtaMetadata => {
     const versions = [
         metadata.currentVersion,
@@ -99,6 +105,7 @@ export const registerNewVersion = (
 
     return {
         ...metadata,
+        appVersion: appVersion ?? metadata.appVersion,
         currentVersion: newVersion,
         previousVersions: uniquePrevious,
         rollbackCount: 0,
@@ -138,7 +145,7 @@ export const cleanupOldVersions = async (
                 }
             }
             // Clean up leftover temporary bundle files (.tmp)
-            if (item.endsWith('.tmp')) {
+            if (item.endsWith('.tmp') && item !== 'metadata.json.tmp') {
                 await ReactNativeBlobUtil.fs.unlink(`${OTA_DIR}/${item}`).catch(() => {});
             }
         }
@@ -157,10 +164,13 @@ export const cleanupOldVersions = async (
  */
 export const markHealthy = async (
     defaultVersion: number,
+    appVersion?: string,
 ): Promise<OtaMetadata> => {
     const metadata = await loadMetadata(defaultVersion);
     const updated: OtaMetadata = {
         ...metadata,
+        // Stamp legacy metadata so the native resolver can detect a store update later
+        appVersion: metadata.appVersion ?? appVersion,
         lastLaunchSuccessful: true,
         rollbackCount: 0,
     };

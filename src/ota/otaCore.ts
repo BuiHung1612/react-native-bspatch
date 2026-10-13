@@ -4,8 +4,7 @@
  * Responsibilities:
  *  - Download patches with retry
  *  - Verify integrity (SHA-256 hash)
- *  - Verify security (HMAC signature)
- *  - Handle gzip decompression
+ *  - Verify security (RSA/ECDSA signature)
  *  - Apply binary patch (bsdiff)
  *  - Atomic bundle swap
  *  - Full bundle fallback on failure
@@ -14,7 +13,6 @@
 
 import { Platform } from 'react-native';
 import ReactNativeBlobUtil from 'react-native-blob-util';
-import CryptoJS from 'crypto-js';
 import NativeBsPatch from '../NativeBsPatch';
 import { createOtaLogger, OtaEvent } from './otaLogger';
 import {
@@ -24,12 +22,9 @@ import {
     registerNewVersion,
     saveMetadata,
 } from './otaMetadata';
-import { CustomStorageProvider } from './storage/CustomStorage';
-import { GitHubReleaseStorageProvider } from './storage/GitHubReleaseStorage';
 import { GitHubRawStorageProvider } from './storage/GitHubRawStorage';
 import {
     OtaStatus,
-    OtaStorageType,
     type OtaAsset,
     type OtaConfig,
     type OtaMetrics,
@@ -41,20 +36,11 @@ const OTA_DIR = `${ReactNativeBlobUtil.fs.dirs.DocumentDir}/ota`;
 
 // ─── Storage Provider Factory ──────────────────────────────────────────
 
-const DEFAULT_STORAGE = new CustomStorageProvider();
-const GITHUB_STORAGE = new GitHubReleaseStorageProvider();
-const GITHUB_RAW_STORAGE = new GitHubRawStorageProvider();
+const DEFAULT_STORAGE = new GitHubRawStorageProvider();
 
-/**
- * Get the storage provider for the given configuration.
- * Priority: explicit storage instance > storageType > default (CustomStorage)
- */
-const getStorage = (config: OtaConfig): OtaStorageProvider => {
-    if (config.storage) return config.storage;
-    if (config.storageType === OtaStorageType.GITHUB) return GITHUB_STORAGE;
-    if (config.storageType === OtaStorageType.GITHUB_RAW) return GITHUB_RAW_STORAGE;
-    return DEFAULT_STORAGE;
-};
+/** Explicit `config.storage` (e.g. a future Cloudflare provider) or GitHub raw. */
+const getStorage = (config: OtaConfig): OtaStorageProvider =>
+    config.storage ?? DEFAULT_STORAGE;
 
 // ─── Helpers ──────────────────────────────────────────────────────────
 
@@ -103,93 +89,22 @@ export const verifyHash = async (
 };
 
 /**
- * Verify HMAC-SHA256 signature of a file.
- *
- * Uses CryptoJS to verify that the signature matches the file content
- * using the provided HMAC key.
- *
- * @param filePath - Path to the file to verify
- * @param signature - Base64-encoded HMAC signature to verify against
- * @param publicKey - Base64-encoded HMAC key
- * @returns true if signature is valid, false otherwise
- *
- * @example
- * // Server-side (Node.js) - generate signature:
- * const crypto = require('crypto');
- * const key = crypto.randomBytes(32).toString('base64');
- * const fileBuffer = fs.readFileSync('bundle.patch');
- * const signature = crypto.createHmac('sha256', Buffer.from(key, 'base64'))
- *     .update(fileBuffer)
- *     .digest('base64');
+ * When `config.publicKey` is set, an RSA/ECDSA SHA-256 signature is mandatory
+ * and must verify (fail closed). Without a public key, signing is not enforced.
  */
-export const verifySignature = async (
+const assertSigned = async (
     filePath: string,
-    signature?: string,
-    publicKey?: string,
-): Promise<boolean> => {
-    if (!signature || !publicKey) return true; // Skip if not configured
-    try {
-        // Fast-path: use Native streaming HMAC-SHA256 (avoids Base64 conversion and JS thread blocking)
-        if (typeof NativeBsPatch.verifySignature === 'function') {
-            const isValid = await NativeBsPatch.verifySignature(filePath, signature, publicKey);
-            if (!isValid && __DEV__) {
-                console.warn('[otaCore] Signature mismatch');
-            }
-            return isValid;
-        }
-
-        // Fallback to JS CryptoJS if native module is running an older binary
-        const fileData = await ReactNativeBlobUtil.fs.readFile(filePath, 'base64');
-        const fileWords = CryptoJS.enc.Base64.parse(fileData);
-        const keyWords = CryptoJS.enc.Base64.parse(publicKey);
-        const signatureWords = CryptoJS.enc.Base64.parse(signature);
-        const hmac = CryptoJS.HmacSHA256(fileWords, keyWords);
-        const isValid = hmac.toString(CryptoJS.enc.Base64) === signatureWords.toString(CryptoJS.enc.Base64);
-
-        if (!isValid && __DEV__) {
-            console.warn('[otaCore] Signature mismatch');
-        }
-
-        return isValid;
-    } catch (error) {
-        if (__DEV__) {
-            console.error('[otaCore] Signature verification failed:', error);
-        }
-        return false;
+    signature: string | undefined,
+    config: OtaConfig,
+    what: string,
+): Promise<void> => {
+    if (!config.publicKey) return;
+    const valid =
+        !!signature &&
+        (await NativeBsPatch.verifySignature(filePath, signature, config.publicKey).catch(() => false));
+    if (!valid) {
+        throw new Error(`${what} signature missing or invalid`);
     }
-};
-
-/**
- * Decompress a .gz file in-place using native helpers.
- * Falls back to skipping decompression if no native helper is available,
- * but enforces that the patch file must NOT be gzip-compressed in that case.
- */
-const decompressGzip = async (filePath: string): Promise<string> => {
-    if (!filePath.endsWith('.gz')) {
-        return filePath;
-    }
-
-    const decompressedPath = filePath.replace(/\.gz$/, '');
-    try {
-        const success = await NativeBsPatch.decompressGzip(
-            filePath,
-            decompressedPath,
-        );
-        if (success) {
-            return decompressedPath;
-        }
-    } catch {
-        // Native decompress not available — fall through
-    }
-
-    // No native gzip support: abort if file is actually compressed.
-    // Do NOT silently rename a .gz file to .patch — bspatch will read gzip
-    // magic bytes and fail with a confusing error.
-    console.error(
-        '[otaCore] .gz decompression is not supported on this platform. ' +
-            'Ensure the OTA server sends uncompressed patches (compressed: false).',
-    );
-    throw new Error('Gzip decompression is not supported on this platform.');
 };
 
 /**
@@ -208,10 +123,13 @@ const downloadWithRetry = async (
 
     for (let i = 0; i < retryLimit; i++) {
         let taskRef: { cancel: () => void } | null = null;
+        // Download to .part and rename only on a 2xx response, so a cut-off
+        // download or an error page never sits at destPath looking complete.
+        const partPath = `${destPath}.part`;
         try {
             const task = ReactNativeBlobUtil.config({
                 fileCache: true,
-                path: destPath,
+                path: partPath,
                 followRedirect: true,
                 timeout,
             })
@@ -226,11 +144,20 @@ const downloadWithRetry = async (
                     onProgress(percent);
                 });
             taskRef = { cancel: () => task.cancel() };
-            await task;
+            const resp = await task;
+            const status = resp.respInfo.status;
+            if (status < 200 || status >= 300) {
+                throw new Error(`HTTP ${status} for ${url}`);
+            }
+            if (await ReactNativeBlobUtil.fs.exists(destPath)) {
+                await ReactNativeBlobUtil.fs.unlink(destPath);
+            }
+            await ReactNativeBlobUtil.fs.mv(partPath, destPath);
             return;
         } catch (e) {
             // Cancel any lingering request before retrying
             taskRef?.cancel();
+            await ReactNativeBlobUtil.fs.unlink(partPath).catch(() => {});
             if (i === retryLimit - 1) throw e;
             const delay = Math.pow(2, i) * 1000; // Exponential backoff: 1s, 2s, 4s...
             if (__DEV__) {
@@ -347,12 +274,16 @@ const downloadAndSyncAssets = async (
 
         const manifest = JSON.parse(manifestData);
         // Filter out base assets, we don't need to download them
-        assets = (manifest.assets || []).filter((a: any) => !a.isBase);
+        // Hash/ext become file names: reject anything that isn't a plain sha256 + extension
+        assets = (manifest.assets || []).filter(
+            (a: any) =>
+                !a.isBase &&
+                /^[a-f0-9]{64}$/i.test(a.hash) &&
+                /^[a-z0-9]+$/i.test(a.ext),
+        );
     } catch (e) {
-        if (__DEV__) {
-            console.warn('[otaCore] Failed to fetch asset manifest:', e);
-        }
-        return;
+        // Fatal: activating the bundle without its manifest leaves images unresolved
+        throw new Error(`Failed to fetch asset manifest: ${(e as Error).message}`);
     }
 
     if (assets.length === 0) {
@@ -368,6 +299,7 @@ const downloadAndSyncAssets = async (
     let processed = 0;
     let downloaded = 0;
     let cached = 0;
+    let failed = 0;
 
     const updateProgress = () => {
         processed++;
@@ -413,12 +345,11 @@ const downloadAndSyncAssets = async (
                     );
                 }
             } else {
-                await ReactNativeBlobUtil.config({
-                    fileCache: true,
-                    path: localPath,
-                    followRedirect: true,
-                    timeout: config.network?.timeoutMs ?? 30000,
-                }).fetch('GET', assetUrl);
+                await downloadWithRetry(assetUrl, localPath, config, () => {});
+                if (!(await verifyHash(localPath, asset.hash))) {
+                    await ReactNativeBlobUtil.fs.unlink(localPath).catch(() => {});
+                    throw new Error('hash mismatch');
+                }
                 downloaded++;
                 log.emit(OtaEvent.DOWNLOAD_SUCCESS, {
                     message: `Asset downloaded: ${filename}`,
@@ -431,7 +362,7 @@ const downloadAndSyncAssets = async (
                     e,
                 );
             }
-            // Non-fatal: continue with other assets
+            failed++; // keep going, fail the sync at the end
         } finally {
             updateProgress();
             await downloadNext(); // Start next download
@@ -444,6 +375,10 @@ const downloadAndSyncAssets = async (
         .fill(null)
         .map(() => downloadNext());
     await Promise.all(workers);
+
+    if (failed > 0) {
+        throw new Error(`${failed} asset(s) failed to download`);
+    }
 
     onStatus(
         OtaStatus.SYNCING_ASSETS,
@@ -479,7 +414,7 @@ export const getLocalAssetPath = (hash: string, ext: string): string =>
  * @returns Absolute path to the patch file
  */
 export const getLocalPatchPath = (patch: OtaPatch, docDir: string): string =>
-    `${docDir}/ota/patch-${patch.id}.patch`;
+    `${docDir}/ota/patch-${patch.appVersion}-${patch.id}.patch`;
 
 // ─── Main Update Pipeline ─────────────────────────────────────────────
 
@@ -489,7 +424,6 @@ export const getLocalPatchPath = (patch: OtaPatch, docDir: string): string =>
  * Pipeline:
  *  1. Version compatibility check
  *  2. Download patch (with retry)
- *  3. Decompress (if .gz)
  *  4. Security signature check
  *  5. Resolve source bundle
  *  6. Verify source hash
@@ -501,7 +435,22 @@ export const getLocalPatchPath = (patch: OtaPatch, docDir: string): string =>
  *
  * On failure → fallback to full bundle download if URL available.
  */
-export const applyOtaPatchInternal = async (
+let updateInFlight = false;
+
+/** Runs the pipeline below; rejects if another update is already running. */
+export const applyOtaPatchInternal: typeof runUpdatePipeline = async (...args) => {
+    if (updateInFlight) {
+        throw new Error('Another OTA update is already in progress');
+    }
+    updateInFlight = true;
+    try {
+        return await runUpdatePipeline(...args);
+    } finally {
+        updateInFlight = false;
+    }
+};
+
+const runUpdatePipeline = async (
     patch: OtaPatch,
     config: OtaConfig,
     onStatus: (
@@ -531,6 +480,23 @@ export const applyOtaPatchInternal = async (
         patch,
         ReactNativeBlobUtil.fs.dirs.DocumentDir,
     );
+
+    // Cached per asset hash, so calling it again in the fallback is cheap
+    const syncAssets = async () => {
+        if (!patch.assetManifestUrl) return;
+        const manifestUrl = await getStorage(config).getUpdateFileUrl(
+            patch.assetManifestUrl,
+            config,
+        );
+        await downloadAndSyncAssets(
+            manifestUrl,
+            patch.toVersion,
+            config,
+            log,
+            onStatus,
+            onProgress,
+        );
+    };
 
     try {
         // ── Step 1: Version Compatibility ──
@@ -607,49 +573,20 @@ export const applyOtaPatchInternal = async (
             }
         }
 
-        // ── Step 3: Decompress if needed ──
-        let actualPatchPath = localPatchPath;
-        if (patch.compressed) {
-            log.emit(OtaEvent.DECOMPRESS_START);
-            onStatus(OtaStatus.APPLYING, 'Decompressing...');
-            actualPatchPath = await decompressGzip(localPatchPath);
-            log.emit(OtaEvent.DECOMPRESS_SUCCESS);
-        }
-
         // ── Step 4: Signature Verification ──
-        if (patch.signature && config.publicKey) {
+        // Verify before feeding the patch to native bspatch
+        if (config.publicKey) {
             onStatus(OtaStatus.APPLYING, 'Verifying signature...');
-            const sigValid = await verifySignature(
-                actualPatchPath,
-                patch.signature,
-                config.publicKey,
-            );
-            if (!sigValid) {
-                log.emit(OtaEvent.SIGNATURE_INVALID, {
-                    version: patch.toVersion,
-                });
-                throw new Error(
-                    'Patch signature verification failed. Possible MITM.',
-                );
+            try {
+                await assertSigned(localPatchPath, patch.signature, config, 'Patch');
+            } catch (sigError) {
+                log.emit(OtaEvent.SIGNATURE_INVALID, { version: patch.toVersion });
+                throw sigError;
             }
         }
 
         // ── Step 4.2: Download & Sync Assets ──
-        if (patch.assetManifestUrl) {
-            const storage = getStorage(config);
-            const manifestUrl = await storage.getUpdateFileUrl(
-                patch.assetManifestUrl,
-                config,
-            );
-            await downloadAndSyncAssets(
-                manifestUrl,
-                patch.toVersion,
-                config,
-                log,
-                onStatus,
-                onProgress,
-            );
-        }
+        await syncAssets();
 
         // ── Step 5: Resolve Source Bundle ──
         onStatus(OtaStatus.APPLYING, 'Preparing source...');
@@ -692,22 +629,13 @@ export const applyOtaPatchInternal = async (
                 // True base: extract byte-for-byte from APK assets.
                 // RNFS.copyFileAssets is known to produce inconsistent bytes in some
                 // APK configurations (e.g., release signing + resource shrinking).
+                // Re-extract every time: a cached copy can be partial or left over
+                // from the previous store build. It's one local copy per update.
                 actualOldPath = `${OTA_DIR}/base.hbc`;
-                if (!(await ReactNativeBlobUtil.fs.exists(actualOldPath))) {
-                    if (__DEV__) {
-                        console.log(
-                            `[otaCore] Source: extracting bundle from APK assets → ${actualOldPath}`,
-                        );
-                    }
-                    await NativeBsPatch.extractBundleFromAssets(
-                        bundleFilename,
-                        actualOldPath,
-                    );
-                } else if (__DEV__) {
-                    console.log(
-                        `[otaCore] Source: cached APK-extracted bundle → ${actualOldPath}`,
-                    );
-                }
+                await NativeBsPatch.extractBundleFromAssets(
+                    bundleFilename,
+                    actualOldPath,
+                );
             }
         } else {
             actualOldPath = oldBundlePath;
@@ -717,14 +645,14 @@ export const applyOtaPatchInternal = async (
         try {
             const oldStat = await ReactNativeBlobUtil.fs.stat(actualOldPath);
             const patchStat = await ReactNativeBlobUtil.fs.stat(
-                actualPatchPath,
+                localPatchPath,
             );
             if (__DEV__) {
                 console.log(
                     `[otaCore] DEBUG old bundle size=${oldStat.size} path=${actualOldPath}`,
                 );
                 console.log(
-                    `[otaCore] DEBUG patch size=${patchStat.size} path=${actualPatchPath}`,
+                    `[otaCore] DEBUG patch size=${patchStat.size} path=${localPatchPath}`,
                 );
                 console.log(
                     `[otaCore] DEBUG baseHash expected=${patch.baseHash}`,
@@ -797,7 +725,7 @@ export const applyOtaPatchInternal = async (
         const success = await NativeBsPatch.applyPatch(
             actualOldPath,
             tempBundle,
-            actualPatchPath,
+            localPatchPath,
         );
         const applyMs = Date.now() - applyStart;
 
@@ -839,14 +767,18 @@ export const applyOtaPatchInternal = async (
             });
         }
 
+        await assertSigned(tempBundle, patch.bundleSignature, config, 'Bundle');
+
         // ── Step 9: Atomic Commit ──
         if (await ReactNativeBlobUtil.fs.exists(finalBundlePath)) {
             await ReactNativeBlobUtil.fs.unlink(finalBundlePath);
         }
         await ReactNativeBlobUtil.fs.mv(tempBundle, finalBundlePath);
 
+        await ReactNativeBlobUtil.fs.unlink(localPatchPath).catch(() => {});
+
         // ── Step 10: Update Metadata ──
-        const newMetadata = registerNewVersion(metadata, patch.toVersion);
+        const newMetadata = registerNewVersion(metadata, patch.toVersion, config.appVersion);
         await saveMetadata(newMetadata);
 
         const totalMs = Date.now() - totalStart;
@@ -886,6 +818,8 @@ export const applyOtaPatchInternal = async (
         if (__DEV__) {
             console.error('[otaCore] Pipeline failed:', error);
         }
+        await ReactNativeBlobUtil.fs.unlink(localPatchPath).catch(() => {});
+        await ReactNativeBlobUtil.fs.unlink(tempBundle).catch(() => {});
 
         // ── Fallback: Full Bundle Download ──
         if (patch.fullBundleUrl) {
@@ -900,6 +834,10 @@ export const applyOtaPatchInternal = async (
                     config,
                 );
 
+                const versionDir = `${OTA_DIR}/v${patch.toVersion}`;
+                if (!(await ReactNativeBlobUtil.fs.exists(versionDir))) {
+                    await ReactNativeBlobUtil.fs.mkdir(versionDir);
+                }
                 await downloadWithRetry(
                     url,
                     tempBundle,
@@ -951,6 +889,9 @@ export const applyOtaPatchInternal = async (
                     }
                 }
 
+                await assertSigned(tempBundle, patch.bundleSignature, config, 'Full bundle');
+                await syncAssets();
+
                 // Atomic swap
                 if (await ReactNativeBlobUtil.fs.exists(finalBundlePath)) {
                     await ReactNativeBlobUtil.fs.unlink(finalBundlePath);
@@ -961,6 +902,7 @@ export const applyOtaPatchInternal = async (
                 const newMetadata = registerNewVersion(
                     metadata,
                     patch.toVersion,
+                    config.appVersion,
                 );
                 await saveMetadata(newMetadata);
 

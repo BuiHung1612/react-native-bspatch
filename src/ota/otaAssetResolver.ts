@@ -150,8 +150,11 @@ const patchAssetResolver = (): void => {
                         log(`REDIRECTED (BASE): ${uri} -> (MainBundle: ${finalUri})`);
                         return { ...res, uri: finalUri };
                     } else {
-                        // Android: let the default responder load it from apk assets (res.uri is correct)
-                        return res;
+                        // Android: with a file-based bundle RN points at ota/vN/drawable-*/x.png,
+                        // which doesn't exist. Base assets live in the APK as drawable/raw
+                        // resources, addressed by name (originalPath: "drawable-mdpi/name.png").
+                        const resName = found.originalPath.split('/').pop()!.replace(/\.[^.]+$/, '');
+                        return { ...res, uri: resName };
                     }
                 }
 

@@ -30,10 +30,7 @@ fi
 
 if [ -n "$ENV_FILE" ]; then
     echo "Loading environment variables from $(basename "$ENV_FILE")..."
-    export $(grep -v '^#' "$ENV_FILE" | grep -v '^$' | xargs)
-    # Debug: verify loaded variables
-    echo "  Loaded OTA_UPLOAD_USER=${OTA_UPLOAD_USER:+[SET]}"
-    echo "  Loaded OTA_UPLOAD_PASSWORD=${OTA_UPLOAD_PASSWORD:+[SET]}"
+    set -a; . "$ENV_FILE"; set +a
 else
     echo "  No .env file found in $ROOT or $MODULE_DIR"
 fi
@@ -75,7 +72,7 @@ while [[ "$#" -gt 0 ]]; do
       elif [[ "$1" == *.ipa ]]; then
         SEED_IPA="$1"
         ACTION="seed"
-      elif [[ "$1" == *.hbc ]] || [[ "$1" == *.bundle ]]; then
+      elif [[ "$1" == *.hbc ]] || [[ "$1" == *.bundle ]] || [[ "$1" == *.jsbundle ]]; then
         SEED_BUNDLE="$1"
         ACTION="seed"
       fi
@@ -107,156 +104,65 @@ mkdir -p "$ROOT/ios/output"
 REGISTRY_SHARED="$ROOT/ota_registry.json"
 
 # ── Registry Sync ──────────────────────────────────────────────────────────
-# Skip registry sync for reset/clean actions
-if [ "$ACTION" != "reset" ]; then
+# Reset syncs too: it edits the latest remote registry instead of overwriting it with a stale local copy
+if [ "$ACTION" != "setup" ]; then
     echo "Syncing remote registry..."
 
-    BASE_URL="${OTA_BASE_URL:-https://sync-server.osp.com.vn}"
-    UPCODE_USER="${OTA_UPLOAD_USER:-}"
-    UPCODE_PASS="${OTA_UPLOAD_PASSWORD:-}"
+    BASE_URL="${OTA_BASE_URL:-}"
     BASE_FOLDER="${OTA_FOLDER:-ota}"
 
     echo "  Using URL: $BASE_URL"
     echo "  Using Folder: $BASE_FOLDER"
 
-    if [[ "$BASE_URL" == *"github"* ]] || [[ "$BASE_URL" == *"raw.githubusercontent"* ]]; then
-        echo "  Downloading remote registry from GitHub..."
+    # GitHub is the only storage backend for now
+    if [[ "$BASE_URL" != "https://raw.githubusercontent.com/"* ]]; then
+        echo "  ❌ OTA_BASE_URL must be https://raw.githubusercontent.com/<owner>/<repo>/<branch>"
+        exit 1
+    fi
+    echo "  Downloading remote registry from GitHub..."
 
-        # Parse OWNER/REPO/BRANCH from the raw.githubusercontent URL or github.com URL
-        # e.g. https://raw.githubusercontent.com/owner/repo/branch  OR
-        #      https://github.com/owner/repo/tree/branch
-        CLEAN_URL=$(echo "$BASE_URL" | sed 's#https://raw.githubusercontent.com/##' | sed 's#https://github.com/##' | sed 's#/tree/##')
-        GH_OWNER=$(echo "$CLEAN_URL" | cut -d'/' -f1)
-        GH_REPO=$(echo  "$CLEAN_URL" | cut -d'/' -f2)
-        GH_BRANCH=$(echo "$CLEAN_URL" | cut -d'/' -f3)
-        if [[ -z "$GH_BRANCH" ]]; then GH_BRANCH="main"; fi
+    CLEAN_URL="${BASE_URL#https://raw.githubusercontent.com/}"
+    GH_OWNER=$(echo "$CLEAN_URL" | cut -d'/' -f1)
+    GH_REPO=$(echo  "$CLEAN_URL" | cut -d'/' -f2)
+    GH_BRANCH=$(echo "$CLEAN_URL" | cut -d'/' -f3)
+    if [[ -z "$GH_BRANCH" ]]; then GH_BRANCH="main"; fi
 
-        # Prefer GitHub CLI token for authenticated requests (higher rate limit, no CDN cache)
-        GH_CLI_TOKEN=$(gh auth token 2>/dev/null || true)
-        GH_API_TOKEN="${GH_CLI_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
+    # Contents API (not the raw CDN) always returns the latest commit; the raw
+    # media type has no 1 MB limit and needs no base64 decoding.
+    GH_API_TOKEN="$(gh auth token 2>/dev/null || true)"
+    GH_API_TOKEN="${GH_API_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
+    GH_API_AUTH=()
+    if [[ -n "$GH_API_TOKEN" ]]; then GH_API_AUTH=(-H "Authorization: Bearer $GH_API_TOKEN"); fi
 
-        # Use GitHub Contents API — NOT raw CDN — to bypass the 5-min CDN cache.
-        # The API always returns the latest committed content.
-        REGISTRY_API_URL="https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/contents/${BASE_FOLDER}/ota_registry.json?ref=${GH_BRANCH}"
+    API_HTTP=$(curl -s -o "$REGISTRY_SHARED.tmp" -w "%{http_code}" "${GH_API_AUTH[@]}" \
+        -H "Accept: application/vnd.github.raw" \
+        "https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/contents/${BASE_FOLDER}/ota_registry.json?ref=${GH_BRANCH}" || echo 0)
 
-        API_HTTP_FILE=$(mktemp)
-        API_BODY_FILE=$(mktemp)
-
-        if [[ -n "$GH_API_TOKEN" ]]; then
-            curl -s -o "$API_BODY_FILE" -w "%{http_code}" \
-                -H "Authorization: Bearer $GH_API_TOKEN" \
-                -H "Accept: application/vnd.github.v3+json" \
-                "$REGISTRY_API_URL" > "$API_HTTP_FILE" 2>/dev/null || true
-        else
-            curl -s -o "$API_BODY_FILE" -w "%{http_code}" \
-                -H "Accept: application/vnd.github.v3+json" \
-                "$REGISTRY_API_URL" > "$API_HTTP_FILE" 2>/dev/null || true
-        fi
-
-        API_HTTP=$(cat "$API_HTTP_FILE" 2>/dev/null || echo "0")
-        rm -f "$API_HTTP_FILE"
-
-        if [[ "$API_HTTP" = "200" ]]; then
-            # Decode base64 content returned by the GitHub Contents API in one python3 pass
-            python3 - "$API_BODY_FILE" "$REGISTRY_SHARED.tmp" << 'PYEOF'
-import sys, json, base64
-body_file, out_file = sys.argv[1], sys.argv[2]
-try:
-    with open(body_file, 'r') as f:
-        d = json.load(f)
-    content = d.get('content', '')
-    decoded = base64.b64decode(content.replace('\n', ''))
-    with open(out_file, 'wb') as f:
-        f.write(decoded)
-except Exception as e:
-    sys.exit(1)
-PYEOF
-            rm -f "$API_BODY_FILE"
-
-            if [ -s "$REGISTRY_SHARED.tmp" ]; then
-                mv "$REGISTRY_SHARED.tmp" "$REGISTRY_SHARED"
-                echo "  ✓ Remote registry synced (via GitHub API)"
-            else
-                rm -f "$REGISTRY_SHARED.tmp"
-                echo "  Notice: Remote registry empty or decode failed (starting fresh with local state)."
-            fi
-        else
-            rm -f "$API_BODY_FILE" "$REGISTRY_SHARED.tmp"
-            echo "  Notice: Remote registry not found on GitHub API (HTTP $API_HTTP — starting fresh with local state)."
-        fi
-
+    if [[ "$API_HTTP" == "200" ]] && node -e "JSON.parse(require('fs').readFileSync(process.argv[1],'utf8'))" "$REGISTRY_SHARED.tmp" 2>/dev/null; then
+        mv "$REGISTRY_SHARED.tmp" "$REGISTRY_SHARED"
+        echo "  ✓ Remote registry synced (via GitHub API)"
+    elif [[ "$API_HTTP" == "404" ]]; then
+        rm -f "$REGISTRY_SHARED.tmp"
+        echo "  Notice: No remote registry yet (HTTP 404) — starting fresh with local state."
     else
-        if [[ -n "$UPCODE_USER" ]] && [[ -n "$UPCODE_PASS" ]]; then
-            LOGIN_RES=$(curl -s -X "POST" "$BASE_URL/public/authen/login" \
-                 -H 'Content-Type: application/json; charset=utf-8' \
-                 -w "\n---HTTP_STATUS:%{http_code}" \
-                 -d "{\"username\": \"$UPCODE_USER\", \"password\": \"$UPCODE_PASS\"}")
-            HTTP_STATUS=$(echo "$LOGIN_RES" | grep -o 'HTTP_STATUS:[0-9]*' | cut -d: -f2)
-            LOGIN_BODY=$(echo "$LOGIN_RES" | sed 's/---HTTP_STATUS:.*//')
-
-            TOKEN=$(echo "$LOGIN_BODY" | node -e "
-                try {
-                    const r = JSON.parse(require('fs').readFileSync(0, 'utf8'));
-                    console.log(r.data?.accessTokenInfo?.accessToken || '');
-                } catch(e) { console.log(''); }
-            ")
-
-            if [[ -n "$TOKEN" ]]; then
-                REGISTRY_REMOTE_PATH="$BASE_FOLDER/ota_registry.json"
-                ENCODED_PATH=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$REGISTRY_REMOTE_PATH', safe=''))")
-                GEN_LINK_URL="$BASE_URL/api/minio/gen-download-link?pathFile=$ENCODED_PATH"
-                LINK_RES=$(curl -s -X "GET" "$GEN_LINK_URL" -H "Authorization: Bearer $TOKEN")
-                REGISTRY_URL=$(echo "$LINK_RES" | node -e "
-                    try {
-                        const r = JSON.parse(require('fs').readFileSync(0, 'utf8'));
-                        console.log(r.data || '');
-                    } catch(e) { console.log(''); }
-                ")
-                if [[ -n "$REGISTRY_URL" ]]; then
-                    curl -s -o "$REGISTRY_SHARED" "$REGISTRY_URL"
-                    echo "  ✓ Registry synced"
-                fi
-            else
-                echo "  ⚠ MinIO login skipped. Proceeding with local state."
-            fi
-        else
-            echo "  ⚠ No MinIO credentials. Proceeding with local state."
-        fi
+        # Continuing would later push a stale local registry over the remote one
+        rm -f "$REGISTRY_SHARED.tmp"
+        echo "  ❌ Registry sync failed (HTTP $API_HTTP). Check network / gh auth and retry."
+        exit 1
     fi
 fi
 
-# ── Helper: Download from Server ──────────────────────────────────────────────
-download_from_minio() {
+# ── Helper: Download from remote storage ───────────────────────────────────────
+download_remote() {
   local REMOTE_PATH="$1"
   local DEST="$2"
-  local CB="?cb=$(date +%s)"
-
-  if [[ "$BASE_URL" == *"github"* ]] || [[ "$BASE_URL" == *"raw.githubusercontent"* ]]; then
-      # Use Cache-Control: no-cache + timestamp query to bypass GitHub CDN 5-min cache
-      curl -s -f -H "Cache-Control: no-cache" -o "$DEST" "$BASE_URL/$REMOTE_PATH${CB}" 2>/dev/null || \
-      curl -s -f -H "Cache-Control: no-cache" -o "$DEST" "$BASE_URL/$(basename "$REMOTE_PATH")${CB}" 2>/dev/null
-      return $?
+  # no-cache + timestamp query bypasses the GitHub CDN 5-min cache
+  if curl -s -f -H "Cache-Control: no-cache" -o "$DEST.tmp" "$BASE_URL/$REMOTE_PATH?cb=$(date +%s)"; then
+    mv "$DEST.tmp" "$DEST"
+  else
+    rm -f "$DEST.tmp"
+    return 1
   fi
-
-  if [[ -z "$TOKEN" ]]; then return 1; fi
-  
-  local ENCODED_PATH=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$REMOTE_PATH', safe=''))")
-  local GEN_LINK_URL="$BASE_URL/api/minio/gen-download-link?pathFile=$ENCODED_PATH"
-  local LINK_RES=$(curl -s -X "GET" "$GEN_LINK_URL" -H "Authorization: Bearer $TOKEN")
-  local FILE_URL=$(echo "$LINK_RES" | node -e "
-      try {
-          const r = JSON.parse(require('fs').readFileSync(0, 'utf8'));
-          console.log(r.data || '');
-      } catch(e) { console.log(''); }
-  ")
-  if [[ -n "$FILE_URL" ]]; then
-     # Use -f to return non-zero exit code on HTTP errors (like 404 Not Found)
-     curl -s -f -o "$DEST" "$FILE_URL"
-     if [ $? -eq 0 ]; then
-       return 0
-     fi
-  fi
-  return 1
 }
 
 # ── Helper: compute SHA-256 hash ──────────────────────────────────────────────
@@ -389,17 +295,19 @@ if [ "$ACTION" = "reset" ]; then
     echo '{"apps":{}}' > "$REGISTRY_SHARED"
   fi
 
-  # Delete only output files belonging to this specific flavor
-  find "$ROOT/android/output" -mindepth 1 -name "*_${FLAVOR_LOWER}.*" -not -name 'base-assets_*' -delete 2>/dev/null || true
-  find "$ROOT/android/output" -mindepth 1 -name "*_${FLAVOR_LOWER}_*" -not -name 'base-assets_*' -delete 2>/dev/null || true
-  find "$ROOT/ios/output" -mindepth 1 -name "*_${FLAVOR_LOWER}.*" -not -name 'base-assets_*' -delete 2>/dev/null || true
-  find "$ROOT/ios/output" -mindepth 1 -name "*_${FLAVOR_LOWER}_*" -not -name 'base-assets_*' -delete 2>/dev/null || true
+  # Delete only this app version + flavor. Base bundles (v1 = store binary) are kept:
+  # the next build re-registers them automatically. Delete them by hand to re-seed.
+  for D in "$ROOT/android/output" "$ROOT/ios/output"; do
+    find "$D" -maxdepth 1 -type f -name "*_${APP_VERSION}_*" -name "*_${FLAVOR_LOWER}[._]*" \
+      -not -name "bundle_${APP_VERSION}_v1_*" -delete 2>/dev/null || true
+    find "$D" -maxdepth 1 -type f -name "asset-manifest-v*_${FLAVOR_LOWER}.json" -delete 2>/dev/null || true # legacy names
+  done
 
-  echo "  ✓ Registry and output files cleared for flavor '$FLAVOR_LOWER' (base-assets preserved)"
+  echo "  ✓ Registry and output cleared for $APP_VERSION/$FLAVOR_LOWER (base bundle v1 + base-assets kept)"
 
   if [ "$PUSH_REMOTE" = true ]; then
       echo "  Syncing reset state for flavor '$FLAVOR_LOWER' to remote storage..."
-      bash "$SCRIPT_DIR/upload_ota_custom.sh" "$APP_VERSION" "$FLAVOR_LOWER" "0" "" "ios" "--clean-remote"
+      bash "$SCRIPT_DIR/upload_ota.sh" "$APP_VERSION" "$FLAVOR_LOWER" "0" "" "ios" "--clean-remote"
   fi
   exit 0
 fi
@@ -439,15 +347,23 @@ build_platform() {
   local FLAVOR="$2"
   local CURRENT="$3"
   local NEXT="$4"
-  local FLAVOR_CAP=$(echo "$FLAVOR" | perl -ne 'print ucfirst')
   local FLAVOR_LOWER=$(echo "$FLAVOR" | tr '[:upper:]' '[:lower:]')
-  
+  if [ "$FLAVOR_LOWER" = "dev" ]; then FLAVOR_LOWER="development"; fi
+  if [ "$FLAVOR_LOWER" = "prod" ]; then FLAVOR_LOWER="production"; fi
+  local FLAVOR_CAP=$(echo "$FLAVOR_LOWER" | perl -ne 'print ucfirst')
+
   local OUTPUT="$ROOT/android/output"
   if [ "$PLATFORM" == "ios" ]; then OUTPUT="$ROOT/ios/output"; fi
   local REGISTRY="$REGISTRY_SHARED"
 
   echo ""
   echo ">>> Building $PLATFORM | Version: $APP_VERSION | OTA: v$CURRENT → v$NEXT"
+  if [ "$PLATFORM" == "ios" ]; then
+    local IOS_VER=$(grep -ho 'MARKETING_VERSION = [^;]*' "$ROOT"/ios/*.xcodeproj/project.pbxproj 2>/dev/null | head -n 1 | sed 's/.*= //')
+    if [ -n "$IOS_VER" ] && [ "$IOS_VER" != "$APP_VERSION" ]; then
+      echo "  ⚠ iOS MARKETING_VERSION is $IOS_VER but building for $APP_VERSION — iOS clients on $IOS_VER won't see this OTA"
+    fi
+  fi
 
   # ── Bundle ──
   # Workspace for building
@@ -461,7 +377,15 @@ build_platform() {
     cd "$ROOT"
     BUNDLE_SOURCE="$ROOT/android/app/build/generated/assets/react/${FLAVOR_LOWER}Release/index.android.bundle"
   else
-    if [ -f "$BUNDLE_XCODE_IOS" ] && [ "$ACTION" = "base" ] && [ $CURRENT -eq 0 ]; then
+    local XCODE_STALE=""
+    if [ -f "$BUNDLE_XCODE_IOS" ]; then
+      # ponytail: mtime check, any source edit/checkout after the last Xcode build marks it stale
+      XCODE_STALE=$(find "$ROOT/src" "$ROOT/App.tsx" "$ROOT/index.js" "$ROOT/package.json" -type f -newer "$BUNDLE_XCODE_IOS" -print -quit 2>/dev/null)
+      if [ -n "$XCODE_STALE" ] && [ "$ACTION" = "base" ]; then
+        echo "  ⚠ Xcode bundle ($(stat -f '%Sm' "$BUNDLE_XCODE_IOS")) is older than $XCODE_STALE — ignoring it"
+      fi
+    fi
+    if [ -f "$BUNDLE_XCODE_IOS" ] && [ -z "$XCODE_STALE" ] && [ "$ACTION" = "base" ] && [ $CURRENT -eq 0 ]; then
       # Base action: use Xcode-compiled bundle (already Hermes-compiled, matches IPA exactly)
       echo "  Using Xcode bundle as base source..."
       cp "$BUNDLE_XCODE_IOS" "$WORKSPACE/source.bundle"
@@ -492,7 +416,11 @@ build_platform() {
     echo "  Bundle is already in Hermes bytecode format."
   else
     echo "  Compiling to Hermes bytecode..."
-    "$HERMESC_PATH" -emit-binary -out "$WORKSPACE/source.hbc" "$BUNDLE_SOURCE"
+    if [ -z "$HERMESC_PATH" ] || [ ! -f "$HERMESC_PATH" ]; then
+      echo "  ❌ ERROR: hermesc not found"; exit 1
+    fi
+    # -O matches what Xcode/Gradle use for release, keeping patches against the store bundle small
+    "$HERMESC_PATH" -emit-binary -O -out "$WORKSPACE/source.hbc" "$BUNDLE_SOURCE"
     mv "$WORKSPACE/source.hbc" "$BUNDLE_SOURCE"
   fi
 
@@ -517,7 +445,7 @@ build_platform() {
   fi
 
   # ── Assets ──
-  local ASSET_MANIFEST_FILE="$OUTPUT/asset-manifest-v${NEXT}_${FLAVOR_LOWER}.json"
+  local ASSET_MANIFEST_FILE="$OUTPUT/asset-manifest_${APP_VERSION}_v${NEXT}_${PLATFORM}_${FLAVOR_LOWER}.json"
   local BASE_ASSET_MANIFEST="$OUTPUT/base-assets_${PLATFORM}_${FLAVOR_LOWER}.json"
   local ASSET_STORE_DIR="$OUTPUT/asset-store"
   mkdir -p "$ASSET_STORE_DIR"
@@ -525,19 +453,15 @@ build_platform() {
   if [ "$PLATFORM" == "ios" ]; then ASSETS_SRC_DIR="$OUTPUT/assets"; fi
 
   # Load base assets — try server if missing locally (e.g. after ota:clean)
-  if [ ! -f "$BASE_ASSET_MANIFEST" ] && [ -n "$TOKEN" ]; then
+  if [ ! -f "$BASE_ASSET_MANIFEST" ]; then
     local REMOTE_BASE_ASSET_PATH="$BASE_FOLDER/$APP_VERSION/$FLAVOR_LOWER/$(basename "$BASE_ASSET_MANIFEST")"
     echo "  Base asset manifest missing locally, downloading from server..."
-    download_from_minio "$REMOTE_BASE_ASSET_PATH" "$BASE_ASSET_MANIFEST" || true
+    download_remote "$REMOTE_BASE_ASSET_PATH" "$BASE_ASSET_MANIFEST" || true
     if [ -f "$BASE_ASSET_MANIFEST" ]; then
       echo "  ✓ base-assets manifest restored from server"
     else
       echo "  ⚠ base-assets manifest not found on server — all assets will be treated as new"
     fi
-  fi
-  local BASE_ASSETS_JSON="{}"
-  if [ -f "$BASE_ASSET_MANIFEST" ]; then
-    BASE_ASSETS_JSON=$(cat "$BASE_ASSET_MANIFEST")
   fi
 
   local ASSET_JSON_LIST="["
@@ -557,12 +481,10 @@ build_platform() {
       NEW_BASE_ASSETS+="\"$REL_PATH\": \"$HASH\""
 
       # Optimization: Skip if hash matches the base APK version (client already has it)
-      local IS_IN_BASE=$(node -e "
-        try {
-          const base = JSON.parse(require('fs').readFileSync('$BASE_ASSET_MANIFEST', 'utf8'));
-          console.log(base['$REL_PATH'] === '$HASH' ? 'true' : 'false');
-        } catch(e) { console.log('false'); }
-      ")
+      local IS_IN_BASE=false
+      if [ -f "$BASE_ASSET_MANIFEST" ] && grep -qF "\"$REL_PATH\": \"$HASH\"" "$BASE_ASSET_MANIFEST"; then
+        IS_IN_BASE=true
+      fi
       # Always add ALL assets to the manifest so the resolver can find them at runtime.
       # Only skip the file copy if the asset is unchanged from base (avoids redundant uploads).
       local ASSET_IS_BASE="false"
@@ -594,13 +516,16 @@ EOF
   local NEW_HASH=$(sha256 "$NEW_BUNDLE_PATH")
   if [ $CURRENT -gt 0 ]; then
     PATCHES_JSON="["
+    # Patches from v1 (fresh store installs) + the last 5 versions. Older clients
+    # fall back to the full bundle instead of bsdiff-ing every version each build.
     for (( i=1; i<$NEXT; i++ )); do
+      if [ $i -gt 1 ] && [ $i -lt $((NEXT - 5)) ]; then continue; fi
       local OLD_B="bundle_${APP_VERSION}_v${i}_${PLATFORM}_${FLAVOR_LOWER}.hbc"
       local OLD_P="$OUTPUT/$OLD_B"
       if [ ! -f "$OLD_P" ]; then 
         echo "  Missing local bundle for v$i. Attempting to download from server..."
         local REMOTE_BUNDLE_PATH="$BASE_FOLDER/$APP_VERSION/$FLAVOR_LOWER/$OLD_B"
-        download_from_minio "$REMOTE_BUNDLE_PATH" "$OLD_P" || true
+        download_remote "$REMOTE_BUNDLE_PATH" "$OLD_P" || true
       fi
       if [ ! -f "$OLD_P" ]; then 
         echo "  ⚠ Warning: Could not find or download bundle v$i. Skipping patch generation from v$i."
@@ -616,7 +541,7 @@ EOF
 
   # ── Finalize ──
   node "$SCRIPT_DIR/update_registry.js" "$REGISTRY_SHARED" "$APP_VERSION" "$NEXT" "$PATCHES_JSON" "$PLATFORM" "$ASSET_MANIFEST_FILE" "$FLAVOR_LOWER"
-  bash "$SCRIPT_DIR/upload_ota_custom.sh" "$APP_VERSION" "$FLAVOR_LOWER" "$NEXT" "$NEW_BUNDLE_PATH" "$PLATFORM"
+  bash "$SCRIPT_DIR/upload_ota.sh" "$APP_VERSION" "$FLAVOR_LOWER" "$NEXT" "$NEW_BUNDLE_PATH" "$PLATFORM"
 }
 
 seed_platform() {
@@ -642,7 +567,7 @@ seed_platform() {
 
   local TARGET_BUNDLE="$OUTPUT/bundle_${APP_VERSION}_v1_${PLATFORM}_${FLAVOR_LOWER}.hbc"
   local BASE_ASSET_MANIFEST="$OUTPUT/base-assets_${PLATFORM}_${FLAVOR_LOWER}.json"
-  local ASSET_MANIFEST_FILE="$OUTPUT/asset-manifest-v1_${FLAVOR_LOWER}.json"
+  local ASSET_MANIFEST_FILE="$OUTPUT/asset-manifest_${APP_VERSION}_v1_${PLATFORM}_${FLAVOR_LOWER}.json"
   local TMP_DIR=$(mktemp -d)
 
   if [ "$PLATFORM" == "android" ]; then
@@ -666,7 +591,7 @@ seed_platform() {
     elif unzip -l "$BINARY_PATH" 2>/dev/null | grep -q "main.jsbundle"; then
       local ANY_BUNDLE=$(unzip -l "$BINARY_PATH" 2>/dev/null | grep -o '[^ ]*main\.jsbundle' | head -n 1)
       unzip -p "$BINARY_PATH" "$ANY_BUNDLE" > "$TMP_DIR/extracted.bundle"
-    elif [[ "$BINARY_PATH" == *.bundle ]] || [[ "$BINARY_PATH" == *.hbc ]]; then
+    elif [[ "$BINARY_PATH" == *.bundle ]] || [[ "$BINARY_PATH" == *.hbc ]] || [[ "$BINARY_PATH" == *.jsbundle ]]; then
       cp "$BINARY_PATH" "$TMP_DIR/extracted.bundle"
     else
       echo "  ❌ ERROR: Could not find 'main.jsbundle' inside $BINARY_PATH"
@@ -688,7 +613,7 @@ seed_platform() {
       rm -rf "$TMP_DIR"
       exit 1
     fi
-    "$HERMESC_PATH" -emit-binary -out "$TARGET_BUNDLE" "$TMP_DIR/extracted.bundle"
+    "$HERMESC_PATH" -emit-binary -O -out "$TARGET_BUNDLE" "$TMP_DIR/extracted.bundle"
   fi
 
   # Extract base assets manifest
@@ -698,7 +623,7 @@ seed_platform() {
   local FIRST=true
 
   if [ "$PLATFORM" == "android" ]; then
-    unzip -q -o "$BINARY_PATH" "res/drawable*/*" "res/raw/*" -d "$TMP_DIR/assets_unzipped" 2>/dev/null || true
+    unzip -q -o "$BINARY_PATH" "res/drawable*/*" "res/raw/*" "base/res/drawable*/*" "base/res/raw/*" -d "$TMP_DIR/assets_unzipped" 2>/dev/null || true
   else
     unzip -q -o "$BINARY_PATH" "Payload/*.app/assets/*" -d "$TMP_DIR/assets_unzipped" 2>/dev/null || true
   fi
@@ -709,7 +634,9 @@ seed_platform() {
       local FNAME=$(basename "$ASSET_FILE")
       local EX="${FNAME##*.}"
       local REL_PATH="${ASSET_FILE#$TMP_DIR/assets_unzipped/}"
-      
+      # Same keys as build_platform: iOS "assets/...", Android "drawable-*/..." / "raw/..."
+      REL_PATH=$(echo "$REL_PATH" | sed -E 's#^Payload/[^/]+\.app/##; s#^(base/)?res/##')
+
       if [ "$NEW_BASE_ASSETS" != "{" ]; then NEW_BASE_ASSETS+=", "; fi
       NEW_BASE_ASSETS+="\"$REL_PATH\": \"$HASH\""
 
@@ -738,7 +665,7 @@ EOF
   # Push if requested
   if [ "$PUSH_REMOTE" = true ]; then
     echo "  Pushing seeded base bundle to remote..."
-    bash "$SCRIPT_DIR/upload_ota_custom.sh" "$APP_VERSION" "$FLAVOR_LOWER" "1" "$TARGET_BUNDLE" "$PLATFORM"
+    bash "$SCRIPT_DIR/upload_ota.sh" "$APP_VERSION" "$FLAVOR_LOWER" "1" "$TARGET_BUNDLE" "$PLATFORM"
   fi
 
   echo "  ✓ Seeding complete for $PLATFORM!"
@@ -804,7 +731,7 @@ if [ "$ACTION" = "ota" ] && [ $CURRENT_TOTAL -eq 0 ]; then
     if [ ! -f "$P_BASE_BUNDLE" ]; then
       # Try downloading from remote if available
       REMOTE_BASE_PATH="$BASE_FOLDER/$APP_VERSION/$FLAVOR_LOWER/$(basename "$P_BASE_BUNDLE")"
-      download_from_minio "$REMOTE_BASE_PATH" "$P_BASE_BUNDLE" || true
+      download_remote "$REMOTE_BASE_PATH" "$P_BASE_BUNDLE" || true
     fi
 
     if [ -f "$P_BASE_BUNDLE" ]; then

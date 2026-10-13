@@ -15,23 +15,10 @@ export interface Spec extends TurboModule {
     patchPath: string,
   ): Promise<boolean>;
 
-  /**
-   * Unzip a file to a target directory
-   * @param source The absolute path to the zip file
-   * @param targetDir The absolute path to the destination directory
-   */
-  unzip(source: string, targetDir: string): Promise<boolean>;
   extractBundleFromAssets(
     assetName: string,
     destPath: string,
   ): Promise<boolean>;
-
-  /**
-   * Decompress a gzip file to the destination path.
-   * @param sourcePath Absolute path to the .gz file
-   * @param destPath Absolute path to write the decompressed output
-   */
-  decompressGzip(sourcePath: string, destPath: string): Promise<boolean>;
 
   /**
    * Mark the current boot as healthy to prevent rollback
@@ -49,10 +36,10 @@ export interface Spec extends TurboModule {
   logNative(message: string): void;
 
   /**
-   * Verify HMAC-SHA256 signature natively with streaming file I/O
+   * Verify an RSA/ECDSA SHA-256 signature natively with streaming file I/O
    * @param filePath Absolute path to the file to verify
-   * @param signature Base64-encoded expected signature
-   * @param publicKey Base64-encoded secret key
+   * @param signature Base64-encoded signature
+   * @param publicKey SPKI public key (PEM or base64)
    */
   verifySignature(
     filePath: string,

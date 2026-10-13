@@ -17,7 +17,6 @@ Premium OTA update solution for React Native using **TurboModules** + **bsdiff b
 - **Crash detection + auto-rollback** — native-side protection runs **before** JS boots; if the updated bundle crashes, the app automatically rolls back to the previous version
 - **Integrity verification** — SHA-256 hash check on both source bundle and result bundle
 - **Disk Garbage Collection** — automatically removes obsolete bundle versions and dangling temporary files
-- **Gzip decompression** — native 64KB-buffered gzip decompression on both Android and iOS
 - **Content-addressed asset store** — images/assets downloaded per-version and redirected via `setCustomSourceTransformer`
 - **Structured telemetry** — all OTA events forwarded to your analytics via `onEvent` callback
 - **New Architecture ready** — built with TurboModules (no legacy Bridge)
@@ -71,12 +70,9 @@ const config = {
   updateMode: OtaUpdateMode.BACKGROUND_DOWNLOAD, // Silent download without interrupting user
   allowDebugUpdates: false,   // default: OTA is blocked in __DEV__
   customServer: {
-    baseUrl: 'https://ota.yourcompany.com',
-    username: 'your-user',
-    password: 'your-pass',
+    baseUrl: 'https://raw.githubusercontent.com/<owner>/<storage-repo>/main',
     channel: 'production',
-    baseFolder: 'bspatch',
-    useMinio: false,
+    baseFolder: 'ota',
   },
 };
 
@@ -176,22 +172,20 @@ type OtaConfig = {
   onEvent?: (entry: OtaLogEntry) => void;
 
   /**
-   * Base64-encoded public key for HMAC-SHA256 patch signature verification.
+   * SPKI public key (PEM or base64, RSA or EC P-256) for signature verification.
+   * When set, unsigned or wrongly signed patches/bundles are rejected.
    * Recommended for production to prevent MITM attacks.
    */
   publicKey?: string;
 
-  /** Custom storage provider. Omit to use CustomStorageProvider. */
+  /** Custom storage provider. Omit to use GitHubRawStorageProvider. */
   storage?: OtaStorageProvider;
 
-  /** Custom server configuration (used by CustomStorageProvider) */
+  /** Static storage layout read by GITHUB_RAW (public, read-only — no credentials) */
   customServer?: {
-    baseUrl: string;
-    username: string;
-    password: string;
+    baseUrl: string;      // https://raw.githubusercontent.com/<owner>/<repo>/<branch>
     channel: string;
-    baseFolder?: string;  // default: 'bspatch'
-    useMinio?: boolean;
+    baseFolder?: string;  // default: 'ota'
   };
 };
 ```
@@ -254,7 +248,6 @@ Your OTA server must expose a `ota_registry.json` at the configured path (e.g. `
               "baseHash": "sha256_of_v1_bundle",
               "bundleHash": "sha256_of_v2_bundle",
               "platform": "android",
-              "compressed": false,
               "mandatory": false,
               "fullBundleUrl": "v2-full.zip"
             }
@@ -292,7 +285,7 @@ This means crash protection is **native-side and zero-cost** — it doesn't requ
 
 ## Custom Storage Provider
 
-The library ships with `CustomStorageProvider` for MinIO-based private servers. To use a different backend, implement the interface:
+The library ships with `GitHubRawStorageProvider` (default). To use a different backend (e.g. Cloudflare), implement the interface:
 
 ```ts
 interface OtaStorageProvider {
@@ -434,7 +427,7 @@ yarn ota:build
 
 ### Environment Variables
 
-The build script requires server credentials. You can provide them via:
+Builds publish to a GitHub storage repository. Authentication uses `gh auth token` (or `GH_TOKEN` / `GITHUB_TOKEN`), so run `gh auth login` once.
 
 **Option 1: `.env` file (recommended)**
 
@@ -442,8 +435,8 @@ Create a `.env` file in your **React Native project root** (not in the module di
 
 ```bash
 # In your project root (e.g., /path/to/YourApp/)
-OTA_USER=your-username
-OTA_PASSWORD=your-password
+OTA_BASE_URL=https://raw.githubusercontent.com/<owner>/<storage-repo>/main
+OTA_FOLDER=ota
 ```
 
 The build script automatically loads `.env` from the project root.
@@ -451,17 +444,15 @@ The build script automatically loads `.env` from the project root.
 **Option 2: Export environment variables**
 
 ```bash
-export OTA_USER="your-username"
-export OTA_PASSWORD="your-password"
+export OTA_BASE_URL="https://raw.githubusercontent.com/<owner>/<storage-repo>/main"
 yarn ota:build
 ```
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `OTA_USER` | Yes | - | Server username |
-| `OTA_PASSWORD` | Yes | - | Server password |
-| `OTA_BASE_URL` | No | `https://sync-server.osp.com.vn` | Server base URL |
-| `OTA_FOLDER` | No | `congplqg` | Base folder path |
+| `OTA_BASE_URL` | Yes | - | `https://raw.githubusercontent.com/<owner>/<repo>/<branch>` |
+| `OTA_FOLDER` | No | `ota` | Base folder in the storage repo |
+| `OTA_PRIVATE_KEY` | No | - | PEM private key (or `ota_private_key.pem` in project root) |
 
 > **Security Warning:** Never commit credentials to source control. The `.env` file is gitignored.
 
@@ -497,12 +488,12 @@ const otaConfig: OtaConfig = {
 
 ### 2. Automated Signing at Build Time
 
-When you run `tools/build_ota.sh`, it automatically searches for `ota_private_key.pem` (or the `OTA_PRIVATE_KEY` environment variable). If found, it **cryptographically signs each binary patch file using SHA-256** and injects the signatures into `ota_registry.json`.
+When you run `tools/build_ota.sh`, it automatically searches for `ota_private_key.pem` (or the `OTA_PRIVATE_KEY` environment variable). If found, it **signs each patch (`signature`) and the resulting bundle (`bundleSignature`) with SHA-256** and injects the signatures into `ota_registry.json`. The bundle signature is checked on both the patch path and the full-bundle fallback. If the key is present but a file can't be signed, the build fails.
 
 On the client device:
 - **Android**: Uses Android Security Provider (`SHA256withRSA` / `SHA256withECDSA`).
 - **iOS**: Uses Apple Security framework (`SecKeyVerifySignature`).
-- **Backward Compatibility**: Automatically falls back to HMAC-SHA256 if a symmetric key is passed.
+- **Fail closed**: when `publicKey` is set, a missing or invalid signature rejects the update. HMAC/symmetric keys are no longer supported (the public key ships in the app, so it can't be a secret).
 
 ---
 
@@ -547,7 +538,7 @@ When executing `tools/build_ota.sh`, the script auto-detects the version from `b
 
 - **POSIX `mmap()` Zero-Copy Patching**: Unlike standard bspatch which allocates heap memory with `malloc()`, `react-native-bspatch` memory-maps the input and output files using `mmap()` and `MADV_SEQUENTIAL`. Memory overhead is reduced by **~85–90%**, virtually eliminating out-of-memory crashes on low-end devices.
 - **SIMD Vectorization**: The inner patching loop includes `#pragma clang loop vectorize(enable)` for Clang ARM NEON 128-bit vectorization.
-- **64KB Streaming Buffers**: File hashing, gzip decompression, and stream copying are upgraded to 64KB chunk sizes across Android and iOS.
+- **64KB Streaming Buffers**: File hashing and stream copying are upgraded to 64KB chunk sizes across Android and iOS.
 - **Disk Garbage Collection**: Calling `markHealthy()` automatically deletes obsolete bundle versions and dangling `.tmp` files from disk, keeping app storage minimal.
 - **HTTP 304 ETag Caching**: Registry queries send `If-None-Match`. On `304 Not Modified`, cached patches are returned instantly with zero JSON parsing overhead.
 
@@ -566,13 +557,12 @@ src/native_modules/react-native-bspatch/
 │       ├── OtaProvider.tsx           # React Context provider + auto-update logic
 │       ├── types.ts                  # All TypeScript type definitions
 │       └── storage/
-│           ├── CustomStorage.ts        # MinIO-based storage implementation
-│           └── GitHubReleaseStorage.ts # GitHub Releases storage (public / token-auth)
+│           └── GitHubRawStorage.ts     # GitHub raw repository storage (default)
 ├── android/src/main/java/vn/reactnativebspatch/
-│   ├── BsPatchModule.kt             # Native: applyPatch, unzip, extract, gzip
+│   ├── BsPatchModule.kt             # Native: applyPatch, extract, verifySignature
 │   └── OtaBundleResolver.kt         # Native: bundle resolution + rollback
 ├── ios/
-│   ├── RNBsPatch.mm                # Native iOS bridge + gzip decompress
+│   ├── RNBsPatch.mm                # Native iOS bridge + signature verify
 │   └── OtaBundleResolver.swift      # Native iOS bundle resolution + rollback
 ├── cpp/
 │   ├── CMakeLists.txt               # CMake build for bspatch C library

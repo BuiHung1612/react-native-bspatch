@@ -11,8 +11,6 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
-import java.util.zip.ZipInputStream
-import java.util.zip.GZIPInputStream
 import java.util.concurrent.Executors
 
 class BsPatchModule(private val reactContext: ReactApplicationContext) : NativeBsPatchSpec(reactContext) {
@@ -40,36 +38,6 @@ class BsPatchModule(private val reactContext: ReactApplicationContext) : NativeB
                 promise.resolve(result)
             } catch (e: Exception) {
                 promise.reject("ERR_BSPATCH", e.message, e)
-            }
-        }
-    }
-
-    override fun unzip(source: String, targetDir: String, promise: Promise) {
-        backgroundExecutor.execute {
-            try {
-                val sourceFile = File(source)
-                val destDir = File(targetDir)
-                if (!destDir.exists()) destDir.mkdirs()
-
-                ZipInputStream(BufferedInputStream(FileInputStream(sourceFile), IO_BUFFER_SIZE)).use { zis ->
-                    var entry = zis.nextEntry
-                    while (entry != null) {
-                        val file = File(destDir, entry.name)
-                        if (entry.isDirectory) {
-                            file.mkdirs()
-                        } else {
-                            file.parentFile?.mkdirs()
-                            BufferedOutputStream(FileOutputStream(file), IO_BUFFER_SIZE).use { bos ->
-                                zis.copyTo(bos, bufferSize = IO_BUFFER_SIZE)
-                            }
-                        }
-                        zis.closeEntry()
-                        entry = zis.nextEntry
-                    }
-                }
-                promise.resolve(true)
-            } catch (e: Exception) {
-                promise.reject("ERR_UNZIP", e.message, e)
             }
         }
     }
@@ -119,25 +87,6 @@ class BsPatchModule(private val reactContext: ReactApplicationContext) : NativeB
         android.util.Log.d("JS-OTA", message ?: "")
     }
 
-    override fun decompressGzip(sourcePath: String, destPath: String, promise: Promise) {
-        backgroundExecutor.execute {
-            try {
-                val source = File(sourcePath)
-                val dest = File(destPath)
-                dest.parentFile?.mkdirs()
-
-                GZIPInputStream(BufferedInputStream(FileInputStream(source), IO_BUFFER_SIZE), IO_BUFFER_SIZE).use { gis ->
-                    BufferedOutputStream(FileOutputStream(dest), IO_BUFFER_SIZE).use { bos ->
-                        gis.copyTo(bos, bufferSize = IO_BUFFER_SIZE)
-                    }
-                }
-                promise.resolve(true)
-            } catch (e: Exception) {
-                promise.reject("ERR_GZIP_DECOMPRESS", e.message, e)
-            }
-        }
-    }
-
     override fun verifySignature(filePath: String, signature: String, publicKey: String, promise: Promise) {
         backgroundExecutor.execute {
             try {
@@ -157,65 +106,29 @@ class BsPatchModule(private val reactContext: ReactApplicationContext) : NativeB
                 val keyBytes = android.util.Base64.decode(cleanKey, android.util.Base64.DEFAULT)
                 val expectedSigBytes = android.util.Base64.decode(signature.trim(), android.util.Base64.DEFAULT)
 
-                // 1. Try RSA Public Key (SHA256withRSA)
-                try {
-                    val keySpec = java.security.spec.X509EncodedKeySpec(keyBytes)
-                    val keyFactory = java.security.KeyFactory.getInstance("RSA")
-                    val pubKey = keyFactory.generatePublic(keySpec)
-                    val sig = java.security.Signature.getInstance("SHA256withRSA")
-                    sig.initVerify(pubKey)
-
-                    val buffer = ByteArray(IO_BUFFER_SIZE)
-                    FileInputStream(file).use { fis ->
-                        var read: Int
-                        while (fis.read(buffer).also { read = it } != -1) {
-                            sig.update(buffer, 0, read)
-                        }
-                    }
-                    val isValid = sig.verify(expectedSigBytes)
-                    promise.resolve(isValid)
-                    return@execute
-                } catch (rsaEx: Exception) {
-                    // Not RSA, continue
+                // Pick the algorithm from the key itself; never fall back to another scheme
+                val keySpec = java.security.spec.X509EncodedKeySpec(keyBytes)
+                val pubKey = try {
+                    java.security.KeyFactory.getInstance("RSA").generatePublic(keySpec)
+                } catch (e: Exception) {
+                    java.security.KeyFactory.getInstance("EC").generatePublic(keySpec)
                 }
-
-                // 2. Try ECDSA Public Key (SHA256withECDSA)
-                try {
-                    val keySpec = java.security.spec.X509EncodedKeySpec(keyBytes)
-                    val keyFactory = java.security.KeyFactory.getInstance("EC")
-                    val pubKey = keyFactory.generatePublic(keySpec)
-                    val sig = java.security.Signature.getInstance("SHA256withECDSA")
-                    sig.initVerify(pubKey)
-
-                    val buffer = ByteArray(IO_BUFFER_SIZE)
-                    FileInputStream(file).use { fis ->
-                        var read: Int
-                        while (fis.read(buffer).also { read = it } != -1) {
-                            sig.update(buffer, 0, read)
-                        }
-                    }
-                    val isValid = sig.verify(expectedSigBytes)
-                    promise.resolve(isValid)
-                    return@execute
-                } catch (ecEx: Exception) {
-                    // Not EC, continue
-                }
-
-                // 3. Fallback: HMAC-SHA256
-                val mac = javax.crypto.Mac.getInstance("HmacSHA256")
-                val secretKey = javax.crypto.spec.SecretKeySpec(keyBytes, "HmacSHA256")
-                mac.init(secretKey)
+                val sig = java.security.Signature.getInstance(
+                    if (pubKey.algorithm == "RSA") "SHA256withRSA" else "SHA256withECDSA"
+                )
+                sig.initVerify(pubKey)
 
                 val buffer = ByteArray(IO_BUFFER_SIZE)
                 FileInputStream(file).use { fis ->
                     var read: Int
                     while (fis.read(buffer).also { read = it } != -1) {
-                        mac.update(buffer, 0, read)
+                        sig.update(buffer, 0, read)
                     }
                 }
-                val computedSigBytes = mac.doFinal()
-                val isValid = java.security.MessageDigest.isEqual(expectedSigBytes, computedSigBytes)
-                promise.resolve(isValid)
+                promise.resolve(sig.verify(expectedSigBytes))
+            } catch (e: java.security.GeneralSecurityException) {
+                // Malformed key/signature → invalid (fail closed)
+                promise.resolve(false)
             } catch (e: Exception) {
                 promise.reject("ERR_VERIFY_SIG", e.message, e)
             }

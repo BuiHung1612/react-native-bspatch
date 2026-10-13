@@ -50,6 +50,7 @@ function patchFile(filePath, label, patchFn) {
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
+// Plain shell; escaped below for the pbxproj shellScript string literal
 const XCODE_BUNDLE_SYNC_SNIPPET = [
     '',
     '# [react-native-bspatch] Sync compiled bundle to output/ for OTA builds',
@@ -57,20 +58,24 @@ const XCODE_BUNDLE_SYNC_SNIPPET = [
     'BUNDLE_RESULT="$CONFIGURATION_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/main.jsbundle"',
     '',
     'if [ -f "$BUNDLE_RESULT" ]; then',
-    '  mkdir -p "$(dirname \\"$DEST_FILE\\")"',
+    '  mkdir -p "$(dirname "$DEST_FILE")"',
     '  cp "$BUNDLE_RESULT" "$DEST_FILE"',
     '  echo "Bundle synced to $DEST_FILE"',
     '  if [ "$CONFIGURATION" = "Release" ]; then',
     '    APP_VER="${MARKETING_VERSION:-1.0.0}"',
-    '    mkdir -p "$PROJECT_DIR/output"',
-    '    cp "$BUNDLE_RESULT" "$PROJECT_DIR/output/bundle_${APP_VER}_v1_ios_production.hbc"',
-    '    cp "$BUNDLE_RESULT" "$PROJECT_DIR/output/bundle_${APP_VER}_v1_ios_development.hbc" 2>/dev/null || true',
-    '    echo "[react-native-bspatch] ✓ Auto-captured iOS base bundle v1 to output/"',
+    '    # v1 = the store build; never overwrite it (delete the file to re-capture)',
+    '    for FLAVOR in development staging production; do',
+    '      DEST_V1="$PROJECT_DIR/output/bundle_${APP_VER}_v1_ios_${FLAVOR}.hbc"',
+    '      if [ ! -f "$DEST_V1" ]; then',
+    '        cp "$BUNDLE_RESULT" "$DEST_V1"',
+    '        echo "[react-native-bspatch] ✓ Auto-captured iOS base bundle v1 ($FLAVOR)"',
+    '      fi',
+    '    done',
     '  fi',
     'else',
     '  echo "Bundle not found at $BUNDLE_RESULT (skipping sync)"',
     'fi',
-].join('\\n');
+].join('\n').replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
 
 // The escaped version as it appears in pbxproj shellScript value
 const XCODE_BUNDLE_SYNC_MARKER = 'react-native-bspatch] Sync compiled bundle to output/';
@@ -93,7 +98,10 @@ afterEvaluate {
                         def bundleDir = file("\$buildDir/generated/assets/react/\${variant.name}")
                         def bundleFile = file("\$bundleDir/index.android.bundle")
                         def outputDir = file("\$rootDir/output")
-                        if (bundleFile.exists()) {
+                        // v1 = the store build; never overwrite it (delete the file to re-capture).
+                        // build_ota.sh runs this same bundle task for every OTA build.
+                        def destFile = file("\$outputDir/bundle_\${versionName}_v1_android_\${flavorName}.hbc")
+                        if (bundleFile.exists() && !destFile.exists()) {
                             outputDir.mkdirs()
                             def destName = "bundle_\${versionName}_v1_android_\${flavorName}.hbc"
                             copy {
@@ -113,8 +121,13 @@ afterEvaluate {
 `;
 
 function patchAppBuildGradle(content) {
-    if (content.includes(ANDROID_GRADLE_MARKER)) return content;
-    return content.trimEnd() + '\n' + ANDROID_GRADLE_SNIPPET;
+    const markerIdx = content.indexOf('// ' + ANDROID_GRADLE_MARKER);
+    if (markerIdx === -1) return content.trimEnd() + '\n' + ANDROID_GRADLE_SNIPPET;
+
+    // Replace an older snippet in place: from the marker to the afterEvaluate block's closing brace
+    const end = findClosingParen(content, content.indexOf('{', content.indexOf('afterEvaluate', markerIdx)), '{', '}');
+    if (end === -1) return content;
+    return content.slice(0, markerIdx) + ANDROID_GRADLE_SNIPPET.trim() + content.slice(end + 1);
 }
 
 const IOS_IMPORT = 'import react_native_bspatch';
@@ -134,13 +147,13 @@ const IOS_BUNDLE_URL_OVERRIDE = `
 const ANDROID_IMPORT = 'import vn.reactnativebspatch.OtaBundleResolver';
 const ANDROID_JS_BUNDLE = 'jsBundleFilePath = OtaBundleResolver.resolve(applicationContext)';
 
-function findClosingParen(source, openParenIdx) {
+function findClosingParen(source, openParenIdx, open = '(', close = ')') {
     let depth = 0;
     for (let i = openParenIdx; i < source.length; i += 1) {
         const char = source[i];
-        if (char === '(') {
+        if (char === open) {
             depth += 1;
-        } else if (char === ')') {
+        } else if (char === close) {
             depth -= 1;
             if (depth === 0) {
                 return i;
@@ -153,8 +166,14 @@ function findClosingParen(source, openParenIdx) {
 // ── iOS: project.pbxproj ─────────────────────────────────────────────────────
 
 function patchPbxproj(content) {
-    // Already patched?
-    if (content.includes(XCODE_BUNDLE_SYNC_MARKER)) return content;
+    if (content.includes(XCODE_BUNDLE_SYNC_SNIPPET)) return content;
+
+    // Older snippet present → replace it in place (it lacked the base bundle auto-capture)
+    const oldIdx = content.indexOf('\\n# [' + XCODE_BUNDLE_SYNC_MARKER);
+    if (oldIdx !== -1) {
+        const endIdx = content.indexOf('";', oldIdx);
+        return content.slice(0, oldIdx) + XCODE_BUNDLE_SYNC_SNIPPET + content.slice(endIdx);
+    }
 
     // Search by phase name
     const nameIdx = content.indexOf('name = "Bundle React Native code and images";');

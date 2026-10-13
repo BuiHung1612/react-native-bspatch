@@ -55,6 +55,18 @@ object OtaBundleResolver {
             }
 
             var metadata = JSONObject(metadataFile.readText())
+
+            // ── Step 0: Store update → OTA bundles were built for another native version ──
+            val otaAppVersion = metadata.optString("appVersion", "")
+            val installedAppVersion = context.packageManager
+                .getPackageInfo(context.packageName, 0).versionName ?: ""
+            if (otaAppVersion.isNotEmpty() && otaAppVersion != installedAppVersion) {
+                Log.i(TAG, "Native app $otaAppVersion → $installedAppVersion: discarding OTA state")
+                // JS bootstrap deletes ota_trash_* in the background
+                otaDir.renameTo(File(context.filesDir, "ota_trash_${System.currentTimeMillis()}"))
+                return null
+            }
+
             val currentVersion = metadata.optInt("currentVersion", baseVersion)
             val lastLaunchOk = metadata.optBoolean("lastLaunchSuccessful", true)
             val rollbackCount = metadata.optInt("rollbackCount", 0)
@@ -62,7 +74,12 @@ object OtaBundleResolver {
             // ── Step 1: Crash detection & rollback ──────────────────────────
             if (!lastLaunchOk && currentVersion > baseVersion) {
                 Log.w(TAG, "Previous launch failed! Rolling back from V$currentVersion...")
+                // Remember the crashing version so JS never re-applies it
+                val failed = metadata.optJSONArray("failedVersions") ?: JSONArray()
+                failed.put(currentVersion)
                 metadata = performRollback(metadata, baseVersion, rollbackCount, otaDir)
+                metadata.put("failedVersions", failed)
+                metadata.put("appVersion", otaAppVersion)
                 writeMetadata(metadataFile, metadata)
 
                 val newVersion = metadata.optInt("currentVersion", baseVersion)
@@ -219,7 +236,10 @@ object OtaBundleResolver {
     private fun writeMetadata(file: File, metadata: JSONObject) {
         try {
             file.parentFile?.mkdirs()
-            file.writeText(metadata.toString(2))
+            // Write-then-rename: a crash mid-write never leaves truncated JSON
+            val tmp = File(file.parentFile, "${file.name}.tmp")
+            tmp.writeText(metadata.toString(2))
+            if (!tmp.renameTo(file)) throw java.io.IOException("rename failed")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to write metadata: ${e.message}")
         }

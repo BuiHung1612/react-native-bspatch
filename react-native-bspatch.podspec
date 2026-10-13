@@ -20,7 +20,6 @@ Pod::Spec.new do |s|
 
   s.library = 'bz2'
 
-  s.dependency "SSZipArchive"
 
   s.pod_target_xcconfig = {
     'OTHER_CFLAGS' => '$(inherited) -O3 -flto'
