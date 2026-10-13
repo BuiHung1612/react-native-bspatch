@@ -98,16 +98,18 @@ if [ "$ACTION" = "setup" ]; then
 fi
 
 # ── Build environment ──────────────────────────────────────────────────────
-echo "Preparing build environment..."
-# Kill any existing Metro processes to prevent file locks
-pkill -f "react-native/local-cli/cli.js" || true
-pkill -f "metro-config/src/index.js" || true
+if [ "$ACTION" = "ota" ]; then
+  echo "Preparing build environment..."
+  # Kill any existing Metro processes to prevent file locks
+  pkill -f "react-native/local-cli/cli.js" || true
+  pkill -f "metro-config/src/index.js" || true
 
-# Manually clear metro cache if it exists (robust vs ENOTEMPTY error)
-METRO_CACHE_DIR=$(node -e "console.log(require('os').tmpdir())")/metro-cache
-if [ -d "$METRO_CACHE_DIR" ]; then
-  echo "  Cleaning Metro cache..."
-  rm -rf "$METRO_CACHE_DIR"
+  # Manually clear metro cache if it exists (robust vs ENOTEMPTY error)
+  METRO_CACHE_DIR=$(node -e "console.log(require('os').tmpdir())")/metro-cache
+  if [ -d "$METRO_CACHE_DIR" ]; then
+    echo "  Cleaning Metro cache..."
+    rm -rf "$METRO_CACHE_DIR"
+  fi
 fi
 
 mkdir -p "$ROOT/android/output"
@@ -123,8 +125,7 @@ if [ "$ACTION" != "setup" ]; then
     BASE_URL="${OTA_BASE_URL:-}"
     BASE_FOLDER="${OTA_FOLDER:-ota}"
 
-    echo "  Using URL: $BASE_URL"
-    echo "  Using Folder: $BASE_FOLDER"
+    echo "  Storage: ${OTA_R2_BUCKET:+R2 $OTA_R2_BUCKET → }$BASE_URL/$BASE_FOLDER"
 
     if [[ -n "${OTA_R2_BUCKET:-}" ]]; then
         R2_URL="https://${OTA_R2_ACCOUNT_ID:?set OTA_R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${OTA_R2_BUCKET}"
@@ -234,7 +235,9 @@ fi
 # Confirm in a terminal (Enter keeps the detected version); CI / -y / --release-version skip it
 if [ -t 0 ] && [ "$CONFIRM_VERSION" = true ] && [ -z "$APP_VERSION_ARG" ]; then
   echo ""
-  read -r -p "  Release version for ${PLATFORM_ARG:-android + ios} [${APP_VERSION:-none detected}]: " INPUT_VERSION
+  if [ "$ACTION" = "reset" ]; then PROMPT_WHAT="Release version to RESET ($FLAVOR_LOWER, android + ios)"
+  else PROMPT_WHAT="Release version for ${PLATFORM_ARG:-android + ios} ($FLAVOR_LOWER)"; fi
+  read -r -p "  $PROMPT_WHAT [${APP_VERSION:-none detected}]: " INPUT_VERSION
   INPUT_VERSION="${INPUT_VERSION// /}"
   APP_VERSION="${INPUT_VERSION:-$APP_VERSION}"
 fi
