@@ -6,7 +6,7 @@
 //   - package.json ("version")
 //   - android/app/build.gradle (versionName & increments versionCode)
 //   - ios/*.xcodeproj/project.pbxproj (MARKETING_VERSION & increments CURRENT_PROJECT_VERSION)
-//   - src/ota/otaConfig.ts (APP_VERSION, if it exists)
+// JS reads the native version at runtime (getAppVersion); never hardcode it in source.
 //
 // Usage:
 //   node bump_version.js <new_version> [--root <path>]
@@ -116,18 +116,6 @@ if (fs.existsSync(iosDir)) {
   } catch (e) {
     console.warn(`  ⚠ Failed to update iOS project: ${e.message}`);
   }
-}
-
-// 4. src/ota/otaConfig.ts (if exists)
-const otaConfigPath = path.join(rootDir, 'src/ota/otaConfig.ts');
-if (fs.existsSync(otaConfigPath)) {
-  try {
-    let content = fs.readFileSync(otaConfigPath, 'utf8');
-    content = content.replace(/export const APP_VERSION = ['"][^'"]+['"];/, `export const APP_VERSION = '${newVersion}';`);
-    fs.writeFileSync(otaConfigPath, content, 'utf8');
-    console.log(`  ✓ src/ota/otaConfig.ts: APP_VERSION → '${newVersion}'`);
-    changedCount++;
-  } catch (e) {}
 }
 
 console.log(`\n✓ Done! Updated ${changedCount} file(s) to version ${newVersion}.\n`);
