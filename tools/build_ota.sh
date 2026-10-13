@@ -81,9 +81,14 @@ load_env() {
     export "$k=$v"
   done < "$1"
 }
+if [ "$FLAVOR_LOWER" = "android" ] || [ "$FLAVOR_LOWER" = "ios" ]; then
+  echo "❌ '$FLAVOR_LOWER' is a platform, not a flavor. Usage: patch $FLAVOR_LOWER [--flavor development|staging|production]"
+  exit 1
+fi
 if [ "$ACTION" != "setup" ]; then
   if [ ! -f "$ROOT/.env.$FLAVOR_LOWER" ]; then
-    echo "❌ $ROOT/.env.$FLAVOR_LOWER not found (OTA_BASE_URL / OTA_FOLDER for flavor '$FLAVOR_LOWER')"
+    AVAILABLE=$(cd "$ROOT" && ls .env.* 2>/dev/null | sed 's/^\.env\.//' | grep -vx 'ota' | tr '\n' ' ')
+    echo "❌ .env.$FLAVOR_LOWER not found for flavor '$FLAVOR_LOWER'. Flavors with an env file: ${AVAILABLE:-none}"
     exit 1
   fi
   load_env "$ROOT/.env.$FLAVOR_LOWER"
