@@ -206,14 +206,18 @@ export const fetchOtaManifest = (config: OtaConfig): Promise<OtaPatch[]> =>
 
 const ASSET_STORE_DIR = `${ReactNativeBlobUtil.fs.dirs.DocumentDir}/ota/assets`;
 
+/** Relative path inside the version dir: no absolute paths, no `..` segments. */
+const isSafeRelativePath = (p: string): boolean =>
+    /^[A-Za-z0-9_\-.@/]+$/.test(p) && !p.startsWith('/') && !p.split('/').includes('..');
+
 /**
- * Downloads and syncs assets from the content-addressed asset store.
- * Only downloads assets that are not already cached locally.
- *
- * @param assetManifestUrl URL to the asset-manifest.json for this version
- * @param config OTA configuration
- * @param log Logger instance
- * @param onStatus Status update callback
+ * Downloads this version's assets and places each one next to the bundle, at the
+ * path React Native resolves by default for a bundle loaded from a file:
+ *   Android: ota/vN/drawable-xxhdpi/foo.png, ota/vN/raw/bar.glb
+ *   iOS:     ota/vN/assets/src/images/foo@2x.png
+ * So images resolve correctly from the very first render, with no JS source
+ * transformer (which raced the first render). Files are fetched once per content
+ * hash into ota/assets/ and copied from there for later versions.
  */
 const downloadAndSyncAssets = async (
     assetManifestUrl: string,
@@ -227,168 +231,94 @@ const downloadAndSyncAssets = async (
     ) => void,
     onProgress: (percent: number) => void,
 ): Promise<void> => {
+    const fs = ReactNativeBlobUtil.fs;
     onStatus(OtaStatus.SYNCING_ASSETS, 'Syncing assets...');
-
     const versionDir = `${OTA_DIR}/v${version}`;
-    const manifestPath = `${versionDir}/asset-manifest-v${version}.json`;
 
-    // Ensure asset store dir exists
-    if (!(await ReactNativeBlobUtil.fs.exists(ASSET_STORE_DIR))) {
-        await ReactNativeBlobUtil.fs.mkdir(ASSET_STORE_DIR);
-    }
-
-    // Fetch the asset manifest
     let assets: OtaAsset[] = [];
     try {
-        if (__DEV__) {
-            console.log(
-                `[otaCore] Fetching asset manifest from: ${assetManifestUrl}`,
-            );
-        }
         const resp = await ReactNativeBlobUtil.config({
             followRedirect: true,
             timeout: 10000,
-        }).fetch('GET', assetManifestUrl, {
-            'Cache-Control': 'no-cache',
-        });
-
+        }).fetch('GET', assetManifestUrl, { 'Cache-Control': 'no-cache' });
         if (resp.respInfo.status !== 200) {
-            throw new Error(
-                `Manifest fetch failed with status ${resp.respInfo.status}`,
-            );
+            throw new Error(`status ${resp.respInfo.status}`);
         }
-
-        // Save manifest to disk for future reloads (AssetResolver needs it)
-        if (!(await ReactNativeBlobUtil.fs.exists(versionDir))) {
-            await ReactNativeBlobUtil.fs.mkdir(versionDir);
-        }
-
-        const manifestData =
-            typeof resp.data === 'string'
-                ? resp.data
-                : JSON.stringify(resp.data);
-        await ReactNativeBlobUtil.fs.writeFile(
-            manifestPath,
-            manifestData,
-            'utf8',
-        );
-        if (__DEV__) {
-            console.log(`[otaCore] Saved asset manifest to: ${manifestPath}`);
-        }
-
-        const manifest = JSON.parse(manifestData);
-        // Hash/ext become file names: reject anything that isn't a plain sha256 + extension
+        const manifest = typeof resp.data === 'string' ? JSON.parse(resp.data) : resp.data;
+        // Hash/ext/path become file names: reject anything unexpected
         assets = (manifest.assets || []).filter(
             (a: any) =>
                 /^[a-f0-9]{64}$/i.test(a.hash) &&
-                /^[a-z0-9]+$/i.test(a.ext),
+                /^[a-z0-9]+$/i.test(a.ext) &&
+                typeof a.originalPath === 'string' &&
+                isSafeRelativePath(a.originalPath),
         );
     } catch (e) {
-        // Fatal: activating the bundle without its manifest leaves images unresolved
+        // Fatal: activating the bundle without its assets leaves images blank
         throw new Error(`Failed to fetch asset manifest: ${(e as Error).message}`);
     }
+    if (assets.length === 0) return;
 
-    if (assets.length === 0) {
-        if (__DEV__) {
-            console.log('[otaCore] No new assets to sync for this version.');
-        }
-        return;
-    }
-
-    // Only notify UI now that we actually have assets to download
     onStatus(OtaStatus.SYNCING_ASSETS, `Syncing ${assets.length} asset(s)...`);
+    // One promise per dir: parallel workers would otherwise race mkdir (EEXIST)
+    const dirs = new Map<string, Promise<void>>();
+    const ensureDir = (dir: string): Promise<void> => {
+        if (!dirs.has(dir)) {
+            dirs.set(dir, fs.exists(dir).then(ok => (ok ? undefined : fs.mkdir(dir))));
+        }
+        return dirs.get(dir)!;
+    };
+    await ensureDir(ASSET_STORE_DIR);
 
     let processed = 0;
     let downloaded = 0;
-    let cached = 0;
     let failed = 0;
-
-    const updateProgress = () => {
-        processed++;
-        const percent = Math.round((processed / assets.length) * 100);
-        onProgress(percent);
-    };
-
-    // Concurrency-limited download queue
-    const maxConcurrency = 6; // Optimal for most mobile networks
     let index = 0;
 
-    const downloadNext = async (): Promise<void> => {
-        if (index >= assets.length) return;
-
-        const asset = assets[index++];
-        const filename = `${asset.hash}.${asset.ext}`;
-        const localPath = `${ASSET_STORE_DIR}/${filename}`;
-
-        // Check if already cached
-        if (await ReactNativeBlobUtil.fs.exists(localPath)) {
-            cached++;
-            updateProgress();
-            await downloadNext(); // Start next download
-            return;
-        }
-
-        // Download missing asset
-        onStatus(
-            OtaStatus.SYNCING_ASSETS,
-            `Syncing assets (${processed + 1}/${assets.length})...`,
-        );
-        try {
-            const storage = getStorage(config);
-            const assetUrl = await storage.getAssetUrl(
-                asset.hash,
-                asset.ext,
-                config,
-            );
-            if (!assetUrl) {
+    const worker = async (): Promise<void> => {
+        while (index < assets.length) {
+            const asset = assets[index++];
+            const storePath = getLocalAssetPath(asset.hash, asset.ext);
+            try {
+                if (!(await fs.exists(storePath))) {
+                    const url = await getStorage(config).getAssetUrl(asset.hash, asset.ext, config);
+                    if (!url) throw new Error('no URL');
+                    await downloadWithRetry(url, storePath, config, () => {});
+                    if (!(await verifyHash(storePath, asset.hash))) {
+                        await fs.unlink(storePath).catch(() => {});
+                        throw new Error('hash mismatch');
+                    }
+                    downloaded++;
+                }
+                const dest = `${versionDir}/${asset.originalPath}`;
+                const parts = asset.originalPath.split('/').slice(0, -1);
+                for (let i = 1; i <= parts.length; i++) {
+                    await ensureDir(`${versionDir}/${parts.slice(0, i).join('/')}`);
+                }
+                if (await fs.exists(dest)) await fs.unlink(dest);
+                await fs.cp(storePath, dest);
+            } catch (e) {
                 if (__DEV__) {
-                    console.warn(
-                        `[otaCore] Could not get URL for asset ${filename}`,
-                    );
+                    console.warn(`[otaCore] Asset ${asset.originalPath} failed:`, e);
                 }
-            } else {
-                await downloadWithRetry(assetUrl, localPath, config, () => {});
-                if (!(await verifyHash(localPath, asset.hash))) {
-                    await ReactNativeBlobUtil.fs.unlink(localPath).catch(() => {});
-                    throw new Error('hash mismatch');
-                }
-                downloaded++;
-                log.emit(OtaEvent.DOWNLOAD_SUCCESS, {
-                    message: `Asset downloaded: ${filename}`,
-                });
+                failed++; // keep going, fail the sync at the end
             }
-        } catch (e) {
-            if (__DEV__) {
-                console.warn(
-                    `[otaCore] Failed to download asset ${filename}:`,
-                    e,
-                );
-            }
-            failed++; // keep going, fail the sync at the end
-        } finally {
-            updateProgress();
-            await downloadNext(); // Start next download
+            processed++;
+            onProgress(Math.round((processed / assets.length) * 100));
         }
     };
 
-    // Start initial batch of downloads
-    const initialWorkers = Math.min(maxConcurrency, assets.length);
-    const workers = Array(initialWorkers)
-        .fill(null)
-        .map(() => downloadNext());
-    await Promise.all(workers);
+    // Concurrency-limited queue: 6 parallel requests suit most mobile networks
+    await Promise.all(Array.from({ length: Math.min(6, assets.length) }, worker));
 
     if (failed > 0) {
         throw new Error(`${failed} asset(s) failed to download`);
     }
-
-    onStatus(
-        OtaStatus.SYNCING_ASSETS,
-        `Assets synced (${downloaded} new, ${cached} cached)`,
-    );
-    console.log(
-        `[otaCore] Assets: ${downloaded} downloaded, ${cached} from cache`,
-    );
+    log.emit(OtaEvent.DOWNLOAD_SUCCESS, {
+        version,
+        message: `Assets: ${assets.length} placed, ${downloaded} downloaded`,
+    });
+    onStatus(OtaStatus.SYNCING_ASSETS, `Assets synced (${downloaded} new)`);
 };
 
 /**

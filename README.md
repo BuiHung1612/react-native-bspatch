@@ -17,7 +17,7 @@ Premium OTA update solution for React Native using **TurboModules** + **bsdiff b
 - **Crash detection + auto-rollback** — native-side protection runs **before** JS boots; if the updated bundle crashes, the app automatically rolls back to the previous version
 - **Integrity verification** — SHA-256 hash check on both source bundle and result bundle
 - **Disk Garbage Collection** — automatically removes obsolete bundle versions and dangling temporary files
-- **Content-addressed asset store** — images/assets downloaded once per content hash and redirected via `setCustomSourceTransformer`
+- **OTA assets without a JS resolver** — images/assets are downloaded once per content hash and placed next to the bundle, where React Native looks for them by default (correct from the first render)
 - **Structured telemetry** — all OTA events forwarded to your analytics via `onEvent` callback
 - **New Architecture ready** — built with TurboModules (no legacy Bridge)
 
@@ -375,7 +375,7 @@ The release version is read from the native project (`versionName` / `MARKETING_
 ### How It Works
 
 1. **Bundle** — `npx react-native bundle` + `hermesc` generate Hermes bytecode (`.hbc`), uploaded as the version's full bundle.
-2. **Assets** — Every asset is copied to the content-addressed `asset-store/` (`{sha256}.{ext}`) and listed in the per-version manifest. Clients download each hash once and reuse it across versions.
+2. **Assets** — Every asset is copied to the content-addressed `asset-store/` (`{sha256}.{ext}`) and listed in the per-version manifest with its Metro path. Clients download each hash once (cached in `ota/assets/`) and copy it to `ota/vN/<path>` — the location React Native resolves for a bundle loaded from `ota/vN/` (`drawable-*/`, `raw/` on Android; `assets/…` on iOS).
 3. **Patch** — `bsdiff` generates a delta from each of the last 5 OTA bundles (v2+) to the new one.
 4. **Registry** — Updates `ota_registry.json` with new `baseHash`, `bundleHash`, and asset manifest URL for each platform/channel.
 5. **Upload** — Uploads bundles, patches, and asset store to the configured server.
@@ -526,7 +526,6 @@ react-native-bspatch/
 │       ├── otaCore.ts                # Pipeline: patch from installed OTA bundle, else full bundle
 │       ├── otaMetadata.ts            # Locked metadata updates, health marking, disk GC
 │       ├── otaLogger.ts              # Structured event telemetry
-│       ├── otaAssetResolver.ts       # Image source interceptor + asset store
 │       ├── OtaProvider.tsx           # React provider + update modes
 │       ├── types.ts
 │       └── storage/
@@ -555,4 +554,4 @@ react-native-bspatch/
 - The first OTA after a store install, and clients more than 5 OTA versions behind, download the full bundle (patches are only built from the last 5 OTA versions)
 - Health is confirmed when the app first renders; a crash after that is not rolled back
 - OTA version numbers are shared by both platforms of a flavor, so `patch android` then `patch ios` gives iOS the next number
-- Asset redirection via `setCustomSourceTransformer` requires React Native **0.69+**
+- Each retained OTA version keeps its own copy of its assets next to the bundle (~asset size × up to 4 versions); downloads are still once per content hash

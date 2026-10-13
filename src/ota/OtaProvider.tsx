@@ -18,7 +18,6 @@ import {
 } from 'react-native';
 import ReactNativeBlobUtil from 'react-native-blob-util';
 import NativeBsPatch from '../NativeBsPatch';
-import { initOtaAssetResolver } from './otaAssetResolver';
 import { applyOtaPatchInternal, fetchOtaManifest, selectUpdate, validateOtaConfig } from './otaCore';
 import { createOtaLogger, OtaEvent } from './otaLogger';
 import { loadMetadata, markHealthy } from './otaMetadata';
@@ -131,11 +130,7 @@ export function OtaProvider({
           (s: OtaStatus, msg: string, m?: OtaMetrics) => {
             setMessage(msg);
             setStatus(s);
-            if (m) {
-              setMetrics(m);
-              // Initialize asset resolver for the new version immediately
-              initOtaAssetResolver(targetVer);
-            }
+            if (m) setMetrics(m);
           },
           (percent: number) => {
             setProgressIfChanged(percent);
@@ -189,7 +184,6 @@ export function OtaProvider({
               pendingReloadRef.current = true;
               setStatus(OtaStatus.UP_TO_DATE);
               setMessage(`Update V${targetV} ready for next launch`);
-              // Not initOtaAssetResolver: the running bundle still needs its own manifest
               if (m) setMetrics(m);
             }
           },
@@ -305,11 +299,6 @@ export function OtaProvider({
 
       // Display current version immediately
       setCurrentVersion(metadata.currentVersion);
-
-      // Initialize asset resolver with current version (if not base)
-      if (metadata.currentVersion > config.baseAppVersion) {
-        await initOtaAssetResolver(metadata.currentVersion);
-      }
 
       // (Native layer handled crash detection and any necessary rollback)
       if (configError) {
