@@ -13,7 +13,14 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -e
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Resolve symlinks: npx runs us via node_modules/.bin/react-native-bspatch
+SOURCE="$0"
+while [ -L "$SOURCE" ]; do
+  LINK_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  case "$SOURCE" in /*) ;; *) SOURCE="$LINK_DIR/$SOURCE" ;; esac
+done
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
 MODULE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ROOT="$PWD"
 BUNDLE_XCODE_IOS="$ROOT/ios/output/main.jsbundle"
@@ -85,7 +92,14 @@ FLAVOR_LOWER=$(echo "$FLAVOR" | tr '[:upper:]' '[:lower:]')
 if [ "$FLAVOR_LOWER" = "dev" ]; then FLAVOR_LOWER="development"; fi
 if [ "$FLAVOR_LOWER" = "prod" ]; then FLAVOR_LOWER="production"; fi
 
-# ── Setup ──────────────────────────────────────────────────────────────────
+# ── Setup (project wiring only, no build env needed) ─────────────────────────
+if [ "$ACTION" = "setup" ]; then
+  echo "Setting up react-native-bspatch in this project..."
+  node "$SCRIPT_DIR/setup_project.js" --root "$ROOT"
+  exit 0
+fi
+
+# ── Build environment ──────────────────────────────────────────────────────
 echo "Preparing build environment..."
 # Kill any existing Metro processes to prevent file locks
 pkill -f "react-native/local-cli/cli.js" || true
@@ -309,13 +323,6 @@ if [ "$ACTION" = "reset" ]; then
       echo "  Syncing reset state for flavor '$FLAVOR_LOWER' to remote storage..."
       bash "$SCRIPT_DIR/upload_ota.sh" "$APP_VERSION" "$FLAVOR_LOWER" "0" "" "ios" "--clean-remote"
   fi
-  exit 0
-fi
-
-# ── Setup ─────────────────────────────────────────────────────────────────────
-if [ "$ACTION" = "setup" ]; then
-  echo "Setting up react-native-bspatch in this project..."
-  node "$SCRIPT_DIR/setup_project.js" --root "$ROOT"
   exit 0
 fi
 
