@@ -10,7 +10,7 @@
 ROOT_DIR=$(pwd)
 
 BASE_URL="${OTA_BASE_URL:-}"
-BASE_FOLDER="${OTA_FOLDER:-${6:-ota}}"
+BASE_FOLDER="${OTA_FOLDER:-ota}"
 APP_VERSION="$1"
 CHANNEL="$2"
 OTA_VERSION="$3"
@@ -26,7 +26,7 @@ fi
 
 # Validate
 if [[ -z "$APP_VERSION" || -z "$OTA_VERSION" ]]; then
-    echo "Usage: $0 <app_version> <channel> <ota_version> <bundle_path> [platform] [base_folder]"
+    echo "Usage: $0 <app_version> <channel> <ota_version> <bundle_path> [platform] [--clean-remote]"
     exit 1
 fi
 if [[ ! -f "$REGISTRY_FILE" ]]; then
@@ -67,11 +67,15 @@ if [[ -n "${OTA_R2_BUCKET:-}" ]]; then
 
     echo "      → Cloudflare R2: $OTA_R2_BUCKET/$RELEASE_PREFIX"
     if [ "$CLEAN_REMOTE" = true ]; then
-        echo "  Deleting $RELEASE_PREFIX/ ..."
+        echo "      Deleting $RELEASE_PREFIX/ ..."
         # ponytail: one ListObjectsV2 page (1000 keys); a release+channel holds far fewer
-        for KEY in $(r2 -f "$R2_URL?list-type=2&prefix=$RELEASE_PREFIX/" | grep -o '<Key>[^<]*</Key>' | sed 's/<[^>]*>//g'); do
-            r2 -f -X DELETE "$R2_URL/$KEY" -o /dev/null && echo "  ✗ $KEY"
+        LISTING=$(r2 -f "$R2_URL?list-type=2&prefix=$RELEASE_PREFIX/") || { echo "  ❌ Listing $RELEASE_PREFIX/ failed"; exit 1; }
+        DELETED=0
+        for KEY in $(echo "$LISTING" | grep -o '<Key>[^<]*</Key>' | sed 's/<[^>]*>//g'); do
+            r2 -f -X DELETE "$R2_URL/$KEY" -o /dev/null || { echo "  ❌ Delete failed: $KEY"; exit 1; }
+            echo "      ✗ $KEY"; DELETED=$((DELETED + 1))
         done
+        echo "      ✓ $DELETED object(s) deleted"
     else
         # Only this version's files: earlier bundles/patches are already uploaded and never change
         RELEASE_FILES=()
