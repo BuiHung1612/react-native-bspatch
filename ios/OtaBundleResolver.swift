@@ -10,7 +10,8 @@ import Foundation
  *
  * Lifecycle:
  *   1. Read metadata.json
- *   2. If lastLaunchSuccessful == false → rollback to previous version
+ *   2. If lastLaunchSuccessful == false → retry the same version up to maxLaunchAttempts,
+ *      then rollback to previous version
  *   3. Mark current launch as pending (lastLaunchSuccessful = false)
  *   4. Return the bundle path (or nil for IPA default)
  *   5. JS marks healthy after first render → lastLaunchSuccessful = true, verifiedVersion = current
@@ -34,6 +35,9 @@ public class OtaBundleResolver: NSObject {
     private static let metadataFile = "metadata.json"
     public static let defaultBaseVersion = 1
     private static let maxRollback = 3
+    /// Unverified launches allowed before rollback: a kill before first render (e.g. a
+    /// background reload, then swiped away) is indistinguishable from a crash
+    private static let maxLaunchAttempts = 3
     private static let maxRollbackIterations = 10 // Safety limit to prevent infinite loops
 
     /// Version this process booted (set by resolve), so markAsHealthy verifies only that one
@@ -90,6 +94,16 @@ public class OtaBundleResolver: NSObject {
             let verifiedVersion = metadata["verifiedVersion"] as? Int
 
             // ── Step 1: Crash detection & rollback ──────────────────────────
+            let launchAttempts = metadata["launchAttempts"] as? Int ?? 1
+            let currentBundle = otaDir.appendingPathComponent("v\(currentVersion)/main.jsbundle")
+            if !lastLaunchOk && currentVersion > baseVersion && launchAttempts < maxLaunchAttempts
+                && FileManager.default.fileExists(atPath: currentBundle.path) {
+                metadata["launchAttempts"] = launchAttempts + 1
+                writeMetadata(url: metadataURL, metadata: metadata)
+                NSLog("[OtaBundleResolver] Previous launch of V\(currentVersion) not verified → retry \(launchAttempts + 1)/\(maxLaunchAttempts)")
+                return currentBundle
+            }
+
             if !lastLaunchOk && currentVersion > baseVersion {
                 NSLog("[OtaBundleResolver] Previous launch failed! Rolling back from V\(currentVersion)...")
                 
@@ -118,6 +132,7 @@ public class OtaBundleResolver: NSObject {
                 // Mark this rollback attempt as pending
                 if newVersion != verifiedVersion {
                     metadata["lastLaunchSuccessful"] = false
+                    metadata["launchAttempts"] = 1
                     writeMetadata(url: metadataURL, metadata: metadata)
                 }
 
@@ -143,6 +158,7 @@ public class OtaBundleResolver: NSObject {
             // Mark launch as pending
             if currentVersion != verifiedVersion {
                 metadata["lastLaunchSuccessful"] = false
+                metadata["launchAttempts"] = 1
                 writeMetadata(url: metadataURL, metadata: metadata)
             }
 

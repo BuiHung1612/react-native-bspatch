@@ -273,13 +273,14 @@ The native `OtaBundleResolver` runs **before JS boots** on every cold start:
 
 ```
 1. Read metadata.json
-2. If lastLaunchSuccessful == false → rollback to previous version
+2. If lastLaunchSuccessful == false → retry (see 7) or rollback to previous version
 3. If currentVersion == baseAppVersion → use APK/IPA bundle
 4. Otherwise → load OTA bundle from ota/v{version}/index.android.bundle (or main.jsbundle)
 5. Unless this version is already verified: mark lastLaunchSuccessful = false (pending)
 6. JS boots → OtaProvider renders the app → marks the running version healthy + verified
-7. If that never happens (crash on load or first render) → next boot sees false → rolls back
-   and records the version in failedVersions so it is never re-applied
+7. If that never happens (crash on load or first render, or the app is killed first) → next
+   boot retries the same version, up to 3 unverified launches in total; after that it rolls
+   back and records the version in failedVersions so it is never re-applied
 8. A verified version is never rolled back later (a crash after it rendered is an app bug,
    and killing the app during a download must not discard a good bundle)
 ```

@@ -84,6 +84,8 @@ export type OtaMetadata = {
     failedVersions?: number[];
     /** Last version that launched and rendered successfully; the native resolver never rolls it back */
     verifiedVersion?: number;
+    /** Unverified launches of currentVersion so far; native rolls back once it reaches the limit (3) */
+    launchAttempts?: number;
 };
 
 export type OtaMetrics = {

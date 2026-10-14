@@ -16,7 +16,8 @@ import java.io.File
  *
  * Lifecycle:
  *   1. Read metadata.json
- *   2. If lastLaunchSuccessful == false → rollback to previous version
+ *   2. If lastLaunchSuccessful == false → retry the same version up to MAX_LAUNCH_ATTEMPTS,
+ *      then rollback to previous version
  *   3. Mark current launch as pending (lastLaunchSuccessful = false)
  *   4. Return the bundle path (or null for APK default)
  *   5. JS marks healthy after first render → lastLaunchSuccessful = true, verifiedVersion = current
@@ -35,6 +36,8 @@ object OtaBundleResolver {
     private const val METADATA_FILE = "metadata.json"
     private const val DEFAULT_BASE_VERSION = 1
     private const val MAX_ROLLBACK = 3
+    /** Unverified launches allowed before rollback: a kill before first render is indistinguishable from a crash */
+    private const val MAX_LAUNCH_ATTEMPTS = 3
 
     /** Version this process booted (set by resolve), so markAsHealthy verifies only that one */
     @Volatile private var launchedVersion: Int? = null
@@ -84,6 +87,16 @@ object OtaBundleResolver {
             val verifiedVersion = metadata.optInt("verifiedVersion", -1)
 
             // ── Step 1: Crash detection & rollback ──────────────────────────
+            val launchAttempts = metadata.optInt("launchAttempts", 1)
+            val currentBundle = File(File(otaDir, "v${currentVersion}"), "index.android.bundle")
+            if (!lastLaunchOk && currentVersion > baseVersion && launchAttempts < MAX_LAUNCH_ATTEMPTS &&
+                currentBundle.exists()) {
+                metadata.put("launchAttempts", launchAttempts + 1)
+                writeMetadata(metadataFile, metadata)
+                Log.w(TAG, "Previous launch of V$currentVersion not verified → retry ${launchAttempts + 1}/$MAX_LAUNCH_ATTEMPTS")
+                return currentBundle.absolutePath
+            }
+
             if (!lastLaunchOk && currentVersion > baseVersion) {
                 Log.w(TAG, "Previous launch failed! Rolling back from V$currentVersion...")
                 // Remember the crashing version so JS never re-applies it
@@ -113,6 +126,7 @@ object OtaBundleResolver {
                 // Mark this rollback attempt as pending
                 if (newVersion != verifiedVersion) {
                     metadata.put("lastLaunchSuccessful", false)
+                    metadata.put("launchAttempts", 1)
                     writeMetadata(metadataFile, metadata)
                 }
 
@@ -139,6 +153,7 @@ object OtaBundleResolver {
             // the next boot will see false and trigger rollback
             if (currentVersion != verifiedVersion) {
                 metadata.put("lastLaunchSuccessful", false)
+                metadata.put("launchAttempts", 1)
                 writeMetadata(metadataFile, metadata)
             }
 
