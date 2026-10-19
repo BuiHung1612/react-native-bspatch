@@ -61,7 +61,6 @@ export function OtaProvider({
 
   const appState = useRef(AppState.currentState);
   const isCheckingRef = useRef(false);
-  const pendingReloadRef = useRef(false);
   const bootstrapDone = useRef(false);
   /** Version the native resolver loaded for this JS session */
   const runningVersionRef = useRef(config.baseAppVersion);
@@ -150,21 +149,20 @@ export function OtaProvider({
   /**
    * Exposed method for manual trigger
    */
-  const applyUpdate = useCallback(async () => {
+  const applyVersion = useCallback(async (targetVersion: number) => {
     if (!isDebugUpdateEnabled) {
       setPendingCount(0);
       setStatus(OtaStatus.UP_TO_DATE);
       setMessage('OTA updates are disabled while running a debug build.');
       return;
     }
-    await executeApplyUpdate(patches, currentVersion, latestVersion);
-  }, [
-    currentVersion,
-    executeApplyUpdate,
-    isDebugUpdateEnabled,
-    latestVersion,
-    patches,
-  ]);
+    await executeApplyUpdate(patches, currentVersion, targetVersion);
+  }, [currentVersion, executeApplyUpdate, isDebugUpdateEnabled, patches]);
+
+  const applyUpdate = useCallback(
+    () => applyVersion(latestVersion),
+    [applyVersion, latestVersion],
+  );
 
   const downloadBackgroundUpdate = useCallback(
     async (
@@ -183,7 +181,6 @@ export function OtaProvider({
           (s: OtaStatus, msg: string, m?: OtaMetrics) => {
             if (s === OtaStatus.SUCCESS) {
               setIsUpdateReady(true);
-              pendingReloadRef.current = true;
               setStatus(OtaStatus.UP_TO_DATE);
               setMessage(`Update V${targetV} ready for next launch`);
               if (m) setMetrics(m);
@@ -332,20 +329,15 @@ export function OtaProvider({
   }, []);
 
   /**
-   * AppState listener for ON_APP_FOREGROUND mode and silent background reload
+   * AppState listener for ON_APP_FOREGROUND mode.
+   * A downloaded update is not reloaded on background: iOS suspends JS before the
+   * first render, so the native resolver counts the launch as failed and rolls it back.
+   * metadata already points at the new version, so the next cold start applies it
    */
   useEffect(() => {
     const subscription = AppState.addEventListener(
       'change',
       (nextAppState: AppStateStatus) => {
-        // When going into background: if update is downloaded and ready, reload bundle silently
-        // Only 'background', not 'inactive' (iOS fires it for Control Center, calls,
-        // Face ID). Any previous state: iOS goes active → inactive → background.
-        if (nextAppState === 'background' && pendingReloadRef.current) {
-          pendingReloadRef.current = false;
-          NativeBsPatch.reloadBundle();
-        }
-
         if (
           appState.current.match(/inactive|background/) &&
           nextAppState === 'active' &&
@@ -403,6 +395,7 @@ export function OtaProvider({
     metrics,
     isUpdateReady,
     applyUpdate,
+    applyVersion,
     resetToFactory,
     markAsHealthy,
     checkUpdate: checkUpdates,
@@ -418,6 +411,7 @@ export function OtaProvider({
     metrics,
     isUpdateReady,
     applyUpdate,
+    applyVersion,
     resetToFactory,
     markAsHealthy,
     checkUpdates,

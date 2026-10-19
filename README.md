@@ -7,7 +7,7 @@ Premium OTA update solution for React Native using **TurboModules** + **bsdiff b
 - **Binary delta patches** — after the first OTA, clients download only the diff from the OTA bundle they already run (typically a few hundred KB)
 - **POSIX `mmap()` Zero-Copy Engine** — patches directly in mapped pages, saving ~85–90% heap RAM
 - **ARM NEON SIMD Fast-Path** — vectorized diff patching via Clang SIMD
-- **Silent Background Updates** — download and apply updates completely in the background; smoothly activates on next launch or app backgrounding
+- **Silent Background Updates** — download and apply updates completely in the background; activates on next cold start or when you call `reloadBundle()`
 - **Auto Native Version Detection** — auto-detects `versionName` (Android) and `CFBundleShortVersionString` (iOS); no manual version sync in JS
 - **Asymmetric Cryptography (RSA & ECDSA)** — sign patches on server/CI with Private Key; client verifies with Public Key (zero secret leakage)
 - **Shorebird-style CLI** — `patch android|ios`, release version read from the native project and confirmed with one Enter
@@ -147,7 +147,7 @@ type OtaConfig = {
    * - MANUAL: call checkUpdate() / applyUpdate() manually
    * - ON_APP_START: check and apply automatically on cold start
    * - ON_APP_FOREGROUND: check when app returns to foreground
-   * - BACKGROUND_DOWNLOAD: download and patch in background; applies on next launch or app backgrounding
+   * - BACKGROUND_DOWNLOAD: download and patch in background; applies on next cold start or reloadBundle()
    */
   updateMode?: OtaUpdateMode;
 
@@ -192,7 +192,7 @@ enum OtaUpdateMode {
   MANUAL              = 'MANUAL',              // No auto behavior
   ON_APP_START        = 'ON_APP_START',        // Check + apply on every cold start
   ON_APP_FOREGROUND   = 'ON_APP_FOREGROUND',   // Check when app returns to foreground
-  BACKGROUND_DOWNLOAD = 'BACKGROUND_DOWNLOAD', // Silent download; applies on next start or app backgrounding
+  BACKGROUND_DOWNLOAD = 'BACKGROUND_DOWNLOAD', // Silent download; applies on next cold start or reloadBundle()
 }
 ```
 
@@ -326,6 +326,7 @@ const {
   metrics,          // OtaMetrics | null — timing/size data after update
   isUpdateReady,    // True if background update is downloaded and ready
   applyUpdate,      // () => Promise<void> — download and apply update immediately
+  applyVersion,     // (version) => Promise<void> — download and apply a specific version from the manifest
   resetToFactory,   // () => Promise<void> — wipe OTA state, reload APK/IPA
   markAsHealthy,    // () => Promise<void> — manually mark launch OK
   checkUpdate,      // () => Promise<void> — manual update check

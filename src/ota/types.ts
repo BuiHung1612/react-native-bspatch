@@ -164,6 +164,8 @@ export type OtaState = {
     /** True if a background update has been downloaded and prepared silently */
     isUpdateReady: boolean;
     applyUpdate: () => Promise<void>;
+    /** Installs and reloads `version` from the last checked manifest (full bundle, or a patch from the current version) */
+    applyVersion: (version: number) => Promise<void>;
     resetToFactory: () => Promise<void>;
     markAsHealthy: () => Promise<void>;
     checkUpdate: () => Promise<void>;
