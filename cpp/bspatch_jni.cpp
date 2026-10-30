@@ -38,4 +38,22 @@ Java_vn_reactnativebspatch_BsPatchModule_nativeApplyPatch(
 
     return (result == 0) ? JNI_TRUE : JNI_FALSE;
 }
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_vn_reactnativebspatch_BsPatchModule_nativeDecompressBz2(
+        JNIEnv* env,
+        jobject /* this */,
+        jstring srcPath,
+        jstring destPath) {
+
+    const char *src_file = env->GetStringUTFChars(srcPath, 0);
+    const char *dest_file = env->GetStringUTFChars(destPath, 0);
+
+    int result = decompress_bz2(src_file, dest_file);
+
+    env->ReleaseStringUTFChars(srcPath, src_file);
+    env->ReleaseStringUTFChars(destPath, dest_file);
+
+    return (result == 0) ? JNI_TRUE : JNI_FALSE;
+}
 #endif

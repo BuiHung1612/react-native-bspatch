@@ -31,19 +31,25 @@ function findFile(baseDir, predicate, maxDepth = 10) {
     return results;
 }
 
+// --quiet (run by every `patch`): print only what changed, one line each
+const QUIET = process.argv.includes('--quiet');
+const log = (...args) => {
+    if (!QUIET) console.log(...args);
+};
+
 function patchFile(filePath, label, patchFn) {
     if (!fs.existsSync(filePath)) {
-        console.log(`  ⚠  ${label}: file not found at ${filePath}`);
+        log(`  ⚠  ${label}: file not found at ${filePath}`);
         return false;
     }
     const original = fs.readFileSync(filePath, 'utf8');
     const patched = patchFn(original);
     if (patched === original) {
-        console.log(`  ✓  ${label}: already set up (skipped)`);
+        log(`  ✓  ${label}: already set up (skipped)`);
         return false;
     }
     fs.writeFileSync(filePath, patched, 'utf8');
-    console.log(`  ✓  ${label}: patched`);
+    console.log(QUIET ? label : `  ✓  ${label}: patched`);
     return true;
 }
 
@@ -101,6 +107,25 @@ function removePbxprojSnippet(content) {
     const idx = content.indexOf(LEGACY_XCODE_MARKER);
     if (idx === -1) return content;
     return content.slice(0, idx) + content.slice(content.indexOf('";', idx));
+}
+
+// Runs tools/ios_fingerprint.sh at the end of RN's "Bundle React Native code and images"
+// phase (after Copy Resources, with NODE_BINARY from .xcode.env): stamps the native
+// runtime fingerprint into the .app so OTAs only install on a matching binary.
+const FINGERPRINT_MARKER = '# [react-native-bspatch] runtime fingerprint';
+const FINGERPRINT_STEP =
+    `\\n${FINGERPRINT_MARKER}\\n` +
+    '/bin/sh \\"$REACT_NATIVE_PATH/scripts/xcode/with-environment.sh\\" ' +
+    '\\"$REACT_NATIVE_PATH/../react-native-bspatch/tools/ios_fingerprint.sh\\"\\n';
+
+function addPbxprojFingerprint(content) {
+    if (content.includes(FINGERPRINT_MARKER)) return content;
+    const phase = content.indexOf('/* Bundle React Native code and images */ = {');
+    if (phase === -1) return content;
+    const script = content.indexOf('shellScript = "', phase);
+    const end = content.indexOf('";', script);
+    if (script === -1 || end === -1) return content;
+    return content.slice(0, end) + FINGERPRINT_STEP + content.slice(end);
 }
 
 // ── iOS: AppDelegate.swift ────────────────────────────────────────────────────
@@ -209,28 +234,29 @@ function main() {
     const rootIdx = args.indexOf('--root');
     const ROOT = rootIdx !== -1 ? path.resolve(args[rootIdx + 1]) : process.cwd();
 
-    console.log('\n=== react-native-bspatch Setup ===');
-    console.log(`  Project root: ${ROOT}`);
+    log('\n=== react-native-bspatch Setup ===');
+    log(`  Project root: ${ROOT}`);
 
     const IOS_DIR = path.join(ROOT, 'ios');
     const ANDROID_DIR = path.join(ROOT, 'android');
 
     // ── iOS ──
-    console.log('\n[iOS]');
+    log('\n[iOS]');
 
     // project.pbxproj (ignore CocoaPods project file)
     const pbxprojFiles = findFile(IOS_DIR, (name, fullPath) => name === 'project.pbxproj' && !fullPath.includes('Pods'));
     if (pbxprojFiles.length === 0) {
-        console.log('  ⚠  No project.pbxproj found. Is this an iOS project?');
+        log('  ⚠  No project.pbxproj found. Is this an iOS project?');
     } else {
         const pbxproj = pbxprojFiles[0];
         patchFile(pbxproj, 'project.pbxproj (remove legacy bundle capture)', removePbxprojSnippet);
+        patchFile(pbxproj, 'project.pbxproj (runtime fingerprint build step)', addPbxprojFingerprint);
     }
 
     // AppDelegate.swift
     const appDelegateFiles = findFile(IOS_DIR, (name) => name === 'AppDelegate.swift');
     if (appDelegateFiles.length === 0) {
-        console.log('  ⚠  No AppDelegate.swift found.');
+        log('  ⚠  No AppDelegate.swift found.');
     } else {
         patchFile(appDelegateFiles[0], 'AppDelegate.swift', patchAppDelegate);
     }
@@ -239,21 +265,21 @@ function main() {
     const outputDir = path.join(IOS_DIR, 'output');
     if (!fs.existsSync(outputDir)) {
         fs.mkdirSync(outputDir, { recursive: true });
-        console.log('  ✓  Created ios/output/ directory');
+        log('  ✓  Created ios/output/ directory');
     }
 
     // ── Android ──
-    console.log('\n[Android]');
+    log('\n[Android]');
     const mainAppFiles = findFile(ANDROID_DIR, (name) => name === 'MainApplication.kt');
     if (mainAppFiles.length === 0) {
-        console.log('  ⚠  No MainApplication.kt found. Is this an Android project?');
+        log('  ⚠  No MainApplication.kt found. Is this an Android project?');
     } else {
         patchFile(mainAppFiles[0], 'MainApplication.kt', patchMainApplication);
     }
 
     const appGradleFiles = findFile(path.join(ANDROID_DIR, 'app'), (name) => name === 'build.gradle');
     if (appGradleFiles.length === 0) {
-        console.log('  ⚠  No android/app/build.gradle found.');
+        log('  ⚠  No android/app/build.gradle found.');
     } else {
         patchFile(appGradleFiles[0], 'android/app/build.gradle (remove legacy bundle capture)', removeAppBuildGradleSnippet);
     }
@@ -262,11 +288,11 @@ function main() {
     const androidOutputDir = path.join(ANDROID_DIR, 'output');
     if (!fs.existsSync(androidOutputDir)) {
         fs.mkdirSync(androidOutputDir, { recursive: true });
-        console.log('  ✓  Created android/output/ directory');
+        log('  ✓  Created android/output/ directory');
     }
 
-    console.log('\n=== Setup Complete ===');
-    console.log('Next: release the app to the store (v1), then publish OTA updates with: npx react-native-bspatch\n');
+    log('\n=== Setup Complete ===');
+    log('Next: release the app to the store (v1), then publish OTA updates with: npx react-native-bspatch\n');
 }
 
 main();

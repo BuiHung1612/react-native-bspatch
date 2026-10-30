@@ -18,6 +18,26 @@ def reactNativeArchitectures() {
   return value ? value.split(",") : ["armeabi-v7a", "x86", "x86_64", "arm64-v8a"]
 }
 
+// The app's native runtime fingerprint (tools/fingerprint.js), read by getRuntimeFingerprint():
+// an OTA only installs on a binary with the same one. Never fails the build, but a "" build
+// takes no OTA with a fingerprint: fix node/the script and rebuild.
+def runtimeFingerprint() {
+  def appRoot = rootProject.projectDir.parentFile
+  try {
+    def result = providers.exec {
+      commandLine "node", file("../tools/fingerprint.js").absolutePath, appRoot.absolutePath, "android"
+      workingDir appRoot
+      ignoreExitValue = true
+    }
+    def out = result.standardOutput.asText.get().trim()
+    if (result.result.get().exitValue == 0 && out) return out
+    logger.warn("react-native-bspatch: runtime fingerprint failed (${result.standardError.asText.get().trim()}): this build will not accept OTA updates")
+  } catch (Exception e) {
+    logger.warn("react-native-bspatch: runtime fingerprint failed (${e.message}): this build will not accept OTA updates")
+  }
+  return ""
+}
+
 android {
   namespace "vn.reactnativebspatch"
 
@@ -26,6 +46,7 @@ android {
   defaultConfig {
     minSdkVersion getExtOrIntegerDefault("minSdkVersion")
     targetSdkVersion getExtOrIntegerDefault("targetSdkVersion")
+    resValue "string", "bspatch_runtime_fingerprint", runtimeFingerprint()
     externalNativeBuild {
       cmake {
         cppFlags "-Wall -fstack-protector-all"
@@ -38,6 +59,10 @@ android {
     cmake {
       path "../cpp/CMakeLists.txt"
     }
+  }
+
+  buildFeatures {
+    resValues true
   }
 
   buildTypes {

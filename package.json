@@ -62,7 +62,8 @@
     "bump-version": "node ./tools/bump_version.js",
     "generate-keys": "node ./tools/generate_keys.js",
     "typecheck": "tsc --noEmit",
-    "prepare": "bob build"
+    "prepare": "bob build",
+    "test": "node tools/__tests__/entry_signature.test.js && node tools/__tests__/signing_key.test.js && node tools/__tests__/eligibility.test.js"
   },
   "devDependencies": {
     "@types/react": "^19.2.0",

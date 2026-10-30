@@ -8,10 +8,16 @@
 # Clients on the store build download the full bundle once, then patch.
 #
 # Usage (npx react-native-bspatch ...):
-#   patch [android|ios] [--flavor staging] [--release-version 1.0.4] [-y]
-#                               → build + publish the next OTA (both platforms if omitted)
+#   patch [android|ios] [--flavor staging] [--release-version 1.0.4] [-m "notes"] [-y] [--reset-cache]
+#         [--dry-run] [--json]  → build + publish the next OTA (both platforms if omitted)
+#   promote --from <flavor> [--source-version N] --flavor <target>
+#                               → publish another flavor's bundle here, no build
+#   rollback --to N             → publish vN's bundle again as the next version, no build
+#   status | doctor             → what's live for this release / check the whole setup
+#   disable N | enable N | rollout N <percent> | mandatory N [--off] | qa N --ids a,b
+#                               → release controls on the live version (registry only)
 #   reset [--flavor ...] [--push] → wipe this release's OTAs
-#   setup                       → wire OtaBundleResolver into AppDelegate / MainApplication
+#   setup                       → wire OtaBundleResolver + runtime fingerprint into the native project
 #   version <x.y.z>             → set the native app version (package.json, Gradle, Xcode)
 # The release version is read from the native project and confirmed by a prompt (Enter keeps it).
 # ─────────────────────────────────────────────────────────────────────────────
@@ -48,7 +54,19 @@ while [[ "$#" -gt 0 ]]; do
     --release-version|--app-version) APP_VERSION_ARG="$2"; shift ;;
     -y|--yes|--non-interactive) CONFIRM_VERSION=false ;;
     --push) PUSH_REMOTE=true ;;
+    --reset-cache) RESET_CACHE=true ;;
+    -m|--message|--notes) export BSPATCH_NOTES="$2"; NOTES_GIVEN=true; shift ;;
+    --dry-run) DRY_RUN=true ;;
+    --json) JSON_OUT=true ;;
+    --from) SOURCE_FLAVOR="$2"; shift ;;
+    --source-version|--to) SOURCE_VERSION="$2"; shift ;;
+    --ids) ADMIN_IDS="$2"; shift ;;
+    --off) ADMIN_OFF=true ;;
     patch) ACTION="ota" ;;
+    promote) ACTION="ota"; PUBLISH_MODE="promote" ;;
+    rollback) ACTION="ota"; PUBLISH_MODE="rollback" ;;
+    status|doctor|disable|enable|rollout|mandatory|qa) ACTION="admin"; ADMIN_CMD="$1" ;;
+    [0-9]*) ADMIN_ARGS+=("$1") ;;
     android|ios) PLATFORM_ARG="$1" ;;
     reset|setup) ACTION="$1" ;;
     base|seed|apk|ipa|--apk|--ipa|*.apk|*.aab|*.ipa)
@@ -60,6 +78,17 @@ while [[ "$#" -gt 0 ]]; do
   esac
   shift
 done
+# promote: another flavor's latest (or --source-version) bundle; rollback: this flavor's vN
+if [ "$PUBLISH_MODE" = "promote" ] && [ -z "$SOURCE_FLAVOR" ]; then
+  echo "❌ promote needs --from <flavor> (e.g. promote --from staging --flavor production)"; exit 1
+fi
+if [ "$PUBLISH_MODE" = "rollback" ]; then
+  if [ -z "$SOURCE_VERSION" ]; then echo "❌ rollback needs --to <version> (see 'status')"; exit 1; fi
+  SOURCE_FLAVOR="$FLAVOR"
+fi
+SOURCE_FLAVOR=$(echo "$SOURCE_FLAVOR" | tr '[:upper:]' '[:lower:]')
+case "$SOURCE_FLAVOR" in dev) SOURCE_FLAVOR="development" ;; prod) SOURCE_FLAVOR="production" ;; esac
+
 # Configuration
 FLAVOR_LOWER=$(echo "$FLAVOR" | tr '[:upper:]' '[:lower:]')
 if [ "$FLAVOR_LOWER" = "dev" ]; then FLAVOR_LOWER="development"; fi
@@ -67,19 +96,27 @@ if [ "$FLAVOR_LOWER" = "prod" ]; then FLAVOR_LOWER="production"; fi
 
 # ── Output (exported: upload_ota.sh prints in the same layout) ────────────────
 if [ -t 1 ]; then
-  BOLD=$'\033[1m'; DIM=$'\033[2m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; RESET=$'\033[0m'
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[31m'; GREEN=$'\033[38;5;84m'; YELLOW=$'\033[38;5;221m'
+  CYAN=$'\033[38;5;81m'; PINK=$'\033[38;5;213m'; RESET=$'\033[0m'
 else
-  BOLD=""; DIM=""; GREEN=""; YELLOW=""; RESET=""
+  BOLD=""; DIM=""; RED=""; GREEN=""; YELLOW=""; CYAN=""; PINK=""; RESET=""
 fi
 # Pad to N characters, not bytes ("→" is 3 bytes, printf %-Ns counts bytes)
 padr() { local LC_ALL=en_US.UTF-8; printf "%s%*s" "$1" $(( $2 > ${#1} ? $2 - ${#1} : 0 )) ""; }
-info() { printf "  ${DIM}%s${RESET} %s\n" "$(padr "$1" 9)" "$2"; }   # "  storage   R2 bucket"
-sub() { printf "        %s %s\n" "$(padr "$1" 18)" "$2"; }          # detail under a step
-export BOLD DIM GREEN YELLOW RESET
-export -f padr info sub
+info() { printf "  ${CYAN}%s${RESET} %s\n" "$(padr "$1" 9)" "$2"; }   # "  storage   R2 bucket"
+badge() { # <NAME> → " NAME " on a colored background (plain without a terminal)
+  local C
+  case "$1" in
+    BUILD) C="97;48;5;33" ;; DIFF) C="97;48;5;129" ;; SHIP) C="30;48;5;44" ;; DONE) C="30;48;5;42" ;; FAIL) C="97;48;5;160" ;;
+    IOS) C="97;48;5;240" ;; ANDROID) C="30;48;5;113" ;; *) C="97;48;5;57" ;;
+  esac
+  if [ -n "$RESET" ]; then printf "\033[1;%sm %-5s \033[0m" "$C" "$1"; else printf " %-5s " "$1"; fi
+}
+export BOLD DIM RED GREEN YELLOW CYAN PINK RESET
 if [ "$ACTION" != "setup" ]; then
   if [ "$ACTION" = "ota" ]; then TITLE="patch ${PLATFORM_ARG:-android + ios}"; else TITLE="$ACTION"; fi
-  printf "\n${BOLD}react-native-bspatch${RESET} ${DIM}%s · %s${RESET}\n" "$TITLE" "$FLAVOR_LOWER"
+  PKG_VERSION=$(node -p "require(process.argv[1]).version" "$SCRIPT_DIR/../package.json" 2>/dev/null)
+  printf "\n%s  ${BOLD}%s${RESET} ${DIM}·${RESET} ${PINK}%s${RESET} ${DIM}· v%s${RESET}\n\n" "$(badge BSPATCH)" "$TITLE" "$FLAVOR_LOWER" "$PKG_VERSION"
 fi
 
 # ── Environment ──────────────────────────────────────────────────────────────
@@ -121,19 +158,23 @@ if [ "$ACTION" = "setup" ]; then
 fi
 
 # ── Build environment ──────────────────────────────────────────────────────
-if [ "$ACTION" = "ota" ]; then
+if [ "$ACTION" = "ota" ] && [ -z "$SOURCE_FLAVOR" ]; then
   # Kill any existing Metro processes to prevent file locks
   pkill -f "react-native/local-cli/cli.js" || true
   pkill -f "metro-config/src/index.js" || true
 
-  # Manually clear metro cache if it exists (robust vs ENOTEMPTY error)
+  # A warm cache saves most of the bundle time. Metro's cache key doesn't cover .env files,
+  # so a babel plugin inlining env values would reuse another flavor's output: clear the
+  # cache when this flavor's env file changed since the last build, or on --reset-cache.
   METRO_CACHE_DIR=$(node -e "console.log(require('os').tmpdir())")/metro-cache
-  if [ -d "$METRO_CACHE_DIR" ]; then
-    rm -rf "$METRO_CACHE_DIR"
+  METRO_KEY="$FLAVOR_LOWER $(shasum -a 256 < "$ROOT/.env.$FLAVOR_LOWER" | cut -c1-16)"
+  if [ "$RESET_CACHE" = true ] || [ "$(cat "$METRO_CACHE_DIR/.bspatch-env" 2>/dev/null)" != "$METRO_KEY" ]; then
+    rm -rf "$METRO_CACHE_DIR" # by hand: robust vs ENOTEMPTY
     info metro "stopped · cache cleared"
   else
-    info metro "stopped"
+    info metro "stopped · cache reused ${DIM}(--reset-cache to clear)${RESET}"
   fi
+  mkdir -p "$METRO_CACHE_DIR" && echo "$METRO_KEY" > "$METRO_CACHE_DIR/.bspatch-env"
 fi
 
 mkdir -p "$ROOT/android/output"
@@ -147,35 +188,17 @@ if [ "$ACTION" != "setup" ]; then
     BASE_URL="${OTA_BASE_URL:-}"
     BASE_FOLDER="${OTA_FOLDER:-ota}"
 
-    info storage "${OTA_R2_BUCKET:+R2 $OTA_R2_BUCKET → }$BASE_URL/$BASE_FOLDER"
-
-    if [[ -n "${OTA_R2_BUCKET:-}" ]]; then
-        R2_URL="https://${OTA_R2_ACCOUNT_ID:?set OTA_R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${OTA_R2_BUCKET}"
-        r2() { curl -sS --aws-sigv4 "aws:amz:auto:s3" --user "${OTA_R2_ACCESS_KEY_ID:?}:${OTA_R2_SECRET_ACCESS_KEY:?}" "$@"; }
-        # S3 API, not the public URL: always the latest object, no CDN cache
-        API_HTTP=$(r2 -o "$REGISTRY_SHARED.tmp" -w "%{http_code}" "$R2_URL/$BASE_FOLDER/ota_registry.json" || echo 0)
-    else
-        if [[ "$BASE_URL" != "https://raw.githubusercontent.com/"* ]]; then
-            echo "  ❌ Set OTA_R2_* (Cloudflare R2) or OTA_BASE_URL=https://raw.githubusercontent.com/<owner>/<repo>/<branch>"
-            exit 1
-        fi
-        CLEAN_URL="${BASE_URL#https://raw.githubusercontent.com/}"
-        GH_OWNER=$(echo "$CLEAN_URL" | cut -d'/' -f1)
-        GH_REPO=$(echo  "$CLEAN_URL" | cut -d'/' -f2)
-        GH_BRANCH=$(echo "$CLEAN_URL" | cut -d'/' -f3)
-        if [[ -z "$GH_BRANCH" ]]; then GH_BRANCH="main"; fi
-
-        # Contents API (not the raw CDN) always returns the latest commit; the raw
-        # media type has no 1 MB limit and needs no base64 decoding.
-        GH_API_TOKEN="$(gh auth token 2>/dev/null || true)"
-        GH_API_TOKEN="${GH_API_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
-        GH_API_AUTH=()
-        if [[ -n "$GH_API_TOKEN" ]]; then GH_API_AUTH=(-H "Authorization: Bearer $GH_API_TOKEN"); fi
-
-        API_HTTP=$(curl -s -o "$REGISTRY_SHARED.tmp" -w "%{http_code}" "${GH_API_AUTH[@]}" \
-            -H "Accept: application/vnd.github.raw" \
-            "https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/contents/${BASE_FOLDER}/ota_registry.json?ref=${GH_BRANCH}" || echo 0)
+    # Cloudflare R2 is the only storage for now (until custom servers get their own support)
+    if [[ -z "${OTA_R2_BUCKET:-}" ]]; then
+      echo "  ❌ OTA_R2_BUCKET not set: add OTA_R2_ACCOUNT_ID / OTA_R2_BUCKET / OTA_R2_ACCESS_KEY_ID / OTA_R2_SECRET_ACCESS_KEY to .env.ota"
+      exit 1
     fi
+    info storage "R2 $OTA_R2_BUCKET → $BASE_URL/$BASE_FOLDER"
+
+    R2_URL="https://${OTA_R2_ACCOUNT_ID:?set OTA_R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${OTA_R2_BUCKET}"
+    r2() { curl -sS --aws-sigv4 "aws:amz:auto:s3" --user "${OTA_R2_ACCESS_KEY_ID:?}:${OTA_R2_SECRET_ACCESS_KEY:?}" "$@"; }
+    # S3 API, not the public URL: always the latest object, no CDN cache
+    API_HTTP=$(r2 -o "$REGISTRY_SHARED.tmp" -w "%{http_code}" "$R2_URL/$BASE_FOLDER/ota_registry.json" || echo 0)
 
     if [[ "$API_HTTP" == "200" ]] && node -e "JSON.parse(require('fs').readFileSync(process.argv[1],'utf8'))" "$REGISTRY_SHARED.tmp" 2>/dev/null; then
         mv "$REGISTRY_SHARED.tmp" "$REGISTRY_SHARED"
@@ -195,20 +218,12 @@ if [ "$ACTION" != "setup" ]; then
 fi
 
 # ── Helper: Download from remote storage ───────────────────────────────────────
-download_remote() {
-  local REMOTE_PATH="$1"
-  local DEST="$2"
-  local OK=0
-  if [[ -n "${OTA_R2_BUCKET:-}" ]]; then
-    r2 -f -o "$DEST.tmp" "$R2_URL/$REMOTE_PATH" 2>/dev/null || OK=1
+download_remote() { # <remote path> <dest>
+  # --compressed: bundles are stored gzip Content-Encoded
+  if r2 -f --compressed -o "$2.tmp" "$R2_URL/$1" 2>/dev/null; then
+    mv "$2.tmp" "$2"
   else
-    # no-cache + timestamp query bypasses the GitHub CDN 5-min cache
-    curl -s -f -H "Cache-Control: no-cache" -o "$DEST.tmp" "$BASE_URL/$REMOTE_PATH?cb=$(date +%s)" || OK=1
-  fi
-  if [ $OK -eq 0 ]; then
-    mv "$DEST.tmp" "$DEST"
-  else
-    rm -f "$DEST.tmp"
+    rm -f "$2.tmp"
     return 1
   fi
 }
@@ -218,42 +233,102 @@ sha256() {
   shasum -a 256 "$1" | awk '{print $1}'
 }
 
-# ── Progress helpers (exported: upload_ota.sh uses them too) ──────────────────
+# ── Progress ───────────────────────────────────────────────────────────────────
+#  BUILD   Bundle JS   5.8 MB     ██████░░░░░░░░  18s
+#  BUILD   Hermes      ⠹ 12s · <last log line>         ← running (terminal only, redrawn in place)
+# Bars are each step's share of the platform's total time, so finished rows show an empty
+# bar and timeline_redraw fills them in after the last step.
 human_size() {
   awk -v b="$1" 'BEGIN { split("B KB MB GB", u); i = 1; while (b >= 1024 && i < 4) { b /= 1024; i++ }
     printf (i == 1 ? "%d %s" : "%.1f %s"), b, u[i] }'
 }
 file_size() { wc -c < "$1" | tr -d ' '; }
-STEP=0
-STEP_TOTAL=5
-# One line per step: "  [3/5] Assets           59 files · 1s". In a terminal the label shows
-# while the step runs and step_progress updates it in place.
-step_line() { printf "  [%d/%d] %-16s %s" "$STEP" "$STEP_TOTAL" "$STEP_LABEL" "$1"; }
-step() {
-  STEP=$((STEP + 1)); STEP_START=$SECONDS; STEP_LABEL="$1"
-  if [ -t 1 ]; then step_line "${DIM}…${RESET}"; fi
+row() { # <badge> <label> <detail> <time> [bar] [time color]
+  printf " %s  %s ${BOLD}%s${RESET} %s${6:-$DIM}%4s${RESET}\n" "$(badge "$1")" "$(padr "$2" 11)" "$(padr "$3" 12)" "${5:+$5 }" "$4"
 }
-step_progress() { if [ -t 1 ]; then printf "\r\033[K"; step_line "${DIM}$1${RESET}"; fi; }
-step_done() {
+bar() { # <secs> <total secs> <badge>
+  local W=14 N=0 I C
+  if [ "$2" -gt 0 ]; then N=$(( ($1 * W + $2 - 1) / $2 )); fi
+  if [ "$N" -gt "$W" ]; then N=$W; fi
+  case "$3" in BUILD) C=75 ;; DIFF) C=177 ;; *) C=87 ;; esac
+  if [ -n "$RESET" ]; then printf "\033[38;5;%sm" "$C"; fi
+  for (( I = 0; I < N; I++ )); do printf "█"; done
+  printf "%s" "$RESET$DIM"
+  for (( I = N; I < W; I++ )); do printf "░"; done
+  printf "%s" "$RESET"
+}
+ROWS=() # "badge|label|detail|secs" of the current platform's finished steps
+step() { # <label> <badge>
+  STEP_LABEL="$1"; STEP_BADGE="$2"; STEP_START=$(date +%s)
+  export STEP_LABEL STEP_BADGE STEP_START
+  step_progress
+}
+step_progress() { # [text]
+  [ -t 1 ] || return 0
+  local F=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+  SPIN=$(( (${SPIN:-0} + 1) % 10 ))
+  printf "\r\033[K %s  %s ${CYAN}%s${RESET} ${DIM}%s${RESET}" "$(badge "$STEP_BADGE")" "$(padr "$STEP_LABEL" 11)" "${F[$SPIN]}" "$1"
+}
+step_done() { # <detail>
+  local SECS=$(( $(date +%s) - STEP_START ))
+  ROWS+=("$STEP_BADGE|$STEP_LABEL|$1|$SECS")
+  if [ -t 1 ]; then printf "\r\033[K"; row "$STEP_BADGE" "$STEP_LABEL" "$1" "${SECS}s" "$(bar 0 0 "$STEP_BADGE")"
+  else row "$STEP_BADGE" "$STEP_LABEL" "$1" "${SECS}s"; fi
+}
+step_fail() { # [message]; error details go below
   if [ -t 1 ]; then printf "\r\033[K"; fi
-  step_line "$1 ${DIM}· $((SECONDS - STEP_START))s${RESET}"; printf "\n"
+  printf " %s  %s ${RED}%s${RESET}\n" "$(badge FAIL)" "$(padr "$STEP_LABEL" 11)" "${1:-failed}"
 }
-step_fail() { if [ -t 1 ]; then printf "\n"; fi; }   # leave the step line before error output
-# run_logged LOG cmd… — run cmd with output to LOG; in a terminal, tick elapsed time + the log's last line
+timeline_redraw() { # rewrites the ROWS lines above the cursor with filled bars
+  [ -t 1 ] && [ ${#ROWS[@]} -gt 0 ] || return 0
+  local R B L D S TOTAL=0 MAX=0
+  for R in "${ROWS[@]}"; do
+    TOTAL=$(( TOTAL + ${R##*|} )); if [ "${R##*|}" -gt "$MAX" ]; then MAX=${R##*|}; fi
+  done
+  printf "\033[%dA" ${#ROWS[@]}
+  for R in "${ROWS[@]}"; do
+    IFS='|' read -r B L D S <<< "$R"
+    printf "\r\033[K"
+    # the slowest step stands out
+    if [ "$S" -eq "$MAX" ] && [ "$MAX" -gt 0 ]; then row "$B" "$L" "$D" "${S}s" "$(bar "$S" "$TOTAL" "$B")" "$BOLD$YELLOW"
+    else row "$B" "$L" "$D" "${S}s" "$(bar "$S" "$TOTAL" "$B")"; fi
+  done
+}
+detail() { printf "%10s%s %s\n" "" "$(padr "$1" 9)" "$2"; } # line under a step
+vis_len() { # characters on screen: color codes don't count
+  local LC_ALL=en_US.UTF-8 S
+  S=$(printf "%s" "$1" | sed $'s/\033\\[[0-9;]*m//g')
+  printf "%s" "${#S}"
+}
+box() { # <line>… — rounded box sized to the widest line, border shading blue → green
+  local L W=0 N I EDGE="" PAL=(39 38 44 43 49 48 84 83 119 118)
+  for L in "$@"; do N=$(vis_len "$L"); if [ "$N" -gt "$W" ]; then W=$N; fi; done
+  local A="" Z=""; if [ -n "$RESET" ]; then A=$'\033[38;5;39m'; Z=$'\033[38;5;118m'; fi
+  for (( I = 0; I < W + 4; I++ )); do
+    if [ -n "$RESET" ]; then EDGE+=$'\033[38;5;'"${PAL[$(( I * 10 / (W + 4) ))]}m"; fi
+    EDGE+="─"
+  done
+  printf " ${A}╭%s${Z}╮${RESET}\n" "$EDGE"
+  for L in "$@"; do printf " ${A}│${RESET}  %s%*s  ${Z}│${RESET}\n" "$L" $((W - $(vis_len "$L"))) ""; done
+  printf " ${A}╰%s${Z}╯${RESET}\n" "$EDGE"
+}
+# [RUN_NOTE=…] run_logged LOG cmd… — output to LOG; in a terminal, spin with elapsed time + the log's last line
 run_logged() {
   local LOG="$1"; shift
   "$@" > "$LOG" 2>&1 &
   local PID=$!
   if [ -t 1 ]; then
+    local W=$(( $(tput cols 2>/dev/null || echo 80) - 40 ))
     while kill -0 "$PID" 2>/dev/null; do
-      local LAST=$(tail -n 1 "$LOG" 2>/dev/null | tr -d '\r\033' | cut -c1-50)
-      step_progress "$((SECONDS - STEP_START))s${LAST:+ · $LAST}"
-      sleep 1
+      local LAST=$(tail -n 1 "$LOG" 2>/dev/null | tr -d '\r\033' | cut -c1-$(( W > 10 ? W : 10 )))
+      step_progress "${RUN_NOTE:+$RUN_NOTE · }$(( $(date +%s) - STEP_START ))s${LAST:+ · $LAST}"
+      sleep 0.2
     done
   fi
   wait "$PID"
 }
-export -f human_size file_size
+# upload_ota.sh runs inside the Upload/Remote step: it spins, fails, and reports back through $BSPATCH_REPORT
+export -f padr info badge human_size file_size step_progress step_fail run_logged
 
 # ── Release version (native app version the OTA targets) ─────────────────────
 android_version() {
@@ -294,6 +369,68 @@ if [ -z "$APP_VERSION" ]; then
 fi
 info release "$APP_VERSION"
 
+# Release notes: shown in the summary and kept in release_*.json (public) for a dashboard
+if [ "$ACTION" = "ota" ] && [ -t 0 ] && [ "$CONFIRM_VERSION" = true ] && [ -z "$NOTES_GIVEN" ]; then
+  read -r -p "  ${BOLD}?${RESET} Release notes ${DIM}(optional, Enter to skip)${RESET}: " BSPATCH_NOTES
+  export BSPATCH_NOTES
+fi
+
+# ── Signing key: found, or created + embedded in the app (never replaces one in use) ──
+if [ "$ACTION" = "ota" ]; then
+  KEY_FLAGS=(); if [ -t 0 ]; then KEY_FLAGS=(--interactive); fi
+  KEY_NOTE=$(node "$SCRIPT_DIR/ensure_signing_key.js" "$ROOT" "$REGISTRY_SHARED" "${KEY_FLAGS[@]}") || exit 1
+  info signing "$KEY_NOTE"
+  # Native wiring (resolver, fingerprint build step) kept current without a separate setup run
+  WIRED=$(node "$SCRIPT_DIR/setup_project.js" --root "$ROOT" --quiet | paste -sd ',' - | sed 's/,/, /g')
+  if [ -n "$WIRED" ]; then
+    info wiring "${YELLOW}updated: $WIRED${RESET} ${DIM}(commit; store builds from now on carry it)${RESET}"
+  else
+    info wiring "ok"
+  fi
+fi
+
+# ── Release controls, status, doctor (registry only, nothing is built) ──
+if [ "$ACTION" = "admin" ]; then
+  if [ "$ADMIN_CMD" = "doctor" ]; then
+    exec node "$SCRIPT_DIR/doctor.js" "$ROOT" "$REGISTRY_SHARED" "$APP_VERSION" "$FLAVOR_LOWER" "$BASE_URL" "$BASE_FOLDER"
+  fi
+  RELEASES_DIR=$(mktemp -d)
+  if [ "$ADMIN_CMD" = "status" ]; then
+    # The live version's release_*.json per platform, for who/when/notes/sizes
+    for F in $(node -e '
+      const [reg, app, flavor] = process.argv.slice(1);
+      const g = JSON.parse(require("fs").readFileSync(reg, "utf8")).apps?.[app]?.flavors?.[flavor];
+      for (const p of new Set((g?.patches || []).map(e => e.platform)))
+        console.log(`release_${app}_v${g.latestOtaVersion}_${p}_${flavor}.json`);
+    ' "$REGISTRY_SHARED" "$APP_VERSION" "$FLAVOR_LOWER"); do
+      download_remote "$BASE_FOLDER/$APP_VERSION/$FLAVOR_LOWER/$F" "$RELEASES_DIR/$F" || true
+    done
+  fi
+  ADMIN_FLAGS=(); if [ -n "$PLATFORM_ARG" ]; then ADMIN_FLAGS+=(--platform "$PLATFORM_ARG"); fi
+  if [ -n "$ADMIN_IDS" ]; then ADMIN_FLAGS+=(--ids "$ADMIN_IDS"); fi
+  if [ "$ADMIN_OFF" = true ]; then ADMIN_FLAGS+=(--off); fi
+  if [ "$JSON_OUT" = true ]; then ADMIN_FLAGS+=(--json); fi
+  printf "\n"
+  set +e
+  node "$SCRIPT_DIR/ota_admin.js" "$ADMIN_CMD" "$REGISTRY_SHARED" "$APP_VERSION" "$FLAVOR_LOWER" "$RELEASES_DIR" \
+    "${ADMIN_FLAGS[@]}" "${ADMIN_ARGS[@]}"
+  ADMIN_EXIT=$?
+  set -e
+  rm -rf "$RELEASES_DIR"
+  # Exit 3: the registry changed and goes back to storage
+  if [ $ADMIN_EXIT -eq 3 ]; then
+    if [ "$DRY_RUN" = true ]; then
+      info registry "not uploaded ${DIM}(dry run)${RESET}"
+    else
+      r2 -f -X PUT -T "$REGISTRY_SHARED" -H "Cache-Control: no-cache" "$R2_URL/$BASE_FOLDER/ota_registry.json" -o /dev/null \
+        || { echo "  ❌ Uploading the registry failed"; exit 1; }
+      info registry "uploaded · clients see it on their next check"
+    fi
+    exit 0
+  fi
+  exit $ADMIN_EXIT
+fi
+
 # ── Reset ─────────────────────────────────────────────────────────────────────
 if [ "$ACTION" = "reset" ]; then
   # Reset only the specific flavor in registry JSON if registry exists
@@ -326,7 +463,12 @@ if [ "$ACTION" = "reset" ]; then
   info local "cleared $APP_VERSION/$FLAVOR_LOWER · next OTA is v$((LATEST + 1))"
 
   if [ "$PUSH_REMOTE" = true ]; then
-      bash "$SCRIPT_DIR/upload_ota.sh" "$APP_VERSION" "$FLAVOR_LOWER" "0" "" "ios" "--clean-remote"
+      printf "\n"; step "Remote" SHIP
+      export BSPATCH_REPORT=$(mktemp)
+      bash "$SCRIPT_DIR/upload_ota.sh" "$APP_VERSION" "$FLAVOR_LOWER" "0" "" "ios" "--clean-remote" || exit 1
+      . "$BSPATCH_REPORT"; rm -f "$BSPATCH_REPORT"
+      step_done "$UP_SIZE"
+      if [ -n "$UP_NOTE" ]; then detail "" "${DIM}$UP_NOTE${RESET}"; fi
   else
       info remote "unchanged ${DIM}(add --push to delete on storage)${RESET}"
   fi
@@ -369,8 +511,8 @@ build_platform() {
   if [ "$PLATFORM" == "ios" ]; then OUTPUT="$ROOT/ios/output"; fi
   local REGISTRY="$REGISTRY_SHARED"
 
-  printf "\n${BOLD}%s${RESET} · %s · ${BOLD}v%s${RESET} ${DIM}(previous v%s)${RESET}\n" "$PLATFORM" "$APP_VERSION" "$NEXT" "$CURRENT"
-  STEP=0
+  printf "\n%s  ${BOLD}%s${RESET} ${DIM}· v%s →${RESET} ${BOLD}${GREEN}v%s${RESET}\n\n" "$(badge "$(echo "$PLATFORM" | tr '[:lower:]' '[:upper:]')")" "$APP_VERSION" "$CURRENT" "$NEXT"
+  ROWS=()
   local PLATFORM_START=$SECONDS
 
   # ── Bundle ──
@@ -378,20 +520,60 @@ build_platform() {
   local WORKSPACE="$OUTPUT/workspace"
   mkdir -p "$WORKSPACE"
 
+  local BUNDLE_NAME="bundle_${APP_VERSION}_v${NEXT}_${PLATFORM}_${FLAVOR_LOWER}.hbc"
+  local NEW_BUNDLE_PATH="$OUTPUT/$BUNDLE_NAME"
+  local ASSET_MANIFEST_FILE="$OUTPUT/asset-manifest_${APP_VERSION}_v${NEXT}_${PLATFORM}_${FLAVOR_LOWER}.json"
+  local ASSET_STORE_DIR="$OUTPUT/asset-store"
+  # This version's assets only: upload checks each file, earlier versions' are already on storage
+  rm -rf "$ASSET_STORE_DIR"; mkdir -p "$ASSET_STORE_DIR"
+  unset BSPATCH_FINGERPRINT
+
+  if [ -n "$SOURCE_FLAVOR" ]; then
+    # ── Source: a bundle already on storage (promote / rollback), nothing is built ──
+    local SRC_V="${SOURCE_VERSION:-$(node -e '
+      const [reg, app, flavor] = process.argv.slice(1);
+      console.log(JSON.parse(require("fs").readFileSync(reg, "utf8")).apps?.[app]?.flavors?.[flavor]?.latestOtaVersion || "");
+    ' "$REGISTRY_SHARED" "$APP_VERSION" "$SOURCE_FLAVOR")}"
+    local SRC_PREFIX="$BASE_FOLDER/$APP_VERSION/$SOURCE_FLAVOR"
+    local SRC_SUFFIX="${APP_VERSION}_v${SRC_V}_${PLATFORM}_${SOURCE_FLAVOR}"
+    step "Source" BUILD
+    if [ -z "$SRC_V" ]; then step_fail "$SOURCE_FLAVOR has no OTA for $APP_VERSION"; exit 1; fi
+    step_progress "fetching $SOURCE_FLAVOR v$SRC_V…"
+    if ! download_remote "$SRC_PREFIX/bundle_$SRC_SUFFIX.hbc.gz" "$WORKSPACE/source.hbc.gz"; then
+      step_fail "$SOURCE_FLAVOR v$SRC_V has no $PLATFORM bundle on storage"; exit 1
+    fi
+    gunzip -c "$WORKSPACE/source.hbc.gz" > "$NEW_BUNDLE_PATH"
+    # Assets are content-addressed and already on storage: its manifest is all this needs
+    if ! download_remote "$SRC_PREFIX/asset-manifest_$SRC_SUFFIX.json" "$ASSET_MANIFEST_FILE"; then
+      step_fail "$SOURCE_FLAVOR v$SRC_V has no asset manifest on storage"; exit 1
+    fi
+    # Its fingerprint, not this checkout's: the bundle was built from that commit
+    if download_remote "$SRC_PREFIX/release_$SRC_SUFFIX.json" "$WORKSPACE/source-release.json"; then
+      export BSPATCH_FINGERPRINT=$(node -p 'require(process.argv[1]).runtimeFingerprint || ""' "$WORKSPACE/source-release.json")
+    fi
+    if [ -z "$BSPATCH_NOTES" ]; then
+      if [ "$PUBLISH_MODE" = "rollback" ]; then export BSPATCH_NOTES="rollback to v$SRC_V"
+      else export BSPATCH_NOTES="promoted from $SOURCE_FLAVOR v$SRC_V"; fi
+    fi
+    step_done "$SOURCE_FLAVOR v$SRC_V"
+  else
+
   # Determine source bundle
   local BUILD_LOG="$WORKSPACE/bundle.log"
   if [ "$PLATFORM" == "android" ]; then
-    step "Bundle JS"
+    step "Bundle JS" BUILD
     # Gradle's config noise goes to a log; shown only on failure
     if ! run_logged "$BUILD_LOG" bash -c 'cd "$1/android" && ./gradlew ":app:createBundle${2}ReleaseJsAndAssets" -Pkotlin.incremental=false --quiet' _ "$ROOT" "$FLAVOR_CAP"; then
-      step_fail; tail -n 40 "$BUILD_LOG"; echo "  ❌ Gradle bundle failed (full log: $BUILD_LOG)"; exit 1
+      step_fail "Gradle bundle failed"; tail -n 40 "$BUILD_LOG"; echo "  full log: $BUILD_LOG"; exit 1
     fi
     BUNDLE_SOURCE="$ROOT/android/app/build/generated/assets/react/${FLAVOR_LOWER}Release/index.android.bundle"
   else
-    step "Bundle JS"
+    step "Bundle JS" BUILD
+    # Fresh dir: leftovers of deleted/renamed assets would land in the manifest
+    rm -rf "$OUTPUT/assets"
     if ! run_logged "$BUILD_LOG" npx react-native bundle --platform ios --dev false --entry-file index.js \
       --bundle-output "$WORKSPACE/source.bundle" --assets-dest "$OUTPUT/assets"; then
-      step_fail; tail -n 40 "$BUILD_LOG"; echo "  ❌ Bundle failed (full log: $BUILD_LOG)"; exit 1
+      step_fail "bundle failed"; tail -n 40 "$BUILD_LOG"; echo "  full log: $BUILD_LOG"; exit 1
     fi
     BUNDLE_SOURCE="$WORKSPACE/source.bundle"
   fi
@@ -406,35 +588,29 @@ build_platform() {
     if [ "$FIRST_BYTE" == "c6" ]; then IS_HBC=true; fi
   fi
 
-  step "Hermes"
-  local HERMES_NOTE="already bytecode"
+  step "Hermes" BUILD
   if [ "$IS_HBC" != true ]; then
-    HERMES_NOTE="compiled"
     if [ -z "$HERMESC_PATH" ] || [ ! -f "$HERMESC_PATH" ]; then
-      step_fail; echo "  ❌ ERROR: hermesc not found"; exit 1
+      step_fail "hermesc not found"; exit 1
     fi
-    # -O matches what Xcode/Gradle use for release
-    "$HERMESC_PATH" -emit-binary -O -out "$WORKSPACE/source.hbc" "$BUNDLE_SOURCE"
+    # -O matches what Xcode/Gradle use for release; -w: undeclared-global warnings are expected noise
+    if ! run_logged "$WORKSPACE/hermes.log" "$HERMESC_PATH" -emit-binary -O -w -out "$WORKSPACE/source.hbc" "$BUNDLE_SOURCE"; then
+      step_fail "hermesc failed"; tail -n 40 "$WORKSPACE/hermes.log"; exit 1
+    fi
     mv "$WORKSPACE/source.hbc" "$BUNDLE_SOURCE"
   fi
 
-  local BUNDLE_NAME="bundle_${APP_VERSION}_v${NEXT}_${PLATFORM}_${FLAVOR_LOWER}.hbc"
-  local NEW_BUNDLE_PATH="$OUTPUT/$BUNDLE_NAME"
-
   cp "$BUNDLE_SOURCE" "$NEW_BUNDLE_PATH"
-  step_done "$HERMES_NOTE"
+  step_done "$(human_size "$(file_size "$NEW_BUNDLE_PATH")")"
 
   # ── Assets ──
-  local ASSET_MANIFEST_FILE="$OUTPUT/asset-manifest_${APP_VERSION}_v${NEXT}_${PLATFORM}_${FLAVOR_LOWER}.json"
-  local ASSET_STORE_DIR="$OUTPUT/asset-store"
-  mkdir -p "$ASSET_STORE_DIR"
   local ASSETS_SRC_DIR="$ROOT/android/app/build/generated/res/react/${FLAVOR_LOWER}Release"
   if [ "$PLATFORM" == "ios" ]; then ASSETS_SRC_DIR="$OUTPUT/assets"; fi
 
   local ASSET_JSON_LIST="["
   local FIRST=true
   local ASSET_COUNT=0
-  step "Assets"
+  step "Assets" BUILD
   if [ -d "$ASSETS_SRC_DIR" ]; then
     while IFS= read -r -d '' ASSET_FILE; do
       local HASH=$(sha256 "$ASSET_FILE")
@@ -458,6 +634,7 @@ build_platform() {
   cat > "$ASSET_MANIFEST_FILE" << EOF
 { "version": $NEXT, "appVersion": "$APP_VERSION", "platform": "$PLATFORM", "flavor": "$FLAVOR_LOWER", "assets": $ASSET_JSON_LIST }
 EOF
+  fi
 
   # ── Patches ──
   # From the last 5 OTA versions only (never v1 = store build). Clients on the
@@ -465,46 +642,96 @@ EOF
   local NEW_HASH=$(sha256 "$NEW_BUNDLE_PATH")
   local PATCHES_JSON="["
   local FIRST_FROM=$((NEXT - 5)); if [ $FIRST_FROM -lt 2 ]; then FIRST_FROM=2; fi
-  local PATCH_TOTAL=$((NEXT - FIRST_FROM)) PATCH_MADE=0 PATCH_LINES=() PATCH_MISSING=""
-  step "Patches"
+  local PATCH_SIZES=() PATCH_MISSING="" # "from|bytes"
+  step "Patches" DIFF
   for (( i=FIRST_FROM; i<NEXT; i++ )); do
     local OLD_B="bundle_${APP_VERSION}_v${i}_${PLATFORM}_${FLAVOR_LOWER}.hbc"
     local OLD_P="$OUTPUT/$OLD_B"
     if [ ! -f "$OLD_P" ]; then
       step_progress "v$i: fetching bundle…"
-      local REMOTE_BUNDLE_PATH="$BASE_FOLDER/$APP_VERSION/$FLAVOR_LOWER/$OLD_B"
-      download_remote "$REMOTE_BUNDLE_PATH" "$OLD_P" || true
+      if download_remote "$BASE_FOLDER/$APP_VERSION/$FLAVOR_LOWER/$OLD_B.gz" "$OLD_P.gz"; then
+        gunzip -c "$OLD_P.gz" > "$OLD_P" || rm -f "$OLD_P"
+        rm -f "$OLD_P.gz"
+      fi
     fi
     if [ ! -f "$OLD_P" ]; then
       PATCH_MISSING="${PATCH_MISSING:+$PATCH_MISSING, }v$i"
       continue
     fi
     local PNAME="patch_${APP_VERSION}_v${i}_to_v${NEXT}_${FLAVOR_LOWER}_${PLATFORM}.patch"
-    local PATCH_START=$SECONDS
     step_progress "v$i → v$NEXT…"
     "$BSDIFF" "$OLD_P" "$NEW_BUNDLE_PATH" "$OUTPUT/$PNAME"
-    PATCH_LINES+=("v$i → v$NEXT|$(human_size "$(file_size "$OUTPUT/$PNAME")") ${DIM}· $((SECONDS - PATCH_START))s${RESET}")
-    PATCH_MADE=$((PATCH_MADE + 1))
+    PATCH_SIZES+=("$i|$(file_size "$OUTPUT/$PNAME")")
     if [ "$PATCHES_JSON" != "[" ]; then PATCHES_JSON+=", "; fi
     PATCHES_JSON+="{\"from\": $i, \"to\": $NEXT, \"file\": \"$PNAME\", \"baseHash\": \"$(sha256 "$OLD_P")\", \"bundleHash\": \"$NEW_HASH\"}"
   done
   PATCHES_JSON+="]"
-  if [ $PATCH_TOTAL -eq 0 ]; then
-    step_done "none ${DIM}(first OTA of this release: full bundle only)${RESET}"
-  else
-    step_done "$PATCH_MADE created"
-  fi
-  local L
-  for L in "${PATCH_LINES[@]}"; do sub "${L%%|*}" "${L#*|}"; done
-  if [ -n "$PATCH_MISSING" ]; then sub "$PATCH_MISSING" "${DIM}no bundle on storage → full download${RESET}"; fi
+  case ${#PATCH_SIZES[@]} in
+    0) step_done "none" ;;
+    1) step_done "1 × $(human_size "${PATCH_SIZES[0]#*|}")" ;;
+    *) step_done "${#PATCH_SIZES[@]} patches" ;;
+  esac
 
   # ── Finalize ──
-  step "Publish"
-  if [ -t 1 ]; then printf "\r\033[K"; fi
-  step_line ""; printf "\n"
-  node "$SCRIPT_DIR/update_registry.js" "$REGISTRY_SHARED" "$APP_VERSION" "$NEXT" "$PATCHES_JSON" "$PLATFORM" "$ASSET_MANIFEST_FILE" "$FLAVOR_LOWER"
-  bash "$SCRIPT_DIR/upload_ota.sh" "$APP_VERSION" "$FLAVOR_LOWER" "$NEXT" "$NEW_BUNDLE_PATH" "$PLATFORM"
-  printf "${GREEN}✓${RESET} ${BOLD}%s v%s${RESET} published ${DIM}in %ss${RESET}\n" "$PLATFORM" "$NEXT" "$((SECONDS - PLATFORM_START))"
+  step "Upload" SHIP
+  export BSPATCH_REPORT="$WORKSPACE/upload.report"; : > "$BSPATCH_REPORT"
+  local REGISTRY_NOTE
+  if ! REGISTRY_NOTE=$(node "$SCRIPT_DIR/update_registry.js" "$REGISTRY_SHARED" "$APP_VERSION" "$NEXT" "$PATCHES_JSON" "$PLATFORM" "$ASSET_MANIFEST_FILE" "$FLAVOR_LOWER"); then
+    step_fail "registry update failed"; exit 1
+  fi
+  local UP_SIZE="" UP_DEST="" UP_ASSETS="" UP_GZIP_BYTES="" NATIVE_CHANGED="" VERIFY_NOTE=""
+  if [ "$DRY_RUN" = true ]; then
+    step_done "skipped"
+  else
+    bash "$SCRIPT_DIR/upload_ota.sh" "$APP_VERSION" "$FLAVOR_LOWER" "$NEXT" "$NEW_BUNDLE_PATH" "$PLATFORM" || exit 1
+    . "$BSPATCH_REPORT"
+    step_done "$UP_SIZE"
+    # What the app will read: its own public URL, not the bucket API
+    step "Verify" SHIP
+    if ! VERIFY_NOTE=$(node "$SCRIPT_DIR/verify_publish.js" "$ROOT" "$BASE_URL" "$BASE_FOLDER" "$APP_VERSION" "$FLAVOR_LOWER" "$PLATFORM" "$NEXT" 2>"$WORKSPACE/verify.log"); then
+      step_fail "$(head -n 1 "$WORKSPACE/verify.log")"; tail -n +2 "$WORKSPACE/verify.log"; exit 1
+    fi
+    step_done "$VERIFY_NOTE"
+  fi
+  . "$BSPATCH_REPORT"
+  timeline_redraw
+
+  # ── Summary: what each client downloads ──
+  # What a client downloads for the full bundle: the gzip size on the wire
+  local RAW_BYTES=$(file_size "$NEW_BUNDLE_PATH") FULL_BYTES=${UP_GZIP_BYTES:-$(file_size "$NEW_BUNDLE_PATH")} L CARD=()
+  kv() { CARD+=("${CYAN}$(padr "$1" 10)${RESET}$2"); }
+  if [ "$DRY_RUN" = true ]; then
+    CARD+=("$(badge DONE)  ${BOLD}$PLATFORM v$NEXT built${RESET} in ${YELLOW}$((SECONDS - PLATFORM_START))s${RESET} ${DIM}· dry run, nothing uploaded${RESET}" "")
+  else
+    CARD+=("$(badge DONE)  ${BOLD}$PLATFORM ${GREEN}v$NEXT${RESET}${BOLD} is live${RESET} in ${YELLOW}$((SECONDS - PLATFORM_START))s${RESET} ${DIM}· $UP_DEST${RESET}" "")
+  fi
+  for L in "${PATCH_SIZES[@]}"; do
+    kv "v${L%%|*} → v$NEXT" "${BOLD}$(human_size "${L#*|}")${RESET} patch  ${BOLD}${GREEN}$(awk -v p="${L#*|}" -v f="$FULL_BYTES" 'BEGIN { printf "−%.1f%%", 100 - p * 100 / f }')${RESET}"
+  done
+  kv "v1 → v$NEXT" "${BOLD}$(human_size "$FULL_BYTES")${RESET} full bundle ${DIM}(gzip · $(human_size "$RAW_BYTES") raw)${RESET}"
+  if [ -n "$PATCH_MISSING" ]; then kv "$PATCH_MISSING" "${DIM}no bundle on storage → full bundle${RESET}"; fi
+  if [ -n "$UP_ASSETS" ]; then kv "assets" "$UP_ASSETS"; fi
+  local COMMIT=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)
+  if [ -n "$COMMIT" ]; then
+    local DIRTY=""; if [ -n "$(git -C "$ROOT" status --porcelain --untracked-files=no 2>/dev/null)" ]; then DIRTY=" ${YELLOW}+ uncommitted changes${RESET}"; fi
+    kv "commit" "$COMMIT ${DIM}$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null)${RESET}$DIRTY"
+  fi
+  if [ -n "$BSPATCH_NOTES" ]; then kv "notes" "$BSPATCH_NOTES"; fi
+  case "$REGISTRY_NOTE" in
+    *unsigned*) kv "signing" "${YELLOW}unsigned · no ota_private_key.pem${RESET}" ;;
+    *) kv "signing" "${GREEN}✓${RESET} signed" ;;
+  esac
+  local RELEASE_FILE="$OUTPUT/release_${APP_VERSION}_v${NEXT}_${PLATFORM}_${FLAVOR_LOWER}.json"
+  local FP=$(node -p 'require(process.argv[1]).runtimeFingerprint' "$RELEASE_FILE" 2>/dev/null)
+  if [ -n "$NATIVE_CHANGED" ]; then
+    kv "native" "$FP ${YELLOW}changed since $NATIVE_CHANGED: only store builds of this code take it${RESET}"
+  else
+    kv "native" "$FP"
+  fi
+  printf "\n"; box "${CARD[@]}"
+  if [ "$JSON_OUT" = true ]; then
+    node -e 'process.stdout.write(JSON.stringify(require(process.argv[1])) + "\n")' "$RELEASE_FILE"
+  fi
 }
 
 # ── Main ───────────────────────────────────────────────────────────────────

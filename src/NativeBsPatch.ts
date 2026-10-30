@@ -5,7 +5,7 @@ export type DownloadProgress = {
   /** destPath passed to downloadFile */
   path: string;
   received: number;
-  /** -1 when the server sends no Content-Length */
+  /** -1 when unknown: no Content-Length, or a Content-Encoding (received counts decoded bytes) */
   total: number;
 };
 
@@ -61,12 +61,44 @@ export interface Spec extends TurboModule {
   getDocumentDir(): string;
 
   /**
+   * Public keys the CLI embedded in the app, comma-separated base64 SPKI (primary first,
+   * then the offline backup): Info.plist `BsPatchPublicKey` / Android string
+   * `bspatch_public_key`. '' when none.
+   */
+  getEmbeddedPublicKeys(): string;
+
+  /** Build number: versionCode (Android) / CFBundleVersion (iOS) */
+  getAppBuild(): string;
+
+  /**
+   * Native runtime fingerprint stamped into this binary at build time (Info.plist
+   * `BsPatchRuntimeFingerprint` / Android resValue `bspatch_runtime_fingerprint`);
+   * '' when the build hook didn't run. An OTA only installs on a matching binary.
+   */
+  getRuntimeFingerprint(): string;
+
+  /** Free bytes on the volume holding getDocumentDir() */
+  getFreeDiskSpace(): Promise<number>;
+
+  /** Current connection: 'wifi' | 'cellular' | 'ethernet' | 'none' | 'unknown' */
+  getNetworkType(): Promise<string>;
+
+  /**
+   * Decompresses srcPath into destPath (replacing it). format: 'gzip' | 'bz2'.
+   * Rejects on unknown format or corrupt input; destPath is removed on failure.
+   */
+  decompressFile(srcPath: string, destPath: string, format: string): Promise<void>;
+
+  /**
    * Streams `url` to `destPath` (via `destPath.part`, renamed only on a 2xx response,
    * replacing any existing file). Rejects on network error or non-2xx status.
+   * A failed download of the same destPath is resumed (HTTP Range) on the next call
+   * when the server supports it; otherwise it restarts from zero.
    * @param timeoutMs Idle timeout: no bytes for this long fails the download
+   * @param headersJson Extra request headers as a JSON object string ('{}' for none)
    * @returns Size of the downloaded file in bytes
    */
-  downloadFile(url: string, destPath: string, timeoutMs: number): Promise<number>;
+  downloadFile(url: string, destPath: string, timeoutMs: number, headersJson: string): Promise<number>;
 
   /** Lowercase hex SHA-256 of a file */
   hashFile(path: string): Promise<string>;

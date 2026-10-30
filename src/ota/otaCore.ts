@@ -11,7 +11,9 @@
  *  - Structured telemetry logging
  */
 
+import { Platform } from 'react-native';
 import NativeBsPatch from '../NativeBsPatch';
+import { entryPayload, parsePublicKeys } from './entrySignature';
 import { createOtaLogger, OtaEvent } from './otaLogger';
 import {
     ASSET_LIST_FILE,
@@ -23,7 +25,7 @@ import {
     registerNewVersion,
     updateMetadata,
 } from './otaMetadata';
-import { fetchJson, GitHubRawStorageProvider } from './storage/GitHubRawStorage';
+import { normalizeChannel, R2StorageProvider } from './storage/R2Storage';
 import {
     OtaStatus,
     type OtaAsset,
@@ -35,9 +37,9 @@ import {
 
 // ─── Storage Provider Factory ──────────────────────────────────────────
 
-const DEFAULT_STORAGE = new GitHubRawStorageProvider();
+const DEFAULT_STORAGE = new R2StorageProvider();
 
-/** Explicit `config.storage` or the default static-host provider (GitHub raw, R2, CDN...). */
+/** Explicit `config.storage` or the default provider (R2 public URL). */
 const getStorage = (config: OtaConfig): OtaStorageProvider =>
     config.storage ?? DEFAULT_STORAGE;
 
@@ -104,8 +106,9 @@ export const verifyHash = async (
 };
 
 /**
- * When `config.publicKey` is set, an RSA/ECDSA SHA-256 signature is mandatory
- * and must verify (fail closed). Without a public key, signing is not enforced.
+ * When there is a public key (config.publicKey, else the embedded ones), an RSA/ECDSA
+ * SHA-256 signature is mandatory and must verify against one of them (fail closed):
+ * the backup key takes over without a store build if the primary is lost.
  */
 const assertSigned = async (
     filePath: string,
@@ -113,19 +116,55 @@ const assertSigned = async (
     config: OtaConfig,
     what: string,
 ): Promise<void> => {
-    if (!config.publicKey) return;
-    const valid =
-        !!signature &&
-        (await NativeBsPatch.verifySignature(filePath, signature, config.publicKey).catch(() => false));
+    const keys = parsePublicKeys(config.publicKey);
+    if (keys.length === 0) return;
+    let valid = false;
+    for (const key of signature ? keys : []) {
+        if (await NativeBsPatch.verifySignature(filePath, signature!, key).catch(() => false)) {
+            valid = true;
+            break;
+        }
+    }
     if (!valid) {
         throw new Error(`${what} signature missing or invalid`);
     }
 };
 
 /**
+ * With config.publicKey the registry entry itself must be signed and meant for this app,
+ * so a registry served by someone else (e.g. a lapsed domain) can't hand over another
+ * flavor's, platform's or release's signed bundle, or swap the asset manifest.
+ */
+const assertEntrySigned = async (patch: OtaPatch, config: OtaConfig): Promise<void> => {
+    if (parsePublicKeys(config.publicKey).length === 0) return;
+    const channel = config.customServer?.channel;
+    const mismatch =
+        patch.appVersion !== config.appVersion
+            ? 'appVersion'
+            : patch.platform !== Platform.OS
+                ? 'platform'
+                : channel && patch.flavor !== normalizeChannel(channel)
+                    ? 'flavor'
+                    : patch.assetManifestUrl && !patch.assetManifestHash
+                        ? 'assetManifestHash'
+                        : null;
+    if (mismatch) {
+        throw new Error(`Registry entry rejected: ${mismatch} doesn't match this app`);
+    }
+    const payloadPath = `${OTA_DIR}/entry-payload.txt`;
+    await NativeBsPatch.writeFile(payloadPath, entryPayload(patch));
+    try {
+        await assertSigned(payloadPath, patch.entrySignature, config, 'Registry entry');
+    } finally {
+        await NativeBsPatch.removePath(payloadPath).catch(() => {});
+    }
+};
+
+/**
  * Download a file with retry logic using exponential backoff.
  * Native streams to `${destPath}.part` and renames only on a 2xx response, so a
- * cut-off download or an error page never sits at destPath looking complete.
+ * cut-off download or an error page never sits at destPath looking complete;
+ * each retry resumes where the last attempt stopped.
  * @returns Size of the downloaded file in bytes
  */
 const downloadWithRetry = async (
@@ -136,6 +175,7 @@ const downloadWithRetry = async (
 ): Promise<number> => {
     const retryLimit = Math.max(1, config.network?.retry ?? 3);
     const timeout = config.network?.timeoutMs ?? 30000;
+    const headers = JSON.stringify(config.customServer?.headers ?? {});
     const subscription = NativeBsPatch.onDownloadProgress(e => {
         // total is -1 without a Content-Length
         if (e.path === destPath && e.total > 0) {
@@ -146,7 +186,7 @@ const downloadWithRetry = async (
     try {
         for (let i = 0; ; i++) {
             try {
-                return await NativeBsPatch.downloadFile(url, destPath, timeout);
+                return await NativeBsPatch.downloadFile(url, destPath, timeout, headers);
             } catch (e) {
                 if (i >= retryLimit - 1) throw e;
                 const delay = Math.pow(2, i) * 1000; // Exponential backoff: 1s, 2s, 4s...
@@ -194,6 +234,7 @@ const isSafeRelativePath = (p: string): boolean =>
  */
 const downloadAndSyncAssets = async (
     assetManifestUrl: string,
+    assetManifestHash: string | undefined,
     version: number,
     config: OtaConfig,
     log: ReturnType<typeof createOtaLogger>,
@@ -210,7 +251,14 @@ const downloadAndSyncAssets = async (
 
     let assets: OtaAsset[] = [];
     try {
-        const manifest = await fetchJson(assetManifestUrl, 10000);
+        // Through a file: its hash is in the (signed) registry entry
+        const manifestPath = `${versionDir}/asset-manifest.json`;
+        await downloadWithRetry(assetManifestUrl, manifestPath, config, () => {});
+        if (!(await verifyHash(manifestPath, assetManifestHash))) {
+            throw new Error('hash mismatch');
+        }
+        const manifest = JSON.parse(await fs.readFile(manifestPath));
+        await fs.removePath(manifestPath).catch(() => {});
         // Hash/ext/path become file names: reject anything unexpected
         assets = (manifest.assets || []).filter(
             (a: any) =>
@@ -342,6 +390,7 @@ export const selectUpdate = (
  * Full path (store build, no patch, or patch path failed):
  *   download full bundle → hash → signature
  * Both then: sync assets → atomic commit → metadata → mark healthy → reload.
+ * Only a patch-path failure falls back to the full bundle, never a failed commit.
  *
  * The store build's bundle is never used as a patch source: it can't be
  * reproduced byte-for-byte at build time, so the first OTA is always a full download.
@@ -382,12 +431,21 @@ const runUpdatePipeline = async (
 
     const log = createOtaLogger(config.onEvent);
     await ensureOtaDir();
+    try {
+        await assertEntrySigned(patch, config);
+    } catch (error) {
+        log.emit(OtaEvent.SIGNATURE_INVALID, { version: patch.toVersion, error: (error as Error).message });
+        onStatus(OtaStatus.ERROR, `Error: ${(error as Error).message}`);
+        throw error;
+    }
     const totalStart = Date.now();
     const fs = NativeBsPatch;
 
     const finalBundlePath =
         getBundlePath(patch.toVersion, config.baseAppVersion) || '';
     const tempBundle = `${finalBundlePath}.tmp`;
+    /** Compressed full bundle, before decompressing into tempBundle */
+    const tempDownload = `${finalBundlePath}.download`;
     const versionDir = `${OTA_DIR}/v${patch.toVersion}`;
     const localPatchPath = getLocalPatchPath(patch, DOCUMENT_DIR);
 
@@ -412,6 +470,14 @@ const runUpdatePipeline = async (
                 `Native app ${currentAppVer} is too old. Update to ${patch.minAppVersion}+ first.`,
             );
         }
+    }
+
+    // Room for the download, the decompressed bundle and its assets; a full disk mid-write
+    // would fail later and leave the user's storage fuller
+    const needBytes = (patch.bundleSize ?? 0) * 3 + 20 * 1024 * 1024;
+    const freeBytes = await fs.getFreeDiskSpace().catch(() => Number.MAX_SAFE_INTEGER);
+    if (freeBytes < needBytes) {
+        throw new Error(`Not enough free storage: ${Math.ceil(needBytes / 1048576)} MB needed`);
     }
 
     await fs.mkdir(versionDir);
@@ -450,8 +516,10 @@ const runUpdatePipeline = async (
         throw new Error(`${what} hash mismatch`);
     };
 
+    type BundleMetrics = Omit<OtaMetrics, 'totalMs' | 'fromCache'>;
+
     /** tempBundle is verified: sync assets, swap it in, record the version, reload. */
-    const commit = async (metrics: Omit<OtaMetrics, 'totalMs' | 'fromCache'>) => {
+    const commit = async (metrics: BundleMetrics) => {
         if (patch.assetManifestUrl) {
             const manifestUrl = await getStorage(config).getUpdateFileUrl(
                 patch.assetManifestUrl,
@@ -459,6 +527,7 @@ const runUpdatePipeline = async (
             );
             await downloadAndSyncAssets(
                 manifestUrl,
+                patch.assetManifestHash,
                 patch.toVersion,
                 config,
                 log,
@@ -498,7 +567,8 @@ const runUpdatePipeline = async (
         }
     };
 
-    const applyPatchFile = async (sourcePath: string) => {
+    /** Leaves the verified result at tempBundle. */
+    const applyPatchFile = async (sourcePath: string): Promise<BundleMetrics> => {
         onStatus(OtaStatus.DOWNLOADING, `Downloading V${patch.toVersion}...`);
         const { downloadMs, sizeBytes } = await download(patch.filename!, localPatchPath);
 
@@ -528,24 +598,33 @@ const runUpdatePipeline = async (
 
         await assertHash(tempBundle, patch.bundleHash, 'Result bundle');
         await assertSigned(tempBundle, patch.bundleSignature, config, 'Bundle');
-        await commit({ patchSizeKB: sizeBytes / 1024, downloadMs, applyMs });
+        return { patchSizeKB: sizeBytes / 1024, downloadMs, applyMs };
     };
 
-    const installFullBundle = async () => {
+    /** Leaves the verified full bundle at tempBundle. */
+    const installFullBundle = async (): Promise<BundleMetrics> => {
         if (!patch.fullBundleUrl) {
             throw new Error(`No full bundle for V${patch.toVersion}`);
         }
         log.emit(OtaEvent.FALLBACK_FULL_BUNDLE, { version: patch.toVersion });
         onStatus(OtaStatus.DOWNLOADING, `Downloading V${patch.toVersion} (full bundle)...`);
-        const { downloadMs, sizeBytes } = await download(patch.fullBundleUrl, tempBundle);
+        const compression = patch.fullBundleCompression;
+        const { downloadMs, sizeBytes } = await download(patch.fullBundleUrl, compression ? tempDownload : tempBundle);
+        if (compression) {
+            onStatus(OtaStatus.APPLYING, 'Decompressing...');
+            await fs.decompressFile(tempDownload, tempBundle, compression);
+            await fs.removePath(tempDownload).catch(() => {});
+        }
         await assertHash(tempBundle, patch.bundleHash, 'Full bundle');
         await assertSigned(tempBundle, patch.bundleSignature, config, 'Full bundle');
-        await commit({ patchSizeKB: sizeBytes / 1024, downloadMs, applyMs: 0 });
+        return { patchSizeKB: sizeBytes / 1024, downloadMs, applyMs: 0 };
     };
 
     const cleanup = async () => {
         await fs.removePath(localPatchPath).catch(() => {});
         await fs.removePath(tempBundle).catch(() => {});
+        // tempDownload's .part stays: the next attempt resumes it
+        await fs.removePath(tempDownload).catch(() => {});
     };
 
     // Patch only from an OTA bundle we installed ourselves (byte-identical to the build output)
@@ -557,10 +636,12 @@ const runUpdatePipeline = async (
         !!sourcePath &&
         (await fs.exists(sourcePath));
 
+    // Only a failed patch falls back to the full bundle; a failed commit (asset sync)
+    // would fail the same way after re-downloading the whole bundle
+    let metrics: BundleMetrics | undefined;
     if (canPatch) {
         try {
-            await applyPatchFile(sourcePath!);
-            return;
+            metrics = await applyPatchFile(sourcePath!);
         } catch (error) {
             await cleanup();
             if (__DEV__) {
@@ -574,7 +655,7 @@ const runUpdatePipeline = async (
     }
 
     try {
-        await installFullBundle();
+        await commit(metrics ?? (await installFullBundle()));
     } catch (error) {
         await cleanup();
         onStatus(OtaStatus.ERROR, `Error: ${(error as Error).message}`);

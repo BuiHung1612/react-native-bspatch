@@ -1,9 +1,11 @@
 #import <Foundation/Foundation.h>
+#import <Network/Network.h>
 #import <QuartzCore/QuartzCore.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <Security/Security.h>
 #import <React/RCTLog.h>
 #import <React/RCTReloadCommand.h>
+#include <zlib.h>
 
 #if __has_include(<react_native_bspatch/react_native_bspatch-Swift.h>)
 #import <react_native_bspatch/react_native_bspatch-Swift.h>
@@ -29,6 +31,8 @@ extern "C" {
 /** One download: streams to a system temp file, moved to destPath only on a 2xx response. */
 @interface RNBsPatchDownload : NSObject <NSURLSessionDownloadDelegate>
 @property (nonatomic, copy) NSString *destPath;
+/** Where a failed attempt leaves NSURLSession resume data for the next call */
+@property (nonatomic, copy) NSString *resumePath;
 @property (nonatomic, copy) RCTPromiseResolveBlock resolve;
 @property (nonatomic, copy) RCTPromiseRejectBlock reject;
 @property (nonatomic, copy) void (^onProgress)(int64_t received, int64_t total);
@@ -48,6 +52,10 @@ totalBytesExpectedToWrite:(int64_t)expected
     CFTimeInterval now = CACurrentMediaTime();
     if (now - self.lastEmit < 0.25) return;
     self.lastEmit = now;
+    // written counts decoded bytes, expected the Content-Length on the wire: with a
+    // Content-Encoding they don't compare, so report the total as unknown like Android
+    NSString *encoding = [(NSHTTPURLResponse *)task.response valueForHTTPHeaderField:@"Content-Encoding"];
+    if (encoding.length > 0 && ![encoding isEqualToString:@"identity"]) expected = -1;
     self.onProgress(written, expected); // expected is -1 without a Content-Length
 }
 
@@ -79,6 +87,10 @@ didFinishDownloadingToURL:(NSURL *)location
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error
 {
     NSError *e = error ?: self.error;
+    NSData *resumeData = error.userInfo[NSURLSessionDownloadTaskResumeData];
+    if (resumeData) {
+        [resumeData writeToFile:self.resumePath atomically:YES];
+    }
     if (e) {
         self.reject(@"ERR_DOWNLOAD", e.localizedDescription, e);
     } else {
@@ -107,6 +119,32 @@ static NSData *RNBsPatchSHA256(NSString *path)
     unsigned char digest[CC_SHA256_DIGEST_LENGTH];
     CC_SHA256_Final(digest, &ctx);
     return [NSData dataWithBytes:digest length:sizeof(digest)];
+}
+
+/** Gunzips src into dst; NO on unreadable, non-gzip or truncated input. */
+static BOOL RNBsPatchGunzip(NSString *src, NSString *dst)
+{
+    gzFile in = gzopen(src.fileSystemRepresentation, "rb");
+    if (!in) return NO;
+    FILE *out = fopen(dst.fileSystemRepresentation, "wb");
+    if (!out) {
+        gzclose(in);
+        return NO;
+    }
+    char buffer[65536];
+    int n;
+    BOOL ok = YES;
+    while ((n = gzread(in, buffer, sizeof(buffer))) > 0) {
+        // gzdirect: zlib copies non-gzip input through as-is
+        if (gzdirect(in) || fwrite(buffer, 1, n, out) != (size_t)n) {
+            ok = NO;
+            break;
+        }
+    }
+    if (n < 0) ok = NO;
+    if (gzclose_r(in) != Z_OK) ok = NO; // Z_BUF_ERROR: input ended mid-stream
+    if (fclose(out) != 0) ok = NO;
+    return ok;
 }
 
 /** Runs block off the JS thread: resolves *result, or rejects with *error when it returns NO. */
@@ -149,6 +187,34 @@ RCT_EXPORT_METHOD(applyPatch:(NSString *)oldPath
         } else {
             resolve(@(NO));
         }
+    });
+}
+
+RCT_EXPORT_METHOD(decompressFile:(NSString *)srcPath
+                  destPath:(NSString *)destPath
+                  format:(NSString *)format
+                  resolve:(RCTPromiseResolveBlock)resolve
+                  reject:(RCTPromiseRejectBlock)reject)
+{
+    RNBsPatchIO(resolve, reject, ^BOOL(id *result, NSError **error) {
+        NSString *part = [destPath stringByAppendingString:@".part"];
+        BOOL ok;
+        if ([format isEqualToString:@"gzip"]) {
+            ok = RNBsPatchGunzip(srcPath, part);
+        } else if ([format isEqualToString:@"bz2"]) {
+            ok = decompress_bz2(srcPath.fileSystemRepresentation, part.fileSystemRepresentation) == 0;
+        } else {
+            *error = [NSError errorWithDomain:@"RNBsPatch" code:1 userInfo:@{NSLocalizedDescriptionKey: [@"Unknown compression format: " stringByAppendingString:format]}];
+            return NO;
+        }
+        if (ok) ok = rename(part.fileSystemRepresentation, destPath.fileSystemRepresentation) == 0;
+        if (!ok) {
+            NSFileManager *fm = NSFileManager.defaultManager;
+            [fm removeItemAtPath:part error:nil];
+            [fm removeItemAtPath:destPath error:nil];
+            *error = [NSError errorWithDomain:@"RNBsPatch" code:2 userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Corrupt or unreadable %@ file: %@", format, srcPath]}];
+        }
+        return ok;
     });
 }
 
@@ -288,9 +354,69 @@ RCT_EXPORT_METHOD(getAppVersion:(RCTPromiseResolveBlock)resolve
     return NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
 }
 
+- (NSString *)getEmbeddedPublicKeys
+{
+    id keys = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"BsPatchPublicKey"];
+    return [keys isKindOfClass:[NSString class]] ? keys : @"";
+}
+
+- (NSString *)getAppBuild
+{
+    id build = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"];
+    return [build isKindOfClass:[NSString class]] ? build : @"";
+}
+
+// Written into the .app by the build phase `setup` adds (tools/fingerprint.js)
+- (NSString *)getRuntimeFingerprint
+{
+    NSString *path = [[NSBundle mainBundle] pathForResource:@"bspatch_fingerprint" ofType:@"txt"];
+    NSString *fingerprint = path ? [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil] : nil;
+    return [fingerprint stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
+}
+
+- (void)getFreeDiskSpace:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject
+{
+    RNBsPatchIO(resolve, reject, ^BOOL(id *result, NSError **error) {
+        NSString *dir = [self getDocumentDir];
+        NSNumber *free = nil;
+        [[NSURL fileURLWithPath:dir] getResourceValue:&free forKey:NSURLVolumeAvailableCapacityForImportantUsageKey error:nil];
+        if (free.longLongValue <= 0) {
+            free = [NSFileManager.defaultManager attributesOfFileSystemForPath:dir error:error][NSFileSystemFreeSize];
+        }
+        *result = free;
+        return free != nil;
+    });
+}
+
+- (void)getNetworkType:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject
+{
+    nw_path_monitor_t monitor = nw_path_monitor_create();
+    nw_path_monitor_set_queue(monitor, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    __block BOOL done = NO;
+    // The first update is the current path; cancelling releases the handler (and the monitor)
+    nw_path_monitor_set_update_handler(monitor, ^(nw_path_t path) {
+        if (done) return;
+        done = YES;
+        NSString *type = @"unknown";
+        if (nw_path_get_status(path) != nw_path_status_satisfied) {
+            type = @"none";
+        } else if (nw_path_uses_interface_type(path, nw_interface_type_wifi)) {
+            type = @"wifi";
+        } else if (nw_path_uses_interface_type(path, nw_interface_type_cellular)) {
+            type = @"cellular";
+        } else if (nw_path_uses_interface_type(path, nw_interface_type_wired)) {
+            type = @"ethernet";
+        }
+        resolve(type);
+        nw_path_monitor_cancel(monitor);
+    });
+    nw_path_monitor_start(monitor);
+}
+
 - (void)downloadFile:(NSString *)url
             destPath:(NSString *)destPath
            timeoutMs:(double)timeoutMs
+         headersJson:(NSString *)headersJson
              resolve:(RCTPromiseResolveBlock)resolve
               reject:(RCTPromiseRejectBlock)reject
 {
@@ -299,8 +425,18 @@ RCT_EXPORT_METHOD(getAppVersion:(RCTPromiseResolveBlock)resolve
         reject(@"ERR_DOWNLOAD", [NSString stringWithFormat:@"Invalid URL: %@", url], nil);
         return;
     }
+    id headers = [NSJSONSerialization JSONObjectWithData:[headersJson dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+    if (![headers isKindOfClass:[NSDictionary class]]) {
+        reject(@"ERR_DOWNLOAD", [@"headersJson must be a JSON object, got: " stringByAppendingString:headersJson], nil);
+        return;
+    }
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:nsurl];
+    for (NSString *name in headers) {
+        [request setValue:[headers[name] description] forHTTPHeaderField:name];
+    }
     RNBsPatchDownload *download = [RNBsPatchDownload new];
     download.destPath = destPath;
+    download.resumePath = [destPath stringByAppendingString:@".resumedata"];
     download.resolve = resolve;
     download.reject = reject;
     __weak RNBsPatch *weakSelf = self;
@@ -312,7 +448,12 @@ RCT_EXPORT_METHOD(getAppVersion:(RCTPromiseResolveBlock)resolve
     config.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
     config.timeoutIntervalForRequest = timeoutMs / 1000.0; // idle timeout, same as Android readTimeout
     NSURLSession *session = [NSURLSession sessionWithConfiguration:config delegate:download delegateQueue:nil];
-    [[session downloadTaskWithURL:nsurl] resume];
+    // Single use: a failed attempt writes fresh resume data, invalid data fails this
+    // attempt and the next one starts over
+    NSData *resumeData = [NSData dataWithContentsOfFile:download.resumePath];
+    [NSFileManager.defaultManager removeItemAtPath:download.resumePath error:nil];
+    NSURLSessionDownloadTask *task = resumeData ? [session downloadTaskWithResumeData:resumeData] : nil;
+    [task ?: [session downloadTaskWithRequest:request] resume];
 }
 
 - (void)hashFile:(NSString *)path resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject

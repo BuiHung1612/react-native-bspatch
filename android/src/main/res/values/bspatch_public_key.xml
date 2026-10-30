@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Empty default: the app's own res/values/bspatch_public_key.xml (written by the CLI) overrides it -->
+<resources>
+    <string name="bspatch_public_key" translatable="false"></string>
+</resources>

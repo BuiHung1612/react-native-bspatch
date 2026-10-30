@@ -233,3 +233,37 @@ int apply_bspatch(const char *oldfile, const char *newfile, const char *patchfil
 
 	return ret;
 }
+
+int decompress_bz2(const char *srcfile, const char *dstfile)
+{
+	FILE *in, *out;
+	BZFILE *bz2 = NULL;
+	int bz2err = BZ_OK, n, rc = -1;
+	char buf[64 * 1024];
+
+	if ((in = fopen(srcfile, "rb")) == NULL) {
+		LOGE("decompress_bz2: cannot open %s", srcfile);
+		return -1;
+	}
+	if ((out = fopen(dstfile, "wb")) == NULL) {
+		LOGE("decompress_bz2: cannot create %s", dstfile);
+		fclose(in);
+		return -1;
+	}
+	if ((bz2 = BZ2_bzReadOpen(&bz2err, in, 0, 0, NULL, 0)) != NULL) {
+		while (bz2err == BZ_OK) {
+			n = BZ2_bzRead(&bz2err, bz2, buf, sizeof(buf));
+			if ((bz2err == BZ_OK || bz2err == BZ_STREAM_END) && n > 0 &&
+			    fwrite(buf, 1, n, out) != (size_t)n) {
+				bz2err = BZ_IO_ERROR;
+			}
+		}
+		if (bz2err == BZ_STREAM_END) rc = 0;
+		else LOGE("decompress_bz2: bzip2 error %d", bz2err);
+		BZ2_bzReadClose(&bz2err, bz2);
+	}
+	if (fclose(out) != 0) rc = -1;
+	fclose(in);
+	if (rc != 0) unlink(dstfile);
+	return rc;
+}

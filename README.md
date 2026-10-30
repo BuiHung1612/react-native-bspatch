@@ -70,7 +70,7 @@ const config = {
   updateMode: OtaUpdateMode.BACKGROUND_DOWNLOAD, // Silent download without interrupting user
   allowDebugUpdates: false,   // default: OTA is blocked in __DEV__
   customServer: {
-    baseUrl: Config.OTA_BASE_URL!,  // public storage URL (R2 / GitHub raw), no fallback
+    baseUrl: Config.OTA_BASE_URL!,  // R2 public URL, no fallback
     channel: Config.ENVIRONMENT!,   // flavor: development / staging / production
   },
 };
@@ -151,11 +151,15 @@ type OtaConfig = {
    */
   updateMode?: OtaUpdateMode;
 
-  /** Network retry and timeout settings */
+  /** Network settings */
   network?: {
-    retry?: number;       // max retry attempts (default: 3)
-    timeoutMs?: number;   // request timeout in ms (default: 30000)
+    retry?: number;       // attempts per file (default: 3); each retry resumes the partial download
+    timeoutMs?: number;   // idle timeout in ms (default: 30000)
+    wifiOnly?: boolean;   // automatic downloads only on Wi-Fi/Ethernet (applyUpdate() always downloads)
   };
+
+  /** Minimum time between automatic checks (start, foreground, checkUpdate()). Default 10 min. */
+  minCheckIntervalMs?: number;
 
   /**
    * Optional telemetry callback — all OTA lifecycle events are forwarded here.
@@ -164,9 +168,15 @@ type OtaConfig = {
   onEvent?: (entry: OtaLogEntry) => void;
 
   /**
-   * SPKI public key (PEM or base64, RSA or EC P-256) for signature verification.
-   * When set, unsigned or wrongly signed patches/bundles are rejected.
-   * Recommended for production to prevent MITM attacks.
+   * POST every event as JSON to `url` (fire-and-forget), with installId, platform,
+   * appVersion, appBuild, runtimeFingerprint, flavor and the running OTA version attached.
+   * A Cloudflare Worker writing to D1/Analytics Engine is enough for a dashboard.
+   */
+  telemetry?: { url: string; headers?: Record<string, string> };
+
+  /**
+   * SPKI public key(s), PEM or base64 (comma-separated for several). Defaults to the
+   * signing + backup keys `patch` embedded in the app: leave it unset.
    */
   publicKey?: string;
 
@@ -178,9 +188,10 @@ type OtaConfig = {
    * `storage` is set; invalid values disable OTA (red box in __DEV__), no fallback.
    */
   customServer?: {
-    baseUrl: string;      // R2 public URL, CDN, or https://raw.githubusercontent.com/<owner>/<repo>/<branch>
+    baseUrl: string;      // R2 public URL (r2.dev or custom domain)
     channel: string;      // flavor
     baseFolder?: string;  // default: 'ota'
+    headers?: Record<string, string>; // sent with every request (e.g. auth for a private server)
   };
 };
 ```
@@ -240,7 +251,13 @@ Your OTA server must expose a `ota_registry.json` at the configured path (e.g. `
               "toVersion": 3,
               "bundleHash": "sha256_of_v3_bundle",
               "platform": "android",
-              "fullBundleUrl": "bundle_1.0.0_v3_android_production.hbc"
+              "fullBundleUrl": "bundle_1.0.0_v3_android_production.hbc",
+              "bundleSize": 8558054,
+              "assetManifestUrl": "asset-manifest_1.0.0_v3_android_production.json",
+              "assetManifestHash": "sha256_of_the_asset_manifest",
+              "flavor": "production",
+              "bundleSignature": "base64…",
+              "entrySignature": "base64…"
             },
             {
               "id": "v2-to-v3-production-android",
@@ -260,6 +277,8 @@ Your OTA server must expose a `ota_registry.json` at the configured path (e.g. `
   }
 }
 ```
+
+Every version also gets `release_<app>_v<N>_<platform>_<flavor>.json` next to its bundle: who published it and when, release notes (`-m`), git commit/branch/dirty, bundle (raw + gzip), patch and asset sizes, and the signing key id. Clients never read it; it's there for a dashboard. It is public like everything in the bucket, so keep notes free of secrets.
 
 Every version has one full-bundle entry (no `filename`) plus patches from the last 5 OTA versions. The client applies the patch whose `fromVersion` is the OTA version installed on the device; otherwise (store build = v1, too far behind, or patch failure) it installs `fullBundleUrl`. The store bundle is never a patch source, so it never has to match byte-for-byte.
 
@@ -291,7 +310,7 @@ This means crash protection is **native-side and zero-cost** — it doesn't requ
 
 ## Custom Storage Provider
 
-The default provider (`GitHubRawStorageProvider`) reads any public static host with the `customServer` layout — Cloudflare R2, GitHub raw, a CDN. Implement the interface only for a backend that needs something else (signed URLs, an API):
+The default provider (`R2StorageProvider`, formerly `GitHubRawStorageProvider`) reads the bucket's public URL with the `customServer` layout. Implement the interface only for a backend that needs something else (signed URLs, an API):
 
 ```ts
 interface OtaStorageProvider {
@@ -325,11 +344,13 @@ const {
   isChecking,       // True while fetching manifest
   metrics,          // OtaMetrics | null — timing/size data after update
   isUpdateReady,    // True if background update is downloaded and ready
+  isMandatory,      // The ready update is mandatory: it reloads as soon as the app is in the foreground
+  installId,        // Stable random ID of this install (rollout bucket, QA lists, telemetry)
   applyUpdate,      // () => Promise<void> — download and apply update immediately
   applyVersion,     // (version) => Promise<void> — download and apply a specific version from the manifest
   resetToFactory,   // () => Promise<void> — wipe OTA state, reload APK/IPA
   markAsHealthy,    // () => Promise<void> — manually mark launch OK
-  checkUpdate,      // () => Promise<void> — manual update check
+  checkUpdate,      // ({ force }?) => Promise<void> — check now (throttled by minCheckIntervalMs unless force)
   reloadBundle,     // () => void — immediately reload JS bundle to apply ready update
 } = useOta();
 ```
@@ -356,31 +377,53 @@ The library ships with an **automated build pipeline** (`tools/build_ota.sh`) th
 ### Commands
 
 ```bash
-npx react-native-bspatch setup                      # once: wire OtaBundleResolver into the app
 npx react-native-bspatch version 1.0.5              # set native version (package.json, Gradle, Xcode)
-# … release 1.0.5 to the stores (this is OTA v1) …
+npx react-native-bspatch patch                      # first run also creates the signing keys and wires the native project
+# … build + release 1.0.5 to the stores (this is OTA v1) …
 npx react-native-bspatch patch android              # build + publish the next OTA
-npx react-native-bspatch patch ios --flavor staging
-npx react-native-bspatch patch                      # both platforms (versions must match)
+npx react-native-bspatch patch ios --flavor staging -m "fix checkout"
+npx react-native-bspatch patch --dry-run            # build everything, upload nothing
+
+npx react-native-bspatch status --flavor production # what's live, who published it, controls
+npx react-native-bspatch doctor                     # check storage URL, keys, native wiring, fingerprint
+npx react-native-bspatch rollout 7 20 --flavor production   # v7 to 20% of installs (100 = everyone)
+npx react-native-bspatch disable 7                  # kill switch (enable 7 undoes it)
+npx react-native-bspatch mandatory 7                # apply v7 as soon as it's downloaded (--off undoes it)
+npx react-native-bspatch qa 7 --ids <installId>,…   # v7 only for these installs (--off undoes it)
+npx react-native-bspatch promote --from staging --flavor production   # ship staging's bundle, no build
+npx react-native-bspatch rollback --to 5            # publish v5's bundle again as the next version
 npx react-native-bspatch reset --flavor staging --push   # wipe this release's OTAs
 ```
+
+Every command takes `--flavor`, `android`/`ios`, `--release-version`, `-y`; `patch`, `promote`, `rollback` and `status` take `--json` (machine-readable output for CI). Controls act on the live version's registry entries and aren't signed: they can only hold an update back or release one that is already signed. Clients pick changes up on their next check.
 
 | Option | Default | Description |
 |---|---|---|
 | `android` / `ios` | both | Platform to patch |
 | `--flavor <name>` | `dev` | Channel (`dev`→`development`, `prod`→`production`) |
 | `--release-version <x.y.z>` | read from `versionName` / `MARKETING_VERSION`, confirmed by prompt | Store release the OTA targets |
-| `-y` | | Skip the prompt, use the detected version |
+| `-m "<notes>"` | asked in a terminal | Release notes, kept in the version's `release_*.json` |
+| `-y` | | Skip the prompts, use the detected version |
+| `--reset-cache` | | Clear the Metro cache before bundling (it's cleared automatically when `.env.<flavor>` changed since the last build) |
+| `--dry-run` | | Build, diff and sign, but upload nothing |
+| `--json` | | Print the version's `release_*.json` after the summary |
 
 The release version is read from the native project (`versionName` / `MARKETING_VERSION`) and confirmed in a prompt — Enter keeps it. `-y` or `--release-version` skip the prompt (CI). Every patch ships a full bundle plus bsdiff patches from the last 5 OTA versions; v1 (the store build) is never a patch source, so nothing has to be captured from the store binary.
 
 ### How It Works
 
-1. **Bundle** — `npx react-native bundle` + `hermesc` generate Hermes bytecode (`.hbc`), uploaded as the version's full bundle.
+1. **Bundle** — `npx react-native bundle` + `hermesc` generate Hermes bytecode (`.hbc`), uploaded gzipped (`.hbc.gz`, ~60% smaller) as the version's full bundle. Clients download it resumably and decompress it natively.
 2. **Assets** — Every asset is copied to the content-addressed `asset-store/` (`{sha256}.{ext}`) and listed in the per-version manifest with its Metro path. Clients download each hash once (cached in `ota/assets/`) and copy it to `ota/vN/<path>` — the location React Native resolves for a bundle loaded from `ota/vN/` (`drawable-*/`, `raw/` on Android; `assets/…` on iOS).
 3. **Patch** — `bsdiff` generates a delta from each of the last 5 OTA bundles (v2+) to the new one.
 4. **Registry** — Updates `ota_registry.json` with new `baseHash`, `bundleHash`, and asset manifest URL for each platform/channel.
-5. **Upload** — Uploads bundles, patches, and asset store to the configured server.
+5. **Upload** — Uploads the bundle, patches and new assets to R2, then the registry.
+6. **Verify** — Reads the release back through `OTA_BASE_URL`, the way the app will: the registry must list the new version, every file must be served and the entries must verify against the signing key. An app pointed at another bucket fails here, not weeks later.
+
+### Runtime fingerprint (native compatibility)
+
+An OTA bundle only installs on a binary with the same native code. `setup` (run by every `patch`) adds a step to the Xcode "Bundle React Native code and images" phase, and the library's Gradle file a `resValue`, that stamp the store build with a fingerprint of its native dependencies: react-native, every direct dependency with native code (name@version), `ios/Podfile.lock` / the Gradle dependency lines, and this library's own native sources (so a JS-only release of the library still ships by OTA). `patch` records the same fingerprint in every entry; a client skips entries for other native code, so adding a native module and publishing an OTA can't crash installed apps. The summary flags it when the fingerprint changed since the live version. Not covered: your own AppDelegate/MainApplication code (changing it needs a store build anyway).
+
+Entries also carry the Hermes bytecode version and a `requires` list of client features (e.g. `gzip`): a client skips what its Hermes can't read or what it doesn't support, instead of failing on it.
 
 ### One-time Setup
 
@@ -416,9 +459,9 @@ customServer: {
 },
 ```
 
-Builds publish to **Cloudflare R2** when `.env.ota` sets `OTA_R2_BUCKET`, otherwise to a GitHub storage repository (auth via `gh auth token` / `GH_TOKEN` / `GITHUB_TOKEN`).
+Builds publish to **Cloudflare R2**, the only supported storage for now.
 
-R2 setup: enable the bucket's Public Development URL (or a custom domain) and create an R2 API token with *Object Read & Write* on the bucket. Uploads use `curl --aws-sigv4`, no extra CLI. Bundles, patches and assets are uploaded once with an immutable cache header; `ota_registry.json` is uploaded last with `no-cache`.
+R2 setup: enable the bucket's Public Development URL (or a custom domain) and create an R2 API token with *Object Read & Write* on the bucket. Uploads use `curl --aws-sigv4`, no extra CLI. Bundles, patches and assets are uploaded once with an immutable cache header; `ota_registry.json` is uploaded last with `no-cache`. Bundles are stored gzip `Content-Encoding` (Hermes bytecode shrinks ~60%): every client's HTTP stack decodes them transparently, older app versions included.
 
 ```bash
 # .env.<flavor>
@@ -433,9 +476,9 @@ OTA_R2_SECRET_ACCESS_KEY=...
 
 | Variable | File | Required | Default | Description |
 |----------|------|----------|---------|-------------|
-| `OTA_BASE_URL` | `.env.<flavor>` | Yes | - | Public base URL (R2 public URL, or `https://raw.githubusercontent.com/<owner>/<repo>/<branch>`) |
-| `OTA_FOLDER` | `.env.<flavor>` | No | `ota` | Folder prefix in storage; only set it to share one bucket/repo with other data (and set `customServer.baseFolder` to match) |
-| `OTA_R2_*` | `.env.ota` | For R2 | - | `ACCOUNT_ID`, `BUCKET`, `ACCESS_KEY_ID`, `SECRET_ACCESS_KEY` |
+| `OTA_BASE_URL` | `.env.<flavor>` | Yes | - | R2 public URL (r2.dev or custom domain) |
+| `OTA_FOLDER` | `.env.<flavor>` | No | `ota` | Folder prefix in storage; only set it to share one bucket with other data (and set `customServer.baseFolder` to match) |
+| `OTA_R2_*` | `.env.ota` | Yes | - | `ACCOUNT_ID`, `BUCKET`, `ACCESS_KEY_ID`, `SECRET_ACCESS_KEY` |
 | `OTA_PRIVATE_KEY` | shell env (CI) | No | - | PEM private key; locally keep `ota_private_key.pem` in the project root instead (`.env.ota` values are single-line) |
 
 Keep both files out of git (`.env.*` in `.gitignore`).
@@ -470,14 +513,27 @@ const otaConfig: OtaConfig = {
 };
 ```
 
+### Zero-setup signing
+
+`patch` handles the key itself, so there is nothing to set up:
+
+- **No key yet** (`ota_private_key.pem` / `OTA_PRIVATE_KEY`) and the app has never been signed: it creates the signing key and a **backup key** (`ota_private_key.backup.pem`) in the project root, gitignores both, and embeds both public keys in the app (`Info.plist` → `BsPatchPublicKey`, `android/app/src/main/res/values/bspatch_public_key.xml`). `OtaProvider` verifies with them when `config.publicKey` isn't set. Commit those files; store builds from then on verify every update.
+- **Move the backup key offline** (password manager) and delete it from the machine. If the signing key is ever lost or leaked, put the backup in its place as `ota_private_key.pem`: installed apps already trust it, so no store build is needed.
+- **Key present**: it must be one of the public keys the app already has (embedded, or `publicKey:` in JS), otherwise `patch` stops before building. An app without embedded keys gets them (plus a backup) on the next patch.
+- **Key missing but the app was signed before** (new machine, CI): `patch` stops and asks for the original (or backup) key instead of creating one, since installed apps would reject anything signed with a new key. On CI, set `OTA_PRIVATE_KEY`.
+
 ### 2. Automated Signing at Build Time
 
-When you run `tools/build_ota.sh`, it automatically searches for `ota_private_key.pem` (or the `OTA_PRIVATE_KEY` environment variable). If found, it **signs each patch (`signature`) and the resulting bundle (`bundleSignature`) with SHA-256** and injects the signatures into `ota_registry.json`. The bundle signature is checked on both the patch path and the full-bundle fallback. If the key is present but a file can't be signed, the build fails.
+When you run `tools/build_ota.sh`, it automatically searches for `ota_private_key.pem` (or the `OTA_PRIVATE_KEY` environment variable). If found, it **signs each patch (`signature`), the resulting bundle (`bundleSignature`) and each registry entry (`entrySignature`) with SHA-256** and injects the signatures into `ota_registry.json`. The bundle signature is checked on both the patch path and the full-bundle fallback. If the key is present but a file can't be signed, the build fails.
+
+`entrySignature` covers the fields that decide what a client installs: `appVersion`, `flavor`, `platform`, `fromVersion`, `toVersion`, `bundleHash`, `assetManifestHash` and `minAppVersion`. The client checks that appVersion, flavor and platform are its own and that the asset manifest matches its hash, so whoever serves the registry (say, a lapsed domain) can't replay another flavor's, platform's or release's signed bundle, or swap images.
+
+> **Upgrading from 4.x:** clients with `publicKey` reject entries without `entrySignature`. Publish once for **each** platform after upgrading, before shipping a store build with the new version.
 
 On the client device:
 - **Android**: Uses Android Security Provider (`SHA256withRSA` / `SHA256withECDSA`).
 - **iOS**: Uses Apple Security framework (`SecKeyVerifySignature`).
-- **Fail closed**: when `publicKey` is set, a missing or invalid signature rejects the update. HMAC/symmetric keys are no longer supported (the public key ships in the app, so it can't be a secret).
+- **Fail closed**: when `publicKey` is set, a missing or invalid signature (bundle, patch or registry entry) rejects the update. HMAC/symmetric keys are no longer supported (the public key ships in the app, so it can't be a secret).
 
 ---
 
@@ -531,7 +587,7 @@ react-native-bspatch/
 │       ├── OtaProvider.tsx           # React provider + update modes
 │       ├── types.ts
 │       └── storage/
-│           └── GitHubRawStorage.ts   # Default provider: any static host (R2, GitHub raw, CDN)
+│           └── R2Storage.ts          # Default provider: R2 public URL
 ├── android/src/main/java/vn/reactnativebspatch/
 │   ├── BsPatchModule.kt              # applyPatch, verifySignature, reload
 │   └── OtaBundleResolver.kt          # Bundle resolution + crash rollback (before JS)
@@ -542,7 +598,7 @@ react-native-bspatch/
 └── tools/
     ├── cli.js                        # bin entry (Yarn Berry runs bins with node)
     ├── build_ota.sh                  # CLI: patch / reset / setup / version
-    ├── upload_ota.sh                 # Upload to Cloudflare R2 or a GitHub storage repo
+    ├── upload_ota.sh                 # Upload to Cloudflare R2
     ├── update_registry.js            # Writes ota_registry.json entries + signatures
     ├── setup_project.js              # AppDelegate / MainApplication wiring
     ├── bump_version.js               # Native version sync

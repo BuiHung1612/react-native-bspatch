@@ -17,8 +17,10 @@ import {
   View,
 } from 'react-native';
 import NativeBsPatch from '../NativeBsPatch';
+import { ineligibleReason } from './eligibility';
+import { getInstallId } from './installId';
 import { applyOtaPatchInternal, fetchOtaManifest, selectUpdate, validateOtaConfig } from './otaCore';
-import { createOtaLogger, OtaEvent } from './otaLogger';
+import { createOtaLogger, OtaEvent, type OtaLogEntry } from './otaLogger';
 import { DOCUMENT_DIR, loadMetadata, markHealthy, OTA_DIR } from './otaMetadata';
 import {
   OtaConfig,
@@ -30,6 +32,23 @@ import {
 } from './types';
 
 const OtaContext = createContext<OtaState | undefined>(undefined);
+
+const DEFAULT_MIN_CHECK_INTERVAL_MS = 10 * 60 * 1000;
+
+/** Sync native getter, '' if it throws */
+const nativeString = (get: () => string): string => {
+  try {
+    return get() ?? '';
+  } catch {
+    return '';
+  }
+};
+
+/** Bytecode version the running Hermes reads (undefined off Hermes) */
+const hermesBytecodeVersion = (): number | undefined => {
+  const v = (globalThis as any).HermesInternal?.getRuntimeProperties?.()?.['Bytecode Version'];
+  return v ? Number(v) : undefined;
+};
 
 export function OtaProvider({
   children,
@@ -58,6 +77,8 @@ export function OtaProvider({
   const [patches, setPatches] = useState<OtaPatch[]>([]);
   const [isInitialized, setIsInitialized] = useState<boolean>(false);
   const [isUpdateReady, setIsUpdateReady] = useState<boolean>(false);
+  const [isMandatory, setIsMandatory] = useState<boolean>(false);
+  const [installId, setInstallId] = useState<string>('');
 
   const appState = useRef(AppState.currentState);
   const isCheckingRef = useRef(false);
@@ -65,6 +86,9 @@ export function OtaProvider({
   /** Version the native resolver loaded for this JS session */
   const runningVersionRef = useRef(config.baseAppVersion);
   const progressRef = useRef(0);
+  const lastCheckRef = useRef(0);
+  const appVersionRef = useRef(config.appVersion ?? '');
+  const installIdRef = useRef('');
   const isDebugUpdateEnabled = !__DEV__ || config.allowDebugUpdates === true;
 
   // No fallbacks: a missing env value disables OTA instead of silently pointing elsewhere.
@@ -85,21 +109,46 @@ export function OtaProvider({
     setProgress(nextProgress);
   }, []);
 
+  /** config.onEvent, plus a fire-and-forget POST to config.telemetry.url */
+  const onEvent = useCallback((entry: OtaLogEntry) => {
+    config.onEvent?.(entry);
+    const telemetry = config.telemetry;
+    if (!telemetry) return;
+    fetch(telemetry.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...telemetry.headers },
+      body: JSON.stringify({
+        ...entry,
+        installId: installIdRef.current,
+        platform: Platform.OS,
+        appVersion: appVersionRef.current,
+        appBuild: nativeString(() => NativeBsPatch.getAppBuild()),
+        runtimeFingerprint: nativeString(() => NativeBsPatch.getRuntimeFingerprint()),
+        flavor: config.customServer?.channel,
+        otaVersion: runningVersionRef.current,
+      }),
+    }).catch(() => {});
+  }, [config]);
+
   const getEffectiveConfig = useCallback(async (): Promise<OtaConfig> => {
-    if (config.appVersion) return config;
+    // The keys `patch` embedded in the app (primary + backup), unless the app passes its own
+    const publicKey = config.publicKey || nativeString(() => NativeBsPatch.getEmbeddedPublicKeys()) || undefined;
+    const base = { ...config, publicKey, onEvent };
+    if (config.appVersion) return base;
     try {
       const nativeVer = await NativeBsPatch.getAppVersion();
       if (!nativeVer) {
         throw new Error('Native appVersion is empty');
       }
-      return { ...config, appVersion: nativeVer };
+      appVersionRef.current = nativeVer;
+      return { ...base, appVersion: nativeVer };
     } catch (e) {
       throw new Error(
         `[OtaProvider] Failed to auto-detect appVersion from native: ${(e as Error).message}. ` +
         `Please set versionName (Android) / CFBundleShortVersionString (iOS), or provide config.appVersion explicitly.`
       );
     }
-  }, [config]);
+  }, [config, onEvent]);
 
   /**
    * Core apply update logic — separated so it can be mapped to button clicks
@@ -184,6 +233,12 @@ export function OtaProvider({
               setStatus(OtaStatus.UP_TO_DATE);
               setMessage(`Update V${targetV} ready for next launch`);
               if (m) setMetrics(m);
+              if (directPatch.mandatory) {
+                setIsMandatory(true);
+                // Only in the foreground: a reload in the background is rolled back (see the
+                // AppState effect); the effect reloads once the app comes back
+                if (AppState.currentState === 'active') NativeBsPatch.reloadBundle();
+              }
             }
           },
           () => {}, // silent: background doesn't spam progress
@@ -201,8 +256,9 @@ export function OtaProvider({
   /**
    * Check for updates from the manifest.
    * Uses a ref to guard against concurrent calls (avoids stale closure).
+   * Automatic calls are throttled by minCheckIntervalMs; { force: true } always checks.
    */
-  const checkUpdates = useCallback(async () => {
+  const checkUpdates = useCallback(async (options?: { force?: boolean }) => {
     if (isCheckingRef.current || configError) return;
     if (!isDebugUpdateEnabled) {
       setPendingCount(0);
@@ -211,6 +267,9 @@ export function OtaProvider({
       setMessage('OTA updates are disabled while running a debug build.');
       return;
     }
+    const minInterval = config.minCheckIntervalMs ?? DEFAULT_MIN_CHECK_INTERVAL_MS;
+    if (!options?.force && Date.now() - lastCheckRef.current < minInterval) return;
+    lastCheckRef.current = Date.now();
     isCheckingRef.current = true;
     setIsChecking(true);
     setStatus(OtaStatus.CHECKING);
@@ -223,14 +282,22 @@ export function OtaProvider({
       const metadata = await loadMetadata(config.baseAppVersion);
       const localV = metadata.currentVersion;
 
-      // The one platform filter (storage providers return every platform).
-      // Also skips versions that crashed on boot and were rolled back natively.
-      const failed = metadata.failedVersions ?? [];
-      const platformPatches = remotePatches.filter(
-        p =>
-          (!p.platform || p.platform.toLowerCase() === Platform.OS) &&
-          !failed.includes(p.toVersion),
-      );
+      // Storage providers return every platform: keep what this install may take (platform,
+      // native fingerprint, Hermes, rollout/QA lists, kill switch, versions that crashed here)
+      const context = {
+        platform: Platform.OS,
+        failedVersions: metadata.failedVersions ?? [],
+        runtimeFingerprint: nativeString(() => NativeBsPatch.getRuntimeFingerprint()),
+        hermesBytecodeVersion: hermesBytecodeVersion(),
+        installId: await getInstallId(),
+      };
+      const platformPatches = remotePatches.filter(p => {
+        const reason = ineligibleReason(p, context);
+        if (reason && __DEV__ && p.toVersion > localV) {
+          console.log(`[OtaProvider] Skipping V${p.toVersion} (${p.id}): ${reason}`);
+        }
+        return !reason;
+      });
 
       const maxV =
         platformPatches.length > 0
@@ -247,7 +314,12 @@ export function OtaProvider({
         setStatus(OtaStatus.UPDATE_AVAILABLE);
 
         // Trigger behaviors based on mode
-        if (config.updateMode === OtaUpdateMode.BACKGROUND_DOWNLOAD) {
+        const network = config.network?.wifiOnly
+          ? await NativeBsPatch.getNetworkType().catch(() => 'unknown')
+          : 'wifi';
+        if (network !== 'wifi' && network !== 'ethernet') {
+          setMessage(`Update available: V${localV} → V${maxV} (waiting for Wi-Fi)`);
+        } else if (config.updateMode === OtaUpdateMode.BACKGROUND_DOWNLOAD) {
           downloadBackgroundUpdate(platformPatches, localV, maxV);
         } else if (
           config.updateMode === OtaUpdateMode.ON_APP_START ||
@@ -283,6 +355,11 @@ export function OtaProvider({
    */
   useEffect(() => {
     const bootstrap = async () => {
+      getInstallId().then(id => {
+        installIdRef.current = id;
+        setInstallId(id);
+      }).catch(() => {});
+
       // Clean up any pending trash directories from previous resets (non-blocking)
       NativeBsPatch.readDir(DOCUMENT_DIR).then(dirs => {
         for (const dir of dirs) {
@@ -320,20 +397,26 @@ export function OtaProvider({
       }
     };
 
-    bootstrap().then(() => setIsInitialized(true)).catch(() => {
-      // Bootstrap failed: keep UI blocked so user sees the error state.
-      // setIsInitialized stays false → isBlocking remains true → the error
-      // message is shown via loadingView instead of a silent blank screen.
-    });
+    // OTA must never take the app down: if bootstrap fails, render the app with OTA idle
+    bootstrap()
+      .catch(error => {
+        console.warn('[OtaProvider] Bootstrap failed, OTA disabled for this session:', error);
+        setMessage(`OTA disabled: ${(error as Error).message}`);
+        setStatus(OtaStatus.ERROR);
+      })
+      .finally(() => setIsInitialized(true));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   /**
-   * AppState listener for ON_APP_FOREGROUND mode.
+   * AppState listener for ON_APP_FOREGROUND mode, and for a mandatory update that got
+   * ready while in the background.
    * A downloaded update is not reloaded on background: iOS suspends JS before the
    * first render, so the native resolver counts the launch as failed and rolls it back.
    * metadata already points at the new version, so the next cold start applies it
    */
+  const isMandatoryRef = useRef(false);
+  isMandatoryRef.current = isMandatory && isUpdateReady;
   useEffect(() => {
     const subscription = AppState.addEventListener(
       'change',
@@ -343,6 +426,10 @@ export function OtaProvider({
           nextAppState === 'active' &&
           bootstrapDone.current
         ) {
+          if (isMandatoryRef.current) {
+            NativeBsPatch.reloadBundle();
+            return;
+          }
           const mode = config.updateMode ?? OtaUpdateMode.MANUAL;
           if (mode === OtaUpdateMode.ON_APP_FOREGROUND) {
             checkUpdates();
@@ -358,14 +445,14 @@ export function OtaProvider({
   }, [config.updateMode, checkUpdates]);
 
   const markAsHealthy = useCallback(async () => {
-    const log = createOtaLogger(config.onEvent);
+    const log = createOtaLogger(onEvent);
     log.emit(OtaEvent.MARK_HEALTHY);
     const appVersion = await NativeBsPatch.getAppVersion().catch(() => config.appVersion);
     await markHealthy(config.baseAppVersion, runningVersionRef.current, appVersion);
-  }, [config]);
+  }, [config, onEvent]);
 
   const resetToFactory = useCallback(async () => {
-    const log = createOtaLogger(config.onEvent);
+    const log = createOtaLogger(onEvent);
     try {
       setStatus(OtaStatus.APPLYING);
       setMessage('Executing system wipe...');
@@ -381,7 +468,7 @@ export function OtaProvider({
       setStatus(OtaStatus.ERROR);
       setMessage(`Reset failed: ${(error as Error).message}`);
     }
-  }, [config]);
+  }, [onEvent]);
 
   // Memoized: consumers re-render only when something they can see changes
   const value = useMemo<OtaState>(() => ({
@@ -394,6 +481,8 @@ export function OtaProvider({
     isChecking,
     metrics,
     isUpdateReady,
+    isMandatory,
+    installId,
     applyUpdate,
     applyVersion,
     resetToFactory,
@@ -410,6 +499,8 @@ export function OtaProvider({
     isChecking,
     metrics,
     isUpdateReady,
+    isMandatory,
+    installId,
     applyUpdate,
     applyVersion,
     resetToFactory,

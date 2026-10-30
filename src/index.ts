@@ -20,7 +20,11 @@ export * from './ota/otaLogger';
 export * from './ota/OtaProvider';
 export * from './ota/types';
 
-export { GitHubRawStorageProvider } from './ota/storage/GitHubRawStorage';
+export {
+  R2StorageProvider,
+  /** @deprecated Renamed to R2StorageProvider */
+  R2StorageProvider as GitHubRawStorageProvider,
+} from './ota/storage/R2Storage';
 
 export default {
   applyPatch,

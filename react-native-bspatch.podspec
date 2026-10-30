@@ -18,7 +18,9 @@ Pod::Spec.new do |s|
   s.exclude_files = "cpp/bspatch_jni.cpp", "cpp/bzip2/**"
   s.public_header_files = 'ios/**/*.h'
 
-  s.library = 'bz2'
+  # bz2: bspatch + decompressFile, z: decompressFile gzip, Network: getNetworkType
+  s.libraries = 'bz2', 'z'
+  s.frameworks = 'Network'
 
   s.pod_target_xcconfig = {
     'OTHER_CFLAGS' => '$(inherited) -O3 -flto'
