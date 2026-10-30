@@ -25,11 +25,19 @@ export const rolloutBucket = (installId: string, version: number): number => {
     return h % 100;
 };
 
-/** Why this client must not install the entry, or null when it may */
-export const ineligibleReason = (e: OtaPatch, ctx: EligibilityContext): string | null => {
+/**
+ * Why this client must not install the entry, or null when it may.
+ * ignoreControls (installing a chosen entry by hand, e.g. QA): skip the kill switch,
+ * rollout and QA list, keep every check that protects the app.
+ */
+export const ineligibleReason = (
+    e: OtaPatch,
+    ctx: EligibilityContext,
+    { ignoreControls = false }: { ignoreControls?: boolean } = {},
+): string | null => {
     if (e.platform && e.platform.toLowerCase() !== ctx.platform) return 'other platform';
     if (ctx.failedVersions.includes(e.toVersion)) return 'crashed on boot here before';
-    if (e.disabled) return 'disabled';
+    if (e.disabled && !ignoreControls) return 'disabled';
     const missing = (e.requires ?? []).filter(f => !SUPPORTED_FEATURES.includes(f));
     if (missing.length) return `needs a newer client (${missing.join(', ')})`;
     if (e.runtimeFingerprint && e.runtimeFingerprint !== ctx.runtimeFingerprint) {
@@ -40,6 +48,7 @@ export const ineligibleReason = (e: OtaPatch, ctx: EligibilityContext): string |
     if (e.hermesBytecodeVersion && ctx.hermesBytecodeVersion && e.hermesBytecodeVersion !== ctx.hermesBytecodeVersion) {
         return `Hermes bytecode ${e.hermesBytecodeVersion}, runtime reads ${ctx.hermesBytecodeVersion}`;
     }
+    if (ignoreControls) return null;
     if (e.allowInstallIds?.length && !e.allowInstallIds.includes(ctx.installId)) return 'not in the QA list';
     if (e.rolloutPercent !== undefined && rolloutBucket(ctx.installId, e.toVersion) >= e.rolloutPercent) {
         return `outside the ${e.rolloutPercent}% rollout`;

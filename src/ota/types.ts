@@ -209,6 +209,12 @@ export type OtaState = {
     applyUpdate: () => Promise<void>;
     /** Installs and reloads `version` from the last checked manifest (full bundle, or a patch from the current version) */
     applyVersion: (version: number) => Promise<void>;
+    /**
+     * Installs and reloads exactly this registry entry (e.g. a row of a version list): its
+     * patch when it starts from the running version, else its full bundle. Ignores the kill
+     * switch, rollout and QA list; still refuses entries for other native code or Hermes.
+     */
+    applyEntry: (entry: OtaPatch) => Promise<void>;
     resetToFactory: () => Promise<void>;
     markAsHealthy: () => Promise<void>;
     /** Checks now unless the last check was under minCheckIntervalMs ago (force: always) */

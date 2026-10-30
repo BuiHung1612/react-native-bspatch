@@ -348,6 +348,7 @@ const {
   installId,        // Stable random ID of this install (rollout bucket, QA lists, telemetry)
   applyUpdate,      // () => Promise<void> — download and apply update immediately
   applyVersion,     // (version) => Promise<void> — download and apply a specific version from the manifest
+  applyEntry,       // (entry) => Promise<void> — install exactly this registry entry (QA/version list); skips kill switch/rollout/QA list, never the native/Hermes checks
   resetToFactory,   // () => Promise<void> — wipe OTA state, reload APK/IPA
   markAsHealthy,    // () => Promise<void> — manually mark launch OK
   checkUpdate,      // ({ force }?) => Promise<void> — check now (throttled by minCheckIntervalMs unless force)

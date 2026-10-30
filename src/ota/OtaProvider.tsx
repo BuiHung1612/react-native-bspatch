@@ -17,7 +17,7 @@ import {
   View,
 } from 'react-native';
 import NativeBsPatch from '../NativeBsPatch';
-import { ineligibleReason } from './eligibility';
+import { ineligibleReason, type EligibilityContext } from './eligibility';
 import { getInstallId } from './installId';
 import { applyOtaPatchInternal, fetchOtaManifest, selectUpdate, validateOtaConfig } from './otaCore';
 import { createOtaLogger, OtaEvent, type OtaLogEntry } from './otaLogger';
@@ -150,23 +150,21 @@ export function OtaProvider({
     }
   }, [config, onEvent]);
 
-  /**
-   * Core apply update logic — separated so it can be mapped to button clicks
-   * OR called automatically by checkUpdates()
-   */
-  const executeApplyUpdate = useCallback(
-    async (patchList: OtaPatch[], currentVer: number, targetVer: number) => {
-      const directPatch = selectUpdate(patchList, currentVer, targetVer);
+  /** What decides which registry entries this install may take */
+  const eligibilityContext = useCallback(async (): Promise<EligibilityContext> => {
+    const metadata = await loadMetadata(config.baseAppVersion);
+    return {
+      platform: Platform.OS,
+      failedVersions: metadata.failedVersions ?? [],
+      runtimeFingerprint: nativeString(() => NativeBsPatch.getRuntimeFingerprint()),
+      hermesBytecodeVersion: hermesBytecodeVersion(),
+      installId: await getInstallId(),
+    };
+  }, [config.baseAppVersion]);
 
-      if (!directPatch) {
-        if (__DEV__) {
-          console.warn('[OtaProvider] No update entry found for', currentVer, '->', targetVer);
-        }
-        setStatus(OtaStatus.ERROR);
-        setMessage('No upgrade path found.');
-        return;
-      }
-
+  /** Installs one registry entry in the foreground (status + progress), then reloads */
+  const installEntry = useCallback(
+    async (directPatch: OtaPatch) => {
       try {
         const effectiveConfig = await getEffectiveConfig();
         setStatus(OtaStatus.DOWNLOADING);
@@ -194,6 +192,46 @@ export function OtaProvider({
     },
     [getEffectiveConfig, setProgressIfChanged],
   );
+
+  /**
+   * Core apply update logic — separated so it can be mapped to button clicks
+   * OR called automatically by checkUpdates()
+   */
+  const executeApplyUpdate = useCallback(
+    async (patchList: OtaPatch[], currentVer: number, targetVer: number) => {
+      const directPatch = selectUpdate(patchList, currentVer, targetVer);
+      if (!directPatch) {
+        if (__DEV__) {
+          console.warn('[OtaProvider] No update entry found for', currentVer, '->', targetVer);
+        }
+        setStatus(OtaStatus.ERROR);
+        setMessage('No upgrade path found.');
+        return;
+      }
+      await installEntry(directPatch);
+    },
+    [installEntry],
+  );
+
+  /**
+   * Installs exactly this registry entry (a version list in a debug/QA screen): the patch
+   * when it starts from the running version, else its full bundle. Ignores the kill switch,
+   * rollout and QA list; still refuses what would break the app (native code, Hermes, …).
+   */
+  const applyEntry = useCallback(async (entry: OtaPatch) => {
+    if (!isDebugUpdateEnabled) {
+      setStatus(OtaStatus.UP_TO_DATE);
+      setMessage('OTA updates are disabled while running a debug build.');
+      return;
+    }
+    const reason = ineligibleReason(entry, await eligibilityContext(), { ignoreControls: true });
+    if (reason) {
+      setStatus(OtaStatus.ERROR);
+      setMessage(`Can't install V${entry.toVersion}: ${reason}`);
+      return;
+    }
+    await installEntry(entry);
+  }, [eligibilityContext, installEntry, isDebugUpdateEnabled]);
 
   /**
    * Exposed method for manual trigger
@@ -284,13 +322,7 @@ export function OtaProvider({
 
       // Storage providers return every platform: keep what this install may take (platform,
       // native fingerprint, Hermes, rollout/QA lists, kill switch, versions that crashed here)
-      const context = {
-        platform: Platform.OS,
-        failedVersions: metadata.failedVersions ?? [],
-        runtimeFingerprint: nativeString(() => NativeBsPatch.getRuntimeFingerprint()),
-        hermesBytecodeVersion: hermesBytecodeVersion(),
-        installId: await getInstallId(),
-      };
+      const context = await eligibilityContext();
       const platformPatches = remotePatches.filter(p => {
         const reason = ineligibleReason(p, context);
         if (reason && __DEV__ && p.toVersion > localV) {
@@ -340,7 +372,7 @@ export function OtaProvider({
       isCheckingRef.current = false;
       setIsChecking(false);
     }
-  }, [config, configError, executeApplyUpdate, isDebugUpdateEnabled, downloadBackgroundUpdate, getEffectiveConfig]);
+  }, [config, configError, eligibilityContext, executeApplyUpdate, isDebugUpdateEnabled, downloadBackgroundUpdate, getEffectiveConfig]);
 
   /**
    * Bootstrap: runs once on mount.
@@ -485,6 +517,7 @@ export function OtaProvider({
     installId,
     applyUpdate,
     applyVersion,
+    applyEntry,
     resetToFactory,
     markAsHealthy,
     checkUpdate: checkUpdates,
@@ -503,6 +536,7 @@ export function OtaProvider({
     installId,
     applyUpdate,
     applyVersion,
+    applyEntry,
     resetToFactory,
     markAsHealthy,
     checkUpdates,

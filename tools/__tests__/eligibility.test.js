@@ -31,6 +31,11 @@ assert.match(why({ allowInstallIds: ['someone-else'] }), /QA/);
 assert.strictEqual(why({ allowInstallIds: ['install-1'] }), null);
 assert.match(why({ rolloutPercent: 0 }), /rollout/);
 assert.strictEqual(why({ rolloutPercent: 100 }), null);
+// Installing a chosen entry by hand skips release controls, never the safety checks
+const manual = (patch, c = ctx) => ineligibleReason({ ...entry, ...patch }, { ...ctx, ...c }, { ignoreControls: true });
+assert.strictEqual(manual({ disabled: true, rolloutPercent: 0, allowInstallIds: ['x'] }), null);
+assert.match(manual({ runtimeFingerprint: 'bbbb' }), /native/);
+assert.match(manual({ hermesBytecodeVersion: 96 }), /Hermes/);
 
 // Rollout: a stable bucket per install, ~the right share, a different slice per version
 const ids = Array.from({ length: 5000 }, (_, i) => `id-${i}`);
