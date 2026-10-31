@@ -89,6 +89,10 @@ export function OtaProvider({
   const lastCheckRef = useRef(0);
   const appVersionRef = useRef(config.appVersion ?? '');
   const installIdRef = useRef('');
+  /** The silent BACKGROUND_DOWNLOAD run, so a foreground install waits for it instead of failing */
+  const backgroundRunRef = useRef<Promise<void> | null>(null);
+  /** Version the background run prepared for the next launch */
+  const preparedVersionRef = useRef(0);
   const isDebugUpdateEnabled = !__DEV__ || config.allowDebugUpdates === true;
 
   // No fallbacks: a missing env value disables OTA instead of silently pointing elsewhere.
@@ -166,10 +170,20 @@ export function OtaProvider({
   const installEntry = useCallback(
     async (directPatch: OtaPatch) => {
       try {
-        const effectiveConfig = await getEffectiveConfig();
         setStatus(OtaStatus.DOWNLOADING);
         progressRef.current = 0;
         setProgress(0);
+        // otaCore runs one update at a time: let a background download finish first
+        if (backgroundRunRef.current) {
+          setMessage('Finishing the background download…');
+          await backgroundRunRef.current;
+        }
+        // Already prepared for the next launch: just switch to it
+        if (preparedVersionRef.current === directPatch.toVersion) {
+          NativeBsPatch.reloadBundle();
+          return;
+        }
+        const effectiveConfig = await getEffectiveConfig();
         await applyOtaPatchInternal(
           directPatch,
           effectiveConfig,
@@ -258,15 +272,16 @@ export function OtaProvider({
       targetV: number,
     ) => {
       const directPatch = selectUpdate(patchList, localV, targetV);
-      if (!directPatch) return;
+      if (!directPatch || backgroundRunRef.current || preparedVersionRef.current === targetV) return;
 
-      try {
+      const run = (async () => {
         const effectiveConfig = await getEffectiveConfig();
         await applyOtaPatchInternal(
           directPatch,
           effectiveConfig,
           (s: OtaStatus, msg: string, m?: OtaMetrics) => {
             if (s === OtaStatus.SUCCESS) {
+              preparedVersionRef.current = targetV;
               setIsUpdateReady(true);
               setStatus(OtaStatus.UP_TO_DATE);
               setMessage(`Update V${targetV} ready for next launch`);
@@ -282,11 +297,15 @@ export function OtaProvider({
           () => {}, // silent: background doesn't spam progress
           { autoReload: false }, // Do NOT reload immediately
         );
-      } catch (e) {
+      })().catch(e => {
         if (__DEV__) {
           console.warn('[OtaProvider] Silent background update failed:', e);
         }
-      }
+      }).finally(() => {
+        backgroundRunRef.current = null;
+      });
+      backgroundRunRef.current = run;
+      await run;
     },
     [getEffectiveConfig],
   );
