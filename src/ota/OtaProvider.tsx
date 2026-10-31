@@ -21,7 +21,7 @@ import { ineligibleReason, type EligibilityContext } from './eligibility';
 import { getInstallId } from './installId';
 import { applyOtaPatchInternal, fetchOtaManifest, selectUpdate, validateOtaConfig } from './otaCore';
 import { createOtaLogger, OtaEvent, type OtaLogEntry } from './otaLogger';
-import { DOCUMENT_DIR, loadMetadata, markHealthy, OTA_DIR } from './otaMetadata';
+import { DOCUMENT_DIR, loadMetadata, markHealthy, nativeString, OTA_DIR } from './otaMetadata';
 import {
   OtaConfig,
   OtaMetrics,
@@ -34,15 +34,6 @@ import {
 const OtaContext = createContext<OtaState | undefined>(undefined);
 
 const DEFAULT_MIN_CHECK_INTERVAL_MS = 10 * 60 * 1000;
-
-/** Sync native getter, '' if it throws */
-const nativeString = (get: () => string): string => {
-  try {
-    return get() ?? '';
-  } catch {
-    return '';
-  }
-};
 
 /** Bytecode version the running Hermes reads (undefined off Hermes) */
 const hermesBytecodeVersion = (): number | undefined => {
@@ -93,6 +84,8 @@ export function OtaProvider({
   const backgroundRunRef = useRef<Promise<void> | null>(null);
   /** Version the background run prepared for the next launch */
   const preparedVersionRef = useRef(0);
+  /** The running foreground install, so a second one (double tap, auto-apply) joins it */
+  const foregroundRunRef = useRef<Promise<void> | null>(null);
   const isDebugUpdateEnabled = !__DEV__ || config.allowDebugUpdates === true;
 
   // No fallbacks: a missing env value disables OTA instead of silently pointing elsewhere.
@@ -168,41 +161,48 @@ export function OtaProvider({
 
   /** Installs one registry entry in the foreground (status + progress), then reloads */
   const installEntry = useCallback(
-    async (directPatch: OtaPatch) => {
-      try {
-        setStatus(OtaStatus.DOWNLOADING);
-        progressRef.current = 0;
-        setProgress(0);
-        // otaCore runs one update at a time: let a background download finish first
-        if (backgroundRunRef.current) {
-          setMessage('Finishing the background download…');
-          await backgroundRunRef.current;
+    (directPatch: OtaPatch): Promise<void> => {
+      if (foregroundRunRef.current) return foregroundRunRef.current;
+      const run = (async () => {
+        try {
+          setStatus(OtaStatus.DOWNLOADING);
+          progressRef.current = 0;
+          setProgress(0);
+          // otaCore runs one update at a time: let a background download finish first
+          if (backgroundRunRef.current) {
+            setMessage('Finishing the background download…');
+            await backgroundRunRef.current;
+          }
+          // Already prepared for the next launch: just switch to it
+          if (preparedVersionRef.current === directPatch.toVersion) {
+            NativeBsPatch.reloadBundle();
+            return;
+          }
+          const effectiveConfig = await getEffectiveConfig();
+          await applyOtaPatchInternal(
+            directPatch,
+            effectiveConfig,
+            (s: OtaStatus, msg: string, m?: OtaMetrics) => {
+              setMessage(msg);
+              setStatus(s);
+              if (m) setMetrics(m);
+            },
+            (percent: number) => {
+              setProgressIfChanged(percent);
+            },
+          );
+        } catch (error) {
+          if (__DEV__) {
+            console.error('[OtaProvider] Update error:', error);
+          }
+          setStatus(OtaStatus.ERROR);
+          setMessage(`Update failed: ${(error as Error).message}`);
         }
-        // Already prepared for the next launch: just switch to it
-        if (preparedVersionRef.current === directPatch.toVersion) {
-          NativeBsPatch.reloadBundle();
-          return;
-        }
-        const effectiveConfig = await getEffectiveConfig();
-        await applyOtaPatchInternal(
-          directPatch,
-          effectiveConfig,
-          (s: OtaStatus, msg: string, m?: OtaMetrics) => {
-            setMessage(msg);
-            setStatus(s);
-            if (m) setMetrics(m);
-          },
-          (percent: number) => {
-            setProgressIfChanged(percent);
-          },
-        );
-      } catch (error) {
-        if (__DEV__) {
-          console.error('[OtaProvider] Update error:', error);
-        }
-        setStatus(OtaStatus.ERROR);
-        setMessage(`Update failed: ${(error as Error).message}`);
-      }
+      })().finally(() => {
+        foregroundRunRef.current = null;
+      });
+      foregroundRunRef.current = run;
+      return run;
     },
     [getEffectiveConfig, setProgressIfChanged],
   );
@@ -257,8 +257,10 @@ export function OtaProvider({
       setMessage('OTA updates are disabled while running a debug build.');
       return;
     }
-    await executeApplyUpdate(patches, currentVersion, targetVersion);
-  }, [currentVersion, executeApplyUpdate, isDebugUpdateEnabled, patches]);
+    // From the installed version: a background install may have moved it past the running one
+    const { currentVersion: localV } = await loadMetadata(config.baseAppVersion);
+    await executeApplyUpdate(patches, localV, targetVersion);
+  }, [config.baseAppVersion, executeApplyUpdate, isDebugUpdateEnabled, patches]);
 
   const applyUpdate = useCallback(
     () => applyVersion(latestVersion),
@@ -356,7 +358,8 @@ export function OtaProvider({
           : localV;
 
       setPatches(platformPatches);
-      setCurrentVersion(localV);
+      // localV is ahead of the running version once a background install committed
+      setCurrentVersion(runningVersionRef.current);
       setLatestVersion(maxV);
 
       if (maxV > localV) {
@@ -370,6 +373,8 @@ export function OtaProvider({
           : 'wifi';
         if (network !== 'wifi' && network !== 'ethernet') {
           setMessage(`Update available: V${localV} → V${maxV} (waiting for Wi-Fi)`);
+          // Nothing re-checks on a network change: ON_APP_START must not keep the loading view up
+          if (config.updateMode === OtaUpdateMode.ON_APP_START) setStatus(OtaStatus.UP_TO_DATE);
         } else if (config.updateMode === OtaUpdateMode.BACKGROUND_DOWNLOAD) {
           downloadBackgroundUpdate(platformPatches, localV, maxV);
         } else if (
@@ -381,7 +386,11 @@ export function OtaProvider({
         }
       } else {
         setPendingCount(0);
-        setMessage(`All systems nominal (V${localV})`);
+        setMessage(
+          localV !== runningVersionRef.current
+            ? `Update V${localV} ready for next launch`
+            : `All systems nominal (V${localV})`,
+        );
         setStatus(OtaStatus.UP_TO_DATE);
       }
     } catch (error) {
@@ -571,6 +580,8 @@ export function OtaProvider({
             status === OtaStatus.CHECKING ||
             status === OtaStatus.DOWNLOADING ||
             status === OtaStatus.APPLYING ||
+            status === OtaStatus.SYNCING_ASSETS ||
+            status === OtaStatus.SUCCESS || // reload pending
             status === OtaStatus.UPDATE_AVAILABLE)))
     );
   }, [useLoadingView, isInitialized, config.updateMode, status]);

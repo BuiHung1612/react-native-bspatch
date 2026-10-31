@@ -1,10 +1,12 @@
 package vn.reactnativebspatch
 
 import android.content.Context
+import android.os.Build
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
 
 /**
  * OtaBundleResolver — encapsulates OTA bundle path resolution with
@@ -38,6 +40,8 @@ object OtaBundleResolver {
     private const val MAX_ROLLBACK = 3
     /** Unverified launches allowed before rollback: a kill before first render is indistinguishable from a crash */
     private const val MAX_LAUNCH_ATTEMPTS = 3
+    /** The binary metadata was written against (Step 0), kept across rollback/factory reset */
+    private val BINARY_KEYS = listOf("appVersion", "runtimeFingerprint", "appBuild")
 
     /** Version this process booted (set by resolve), so markAsHealthy verifies only that one */
     @Volatile private var launchedVersion: Int? = null
@@ -73,8 +77,14 @@ object OtaBundleResolver {
             val otaAppVersion = metadata.optString("appVersion", "")
             val installedAppVersion = context.packageManager
                 .getPackageInfo(context.packageName, 0).versionName ?: ""
-            if (otaAppVersion.isNotEmpty() && otaAppVersion != installedAppVersion) {
-                Log.i(TAG, "Native app $otaAppVersion → $installedAppVersion: discarding OTA state")
+            // Same versionName, new binary: the build number or native fingerprint moved
+            val otaBuild = metadata.optString("appBuild", "")
+            val otaFingerprint = metadata.optString("runtimeFingerprint", "")
+            val installedFingerprint = runtimeFingerprint(context)
+            if ((otaAppVersion.isNotEmpty() && otaAppVersion != installedAppVersion) ||
+                (otaBuild.isNotEmpty() && otaBuild != appBuild(context)) ||
+                (otaFingerprint.isNotEmpty() && installedFingerprint.isNotEmpty() && otaFingerprint != installedFingerprint)) {
+                Log.i(TAG, "Native app $otaAppVersion ($otaBuild) → $installedAppVersion (${appBuild(context)}): discarding OTA state")
                 // JS bootstrap deletes ota_trash_* in the background
                 otaDir.renameTo(File(context.filesDir, "ota_trash_${System.currentTimeMillis()}"))
                 return null
@@ -92,7 +102,8 @@ object OtaBundleResolver {
             if (!lastLaunchOk && currentVersion > baseVersion && launchAttempts < MAX_LAUNCH_ATTEMPTS &&
                 currentBundle.exists()) {
                 metadata.put("launchAttempts", launchAttempts + 1)
-                writeMetadata(metadataFile, metadata)
+                // Unrecorded attempt: a crashing bundle would retry forever → APK bundle
+                if (!writeMetadata(metadataFile, metadata)) return null
                 Log.w(TAG, "Previous launch of V$currentVersion not verified → retry ${launchAttempts + 1}/$MAX_LAUNCH_ATTEMPTS")
                 return currentBundle.absolutePath
             }
@@ -102,9 +113,10 @@ object OtaBundleResolver {
                 // Remember the crashing version so JS never re-applies it
                 val failed = metadata.optJSONArray("failedVersions") ?: JSONArray()
                 failed.put(currentVersion)
+                val old = metadata
                 metadata = performRollback(metadata, baseVersion, rollbackCount, otaDir)
                 metadata.put("failedVersions", failed)
-                metadata.put("appVersion", otaAppVersion)
+                copyBinaryKeys(old, metadata)
                 if (verifiedVersion >= 0) metadata.put("verifiedVersion", verifiedVersion)
                 writeMetadata(metadataFile, metadata)
 
@@ -127,7 +139,7 @@ object OtaBundleResolver {
                 if (newVersion != verifiedVersion) {
                     metadata.put("lastLaunchSuccessful", false)
                     metadata.put("launchAttempts", 1)
-                    writeMetadata(metadataFile, metadata)
+                    if (!writeMetadata(metadataFile, metadata)) return null
                 }
 
                 Log.i(TAG, "Trying rollback bundle: ${rollbackBundle.absolutePath}")
@@ -154,7 +166,8 @@ object OtaBundleResolver {
             if (currentVersion != verifiedVersion) {
                 metadata.put("lastLaunchSuccessful", false)
                 metadata.put("launchAttempts", 1)
-                writeMetadata(metadataFile, metadata)
+                // Not marked pending: a crash would never roll back → APK bundle
+                if (!writeMetadata(metadataFile, metadata)) return null
             }
 
             Log.i(TAG, "Loading OTA bundle: ${bundleFile.absolutePath}")
@@ -242,8 +255,8 @@ object OtaBundleResolver {
             put("lastLaunchSuccessful", true)
             // Keep: otherwise JS re-downloads a version that crashed on boot
             old.optJSONArray("failedVersions")?.let { put("failedVersions", it) }
-            old.optString("appVersion", "").takeIf { it.isNotEmpty() }?.let { put("appVersion", it) }
         }
+        copyBinaryKeys(old, factory)
         writeMetadata(metadataFile, factory)
     }
 
@@ -271,18 +284,37 @@ object OtaBundleResolver {
         }
     }
 
+    private fun copyBinaryKeys(from: JSONObject, to: JSONObject) {
+        for (key in BINARY_KEYS) from.optString(key, "").takeIf { it.isNotEmpty() }?.let { to.put(key, it) }
+    }
+
+    /** versionCode, as getAppBuild reports it to JS */
+    internal fun appBuild(context: Context): String {
+        val info = context.packageManager.getPackageInfo(context.packageName, 0)
+        return if (Build.VERSION.SDK_INT >= 28) info.longVersionCode.toString()
+        else @Suppress("DEPRECATION") info.versionCode.toString()
+    }
+
+    /** resValue generated by this library's build.gradle (tools/fingerprint.js) at app build time */
+    internal fun runtimeFingerprint(context: Context): String = context.getString(R.string.bspatch_runtime_fingerprint)
+
     /**
-     * Writes metadata JSON to disk.
+     * Writes metadata JSON to disk. Returns false if it didn't land.
      */
-    private fun writeMetadata(file: File, metadata: JSONObject) {
-        try {
+    private fun writeMetadata(file: File, metadata: JSONObject): Boolean {
+        return try {
             file.parentFile?.mkdirs()
             // Write-then-rename: a crash mid-write never leaves truncated JSON
             val tmp = File(file.parentFile, "${file.name}.tmp")
-            tmp.writeText(metadata.toString(2))
+            FileOutputStream(tmp).use {
+                it.write(metadata.toString(2).toByteArray())
+                it.fd.sync()
+            }
             if (!tmp.renameTo(file)) throw java.io.IOException("rename failed")
+            true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to write metadata: ${e.message}")
+            false
         }
     }
 }

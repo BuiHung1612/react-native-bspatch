@@ -11,6 +11,10 @@
 #include "bspatch.h"
 #include "bspatch_wrapper.h"
 
+/* Larger than any JS bundle; keeps every size_t/off_t cast exact on 32-bit ABIs, where a
+ * truncated size would map a small buffer that bspatch() bounds-checks with the full int64 */
+#define BSPATCH_MAX_SIZE ((int64_t)512 * 1024 * 1024)
+
 #ifdef __ANDROID__
 #include <android/log.h>
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "bspatch", __VA_ARGS__)
@@ -87,7 +91,7 @@ int apply_bspatch(const char *oldfile, const char *newfile, const char *patchfil
 
 	/* Read lengths from header */
 	newsize = wrapper_offtin(header + 16);
-	if (newsize < 0) {
+	if (newsize < 0 || newsize > BSPATCH_MAX_SIZE) {
 		LOGE("Invalid newsize in patch header: %lld", (long long)newsize);
 		fclose(f);
 		return -1;
@@ -107,6 +111,12 @@ int apply_bspatch(const char *oldfile, const char *newfile, const char *patchfil
 		return -1;
 	}
 	oldsize = sb_old.st_size;
+	if (oldsize > BSPATCH_MAX_SIZE) {
+		LOGE("oldfile too large: %lld", (long long)oldsize);
+		close(fd_old);
+		fclose(f);
+		return -1;
+	}
 
 	if (oldsize > 0) {
 		old = (uint8_t *)mmap(NULL, (size_t)oldsize, PROT_READ, MAP_SHARED, fd_old, 0);
@@ -142,8 +152,17 @@ int apply_bspatch(const char *oldfile, const char *newfile, const char *patchfil
 	}
 
 	if (newsize > 0) {
-		if (ftruncate(fd_new, (off_t)newsize) != 0) {
-			LOGE("Failed to ftruncate newfile to size %lld", (long long)newsize);
+		/* Reserve real blocks, not a sparse ftruncate: a full disk would otherwise
+		 * SIGBUS on a write into the mapping instead of failing here */
+#ifdef __APPLE__
+		fstore_t store = { F_ALLOCATEALL, F_PEOFPOSMODE, 0, (off_t)newsize, 0 };
+		int reserved = fcntl(fd_new, F_PREALLOCATE, &store) != -1 &&
+			ftruncate(fd_new, (off_t)newsize) == 0;
+#else
+		int reserved = posix_fallocate(fd_new, 0, (off_t)newsize) == 0;
+#endif
+		if (!reserved) {
+			LOGE("Failed to reserve %lld bytes for newfile", (long long)newsize);
 			if (old_mmapped) munmap(old, (size_t)oldsize);
 			else if (old) free(old);
 			close(fd_old);

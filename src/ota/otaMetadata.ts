@@ -11,6 +11,24 @@ const ASSET_STORE_DIR = `${OTA_DIR}/assets`;
 /** Per-version list of `hash.ext` store files the version uses (written by otaCore) */
 export const ASSET_LIST_FILE = 'assets.json';
 
+/** Sync native getter, '' if it throws */
+export const nativeString = (get: () => string): string => {
+    try {
+        return get() ?? '';
+    } catch {
+        return '';
+    }
+};
+
+/**
+ * The binary an installed version was verified against, next to appVersion: the native
+ * resolver drops OTA state when a non-empty value differs from the binary's own.
+ */
+const binaryStamp = () => ({
+    runtimeFingerprint: nativeString(() => NativeBsPatch.getRuntimeFingerprint()),
+    appBuild: nativeString(() => NativeBsPatch.getAppBuild()),
+});
+
 /** Serializes metadata updates (see updateMetadata). */
 let saveLock: Promise<void> = Promise.resolve();
 
@@ -102,6 +120,7 @@ export const registerNewVersion = (
     return {
         ...metadata,
         appVersion: appVersion ?? metadata.appVersion,
+        ...binaryStamp(),
         currentVersion: newVersion,
         previousVersions: uniquePrevious,
         rollbackCount: 0,
@@ -126,14 +145,17 @@ export const cleanupOldVersions = async (
             metadata.currentVersion,
             ...(metadata.previousVersions || []),
         ]);
+        const failedVersions = new Set(metadata.failedVersions || []);
 
         for (const item of items) {
             // Check if directory matches "v<number>"
             const versionMatch = item.match(/^v(\d+)$/);
             if (versionMatch) {
                 const ver = parseInt(versionMatch[1], 10);
-                // Higher than current: may be an install in progress, not yet in metadata
-                if (!retainedVersions.has(ver) && ver !== baseVersion && ver < metadata.currentVersion) {
+                // Higher than current: may be an install in progress, not yet in metadata.
+                // A version that crashed and was rolled back is never installed again.
+                const obsolete = failedVersions.has(ver) || (!retainedVersions.has(ver) && ver < metadata.currentVersion);
+                if (obsolete && ver !== metadata.currentVersion && ver !== baseVersion) {
                     const dirPath = `${OTA_DIR}/${item}`;
                     await NativeBsPatch.removePath(dirPath).catch(() => {});
                     if (__DEV__) {
@@ -196,8 +218,9 @@ export const markHealthy = async (
         metadata.currentVersion !== runningVersion
             ? metadata
             : {
-                  ...metadata,
                   // Stamp legacy metadata so the native resolver can detect a store update later
+                  ...binaryStamp(),
+                  ...metadata,
                   appVersion: metadata.appVersion ?? appVersion,
                   lastLaunchSuccessful: true,
                   rollbackCount: 0,

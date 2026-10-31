@@ -114,11 +114,17 @@ const appKeys = () => {
   return keys;
 };
 
-/** Embeds the public keys natively (comma-separated); returns where they went */
-const embed = (publicKeys) => {
+/** Where the app embeds keys natively (Info.plist needs plutil: macOS only) */
+const nativeSpots = () => [
+  ...(fs.existsSync(path.dirname(path.dirname(ANDROID_RES))) ? [rel(ANDROID_RES)] : []),
+  ...(process.platform === 'darwin' ? infoPlists().map(rel) : []),
+];
+
+/** Embeds the public keys natively (comma-separated), in `only` (default: everywhere); returns where they went */
+const embed = (publicKeys, only = nativeSpots()) => {
   const publicKeyBase64 = publicKeys.join(',');
   const written = [];
-  if (fs.existsSync(path.dirname(path.dirname(ANDROID_RES)))) {
+  if (only.includes(rel(ANDROID_RES))) {
     fs.mkdirSync(path.dirname(ANDROID_RES), { recursive: true });
     fs.writeFileSync(
       ANDROID_RES,
@@ -131,7 +137,7 @@ const embed = (publicKeys) => {
     );
     written.push(rel(ANDROID_RES));
   }
-  for (const plist of infoPlists()) {
+  for (const plist of infoPlists().filter(p => only.includes(rel(p)))) {
     execFileSync('plutil', ['-replace', 'BsPatchPublicKey', '-string', publicKeyBase64, plist]);
     written.push(rel(plist));
   }
@@ -170,14 +176,18 @@ if (privateKey) {
         '     (or the backup key, if the app embeds it).',
     );
   }
-  if (checkOnly && !known.some(k => k.native)) {
-    console.log(`key ${keyId(der)} · not embedded in the app yet (the next patch embeds it)`);
+  // Every native location needs it: one platform with a key doesn't cover the other's store builds
+  const missing = nativeSpots().filter(w => !known.some(k => k.native && k.where === w));
+  if (checkOnly && missing.length) {
+    console.log(`key ${keyId(der)} · not embedded in ${missing.join(', ')} yet (the next patch embeds it)`);
     process.exit(2);
   }
-  if (known.some(k => k.native)) {
+  if (!missing.length) {
     console.log(`key ${keyId(der)}`);
   } else {
-    const where = embed([publicKeyBase64, backupPublicKey()]);
+    // The same keys as the other platform (signing + its backup), or a new backup
+    const embedded = known.find(k => k.native)?.keys;
+    const where = embed(embedded || [publicKeyBase64, backupPublicKey()], missing);
     console.error(`  ✓ Embedded the signing + backup public keys in ${where.join(', ')}: commit them; store builds from now on verify updates.`);
     console.log(`key ${keyId(der)} · embedded in app`);
   }

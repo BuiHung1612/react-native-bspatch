@@ -23,6 +23,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -e
+set -o pipefail
 # Resolve symlinks: npx runs us via node_modules/.bin/react-native-bspatch
 SOURCE="$0"
 while [ -L "$SOURCE" ]; do
@@ -141,7 +142,7 @@ if [ "$FLAVOR_LOWER" = "android" ] || [ "$FLAVOR_LOWER" = "ios" ]; then
 fi
 if [ "$ACTION" != "setup" ]; then
   if [ ! -f "$ROOT/.env.$FLAVOR_LOWER" ]; then
-    AVAILABLE=$(cd "$ROOT" && ls .env.* 2>/dev/null | sed 's/^\.env\.//' | grep -vx 'ota' | tr '\n' ' ')
+    AVAILABLE=$(cd "$ROOT" && ls .env.* 2>/dev/null | sed 's/^\.env\.//' | grep -vx 'ota' | tr '\n' ' ' || true)
     echo "❌ .env.$FLAVOR_LOWER not found for flavor '$FLAVOR_LOWER'. Flavors with an env file: ${AVAILABLE:-none}"
     exit 1
   fi
@@ -157,6 +158,17 @@ if [ "$ACTION" = "setup" ]; then
   exit 0
 fi
 
+# ── Helper: compute SHA-256 hash ──────────────────────────────────────────────
+# shasum needs perl, missing on minimal Linux images: sha256sum / openssl / node instead
+sha256() {
+  local H
+  H=$(shasum -a 256 "$1" 2>/dev/null || sha256sum "$1" 2>/dev/null || openssl dgst -sha256 -r "$1" 2>/dev/null \
+    || node -e 'process.stdout.write(require("crypto").createHash("sha256").update(require("fs").readFileSync(process.argv[1])).digest("hex"))' "$1") || true
+  H="${H%% *}"
+  if [[ ! "$H" =~ ^[0-9a-f]{64}$ ]]; then echo "  ❌ Could not compute the SHA-256 of $1" >&2; return 1; fi
+  echo "$H"
+}
+
 # ── Build environment ──────────────────────────────────────────────────────
 if [ "$ACTION" = "ota" ] && [ -z "$SOURCE_FLAVOR" ]; then
   # Kill any existing Metro processes to prevent file locks
@@ -167,7 +179,7 @@ if [ "$ACTION" = "ota" ] && [ -z "$SOURCE_FLAVOR" ]; then
   # so a babel plugin inlining env values would reuse another flavor's output: clear the
   # cache when this flavor's env file changed since the last build, or on --reset-cache.
   METRO_CACHE_DIR=$(node -e "console.log(require('os').tmpdir())")/metro-cache
-  METRO_KEY="$FLAVOR_LOWER $(shasum -a 256 < "$ROOT/.env.$FLAVOR_LOWER" | cut -c1-16)"
+  METRO_KEY="$FLAVOR_LOWER $(sha256 "$ROOT/.env.$FLAVOR_LOWER" | cut -c1-16)"
   if [ "$RESET_CACHE" = true ] || [ "$(cat "$METRO_CACHE_DIR/.bspatch-env" 2>/dev/null)" != "$METRO_KEY" ]; then
     rm -rf "$METRO_CACHE_DIR" # by hand: robust vs ENOTEMPTY
     info metro "stopped · cache cleared"
@@ -196,9 +208,31 @@ if [ "$ACTION" != "setup" ]; then
     info storage "R2 $OTA_R2_BUCKET → $BASE_URL/$BASE_FOLDER"
 
     R2_URL="https://${OTA_R2_ACCOUNT_ID:?set OTA_R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${OTA_R2_BUCKET}"
-    r2() { curl -sS --aws-sigv4 "aws:amz:auto:s3" --user "${OTA_R2_ACCESS_KEY_ID:?}:${OTA_R2_SECRET_ACCESS_KEY:?}" "$@"; }
+    # Credentials as a curl config on stdin: on the command line, `ps` would show the secret
+    r2() { printf 'user = "%s:%s"\n' "${OTA_R2_ACCESS_KEY_ID:?}" "${OTA_R2_SECRET_ACCESS_KEY:?}" | curl -sS -K - --aws-sigv4 "aws:amz:auto:s3" "$@"; }
+    etag() { tr -d '\r' < "$1" | sed -n 's/^[Ee][Tt][Aa][Gg]:[[:space:]]*//p' | tail -n 1; } # <curl -D headers file>
+    # Registry PUT only if storage still holds what this run synced (R2 conditional write): a
+    # parallel publish or an admin change in between fails (412) instead of being overwritten.
+    # Keeps REGISTRY_ETAG current for the next PUT; on failure, PUT_ERROR says why.
+    put_registry() { # <file> <url>
+      local H CODE COND="If-Match: $REGISTRY_ETAG"
+      if [ -z "$REGISTRY_ETAG" ]; then COND="If-None-Match: *"; fi
+      H=$(mktemp)
+      CODE=$(r2 -X PUT -T "$1" -H "Cache-Control: no-cache" -H "$COND" -D "$H" -o /dev/null -w "%{http_code}" "$2") || CODE=0
+      case "$CODE" in
+        2??) REGISTRY_ETAG=$(etag "$H"); rm -f "$H"; return 0 ;;
+        412) PUT_ERROR="registry changed on storage while publishing — re-run" ;;
+        *) PUT_ERROR="registry upload failed (HTTP $CODE)" ;;
+      esac
+      rm -f "$H"; return 1
+    }
+    export -f r2 etag put_registry
     # S3 API, not the public URL: always the latest object, no CDN cache
-    API_HTTP=$(r2 -o "$REGISTRY_SHARED.tmp" -w "%{http_code}" "$R2_URL/$BASE_FOLDER/ota_registry.json" || echo 0)
+    API_HTTP=$(r2 -D "$REGISTRY_SHARED.headers" -o "$REGISTRY_SHARED.tmp" -w "%{http_code}" "$R2_URL/$BASE_FOLDER/ota_registry.json" || echo 0)
+    REGISTRY_ETAG=""
+    if [[ "$API_HTTP" == "200" ]]; then REGISTRY_ETAG=$(etag "$REGISTRY_SHARED.headers"); fi
+    rm -f "$REGISTRY_SHARED.headers"
+    export REGISTRY_ETAG
 
     if [[ "$API_HTTP" == "200" ]] && node -e "JSON.parse(require('fs').readFileSync(process.argv[1],'utf8'))" "$REGISTRY_SHARED.tmp" 2>/dev/null; then
         mv "$REGISTRY_SHARED.tmp" "$REGISTRY_SHARED"
@@ -226,11 +260,6 @@ download_remote() { # <remote path> <dest>
     rm -f "$2.tmp"
     return 1
   fi
-}
-
-# ── Helper: compute SHA-256 hash ──────────────────────────────────────────────
-sha256() {
-  shasum -a 256 "$1" | awk '{print $1}'
 }
 
 # ── Progress ───────────────────────────────────────────────────────────────────
@@ -332,10 +361,16 @@ export -f padr info badge human_size file_size step_progress step_fail run_logge
 
 # ── Release version (native app version the OTA targets) ─────────────────────
 android_version() {
-  sed -nE "s/^[[:space:]]*versionName[[:space:]]+[\"']([^\"']+)[\"'].*/\1/p" "$ROOT/android/app/build.gradle" 2>/dev/null | head -n 1
+  sed -nE "s/^[[:space:]]*versionName[[:space:]]+[\"']([^\"']+)[\"'].*/\1/p" "$ROOT/android/app/build.gradle" 2>/dev/null | head -n 1 || true
 }
-ios_version() {
-  grep -ho 'MARKETING_VERSION = [^;]*' "$ROOT"/ios/*.xcodeproj/project.pbxproj 2>/dev/null | head -n 1 | sed 's/.*= //'
+ios_version() { # extension/test targets can carry their own MARKETING_VERSION: several values → ask
+  local V
+  V=$(grep -ho 'MARKETING_VERSION = [^;]*' "$ROOT"/ios/*.xcodeproj/project.pbxproj 2>/dev/null | sed 's/.*= //' | sort -u || true)
+  if [ "$(echo "$V" | wc -l)" -gt 1 ]; then
+    echo "❌ The Xcode project has several MARKETING_VERSION values ($(echo "$V" | tr '\n' ' ')). Pass --release-version <x.y.z>." >&2
+    return 1
+  fi
+  echo "$V"
 }
 
 if [ -n "$APP_VERSION_ARG" ]; then
@@ -343,9 +378,9 @@ if [ -n "$APP_VERSION_ARG" ]; then
 elif [ "$PLATFORM_ARG" = "android" ]; then
   APP_VERSION=$(android_version)
 elif [ "$PLATFORM_ARG" = "ios" ]; then
-  APP_VERSION=$(ios_version)
+  APP_VERSION=$(ios_version) || exit 1
 else
-  AV=$(android_version); IV=$(ios_version)
+  AV=$(android_version); IV=$(ios_version) || exit 1
   if [ -n "$AV" ] && [ -n "$IV" ] && [ "$AV" != "$IV" ]; then
     # One registry key per release version: publishing both under one would strand one platform
     echo "❌ Android is $AV but iOS is $IV. Run 'patch android' and 'patch ios' separately."
@@ -381,7 +416,8 @@ if [ "$ACTION" = "ota" ]; then
   KEY_NOTE=$(node "$SCRIPT_DIR/ensure_signing_key.js" "$ROOT" "$REGISTRY_SHARED" "${KEY_FLAGS[@]}") || exit 1
   info signing "$KEY_NOTE"
   # Native wiring (resolver, fingerprint build step) kept current without a separate setup run
-  WIRED=$(node "$SCRIPT_DIR/setup_project.js" --root "$ROOT" --quiet | paste -sd ',' - | sed 's/,/, /g')
+  WIRED=$(node "$SCRIPT_DIR/setup_project.js" --root "$ROOT" --quiet | paste -sd ',' - | sed 's/,/, /g') \
+    || { echo "  ❌ Wiring the native project failed (setup_project.js)"; exit 1; }
   if [ -n "$WIRED" ]; then
     info wiring "${YELLOW}updated: $WIRED${RESET} ${DIM}(commit; store builds from now on carry it)${RESET}"
   else
@@ -400,8 +436,11 @@ if [ "$ACTION" = "admin" ]; then
     for F in $(node -e '
       const [reg, app, flavor] = process.argv.slice(1);
       const g = JSON.parse(require("fs").readFileSync(reg, "utf8")).apps?.[app]?.flavors?.[flavor];
-      for (const p of new Set((g?.patches || []).map(e => e.platform)))
-        console.log(`release_${app}_v${g.latestOtaVersion}_${p}_${flavor}.json`);
+      // Each platform its own live version: one platform may be behind the other
+      for (const p of new Set((g?.patches || []).map(e => e.platform))) {
+        const v = Math.max(...g.patches.filter(e => e.platform === p).map(e => e.toVersion));
+        console.log(`release_${app}_v${v}_${p}_${flavor}.json`);
+      }
     ' "$REGISTRY_SHARED" "$APP_VERSION" "$FLAVOR_LOWER"); do
       download_remote "$BASE_FOLDER/$APP_VERSION/$FLAVOR_LOWER/$F" "$RELEASES_DIR/$F" || true
     done
@@ -422,8 +461,7 @@ if [ "$ACTION" = "admin" ]; then
     if [ "$DRY_RUN" = true ]; then
       info registry "not uploaded ${DIM}(dry run)${RESET}"
     else
-      r2 -f -X PUT -T "$REGISTRY_SHARED" -H "Cache-Control: no-cache" "$R2_URL/$BASE_FOLDER/ota_registry.json" -o /dev/null \
-        || { echo "  ❌ Uploading the registry failed"; exit 1; }
+      put_registry "$REGISTRY_SHARED" "$R2_URL/$BASE_FOLDER/ota_registry.json" || { echo "  ❌ $PUT_ERROR"; exit 1; }
       info registry "uploaded · clients see it on their next check"
     fi
     exit 0
@@ -436,20 +474,19 @@ if [ "$ACTION" = "reset" ]; then
   # Reset only the specific flavor in registry JSON if registry exists
   LATEST=1
   if [ -f "$REGISTRY_SHARED" ]; then
-    LATEST=$(node -e "
-      try {
-        const fs = require('fs');
-        const reg = JSON.parse(fs.readFileSync('$REGISTRY_SHARED', 'utf8'));
-        const flavors = reg.apps?.['$APP_VERSION']?.flavors;
-        if (flavors?.['$FLAVOR_LOWER']) {
-          // Keep the counter: reused numbers would make clients on an old vN skip the new vN,
-          // and reused file names would serve stale cached bundles
-          flavors['$FLAVOR_LOWER'] = { latestOtaVersion: flavors['$FLAVOR_LOWER'].latestOtaVersion || 1, patches: [] };
-        }
-        fs.writeFileSync('$REGISTRY_SHARED', JSON.stringify(reg, null, 4));
-        console.log(flavors?.['$FLAVOR_LOWER']?.latestOtaVersion || 1);
-      } catch(e) { console.log(1); }
-    ")
+    LATEST=$(node -e '
+      const fs = require("fs");
+      const [file, app, flavor] = process.argv.slice(1);
+      const reg = JSON.parse(fs.readFileSync(file, "utf8"));
+      const flavors = reg.apps?.[app]?.flavors;
+      if (flavors?.[flavor]) {
+        // Keep the counter: reused numbers would make clients on an old vN skip the new vN,
+        // and reused file names would serve stale cached bundles
+        flavors[flavor] = { latestOtaVersion: flavors[flavor].latestOtaVersion || 1, patches: [] };
+      }
+      fs.writeFileSync(file, JSON.stringify(reg, null, 4));
+      console.log(flavors?.[flavor]?.latestOtaVersion || 1);
+    ' "$REGISTRY_SHARED" "$APP_VERSION" "$FLAVOR_LOWER") || exit 1
   else
     echo '{"apps":{}}' > "$REGISTRY_SHARED"
   fi
@@ -477,7 +514,7 @@ fi
 
 # ── Ensure bsdiff compiled ───────────────────────────────────────────────────
 if [ ! -f "$BSDIFF" ] || [ "$SCRIPT_DIR/bsdiff.c" -nt "$BSDIFF" ]; then
-  clang -O2 -D BSDIFF_EXECUTABLE -o "$BSDIFF" "$SCRIPT_DIR/bsdiff.c" -lbz2
+  "${CC:-cc}" -O2 -D BSDIFF_EXECUTABLE -o "$BSDIFF" "$SCRIPT_DIR/bsdiff.c" -lbz2
   info bsdiff "compiled"
 fi
 
@@ -497,6 +534,20 @@ find_hermesc() {
   fi
 }
 
+# The hash storage records for vN's bundle: its registry entry, else its release_*.json ("" if neither)
+recorded_hash() { # <version> <platform> <dir for the download>
+  local H R="release_${APP_VERSION}_v$1_$2_${FLAVOR_LOWER}.json"
+  H=$(node -e '
+    const [reg, app, flavor, platform, v] = process.argv.slice(1);
+    const g = JSON.parse(require("fs").readFileSync(reg, "utf8")).apps?.[app]?.flavors?.[flavor];
+    console.log((g?.patches || []).find(e => e.platform === platform && e.toVersion === +v)?.bundleHash || "");
+  ' "$REGISTRY_SHARED" "$APP_VERSION" "$FLAVOR_LOWER" "$2" "$1") || return 1
+  if [ -z "$H" ] && download_remote "$BASE_FOLDER/$APP_VERSION/$FLAVOR_LOWER/$R" "$3/$R"; then
+    H=$(node -p 'require(process.argv[1]).bundle?.hash || ""' "$3/$R") || return 1
+  fi
+  echo "$H"
+}
+
 build_platform() {
   local PLATFORM="$1"
   local FLAVOR="$2"
@@ -505,7 +556,7 @@ build_platform() {
   local FLAVOR_LOWER=$(echo "$FLAVOR" | tr '[:upper:]' '[:lower:]')
   if [ "$FLAVOR_LOWER" = "dev" ]; then FLAVOR_LOWER="development"; fi
   if [ "$FLAVOR_LOWER" = "prod" ]; then FLAVOR_LOWER="production"; fi
-  local FLAVOR_CAP=$(echo "$FLAVOR_LOWER" | perl -ne 'print ucfirst')
+  local FLAVOR_CAP; FLAVOR_CAP="$(echo "${FLAVOR_LOWER:0:1}" | tr '[:lower:]' '[:upper:]')${FLAVOR_LOWER:1}"
 
   local OUTPUT="$ROOT/android/output"
   if [ "$PLATFORM" == "ios" ]; then OUTPUT="$ROOT/ios/output"; fi
@@ -530,10 +581,13 @@ build_platform() {
 
   if [ -n "$SOURCE_FLAVOR" ]; then
     # ── Source: a bundle already on storage (promote / rollback), nothing is built ──
+    # This platform's latest there: the other platform's may be newer
     local SRC_V="${SOURCE_VERSION:-$(node -e '
-      const [reg, app, flavor] = process.argv.slice(1);
-      console.log(JSON.parse(require("fs").readFileSync(reg, "utf8")).apps?.[app]?.flavors?.[flavor]?.latestOtaVersion || "");
-    ' "$REGISTRY_SHARED" "$APP_VERSION" "$SOURCE_FLAVOR")}"
+      const [reg, app, flavor, platform] = process.argv.slice(1);
+      const g = JSON.parse(require("fs").readFileSync(reg, "utf8")).apps?.[app]?.flavors?.[flavor];
+      const v = (g?.patches || []).filter(e => e.platform === platform).map(e => e.toVersion);
+      console.log(v.length ? Math.max(...v) : "");
+    ' "$REGISTRY_SHARED" "$APP_VERSION" "$SOURCE_FLAVOR" "$PLATFORM")}"
     local SRC_PREFIX="$BASE_FOLDER/$APP_VERSION/$SOURCE_FLAVOR"
     local SRC_SUFFIX="${APP_VERSION}_v${SRC_V}_${PLATFORM}_${SOURCE_FLAVOR}"
     step "Source" BUILD
@@ -613,7 +667,7 @@ build_platform() {
   step "Assets" BUILD
   if [ -d "$ASSETS_SRC_DIR" ]; then
     while IFS= read -r -d '' ASSET_FILE; do
-      local HASH=$(sha256 "$ASSET_FILE")
+      local HASH; HASH=$(sha256 "$ASSET_FILE") || exit 1
       local FNAME=$(basename "$ASSET_FILE")
       local EX="${FNAME##*.}"
       # Capture relative path for resolver matching
@@ -639,20 +693,25 @@ EOF
   # ── Patches ──
   # From the last 5 OTA versions only (never v1 = store build). Clients on the
   # store build or further behind download the full bundle.
-  local NEW_HASH=$(sha256 "$NEW_BUNDLE_PATH")
+  local NEW_HASH; NEW_HASH=$(sha256 "$NEW_BUNDLE_PATH") || exit 1
   local PATCHES_JSON="["
   local FIRST_FROM=$((NEXT - 5)); if [ $FIRST_FROM -lt 2 ]; then FIRST_FROM=2; fi
   local PATCH_SIZES=() PATCH_MISSING="" # "from|bytes"
   step "Patches" DIFF
   for (( i=FIRST_FROM; i<NEXT; i++ )); do
     local OLD_B="bundle_${APP_VERSION}_v${i}_${PLATFORM}_${FLAVOR_LOWER}.hbc"
-    local OLD_P="$OUTPUT/$OLD_B"
-    if [ ! -f "$OLD_P" ]; then
+    local OLD_P="$OUTPUT/$OLD_B" BASE_HASH
+    # Only a base with the hash storage records for v$i: a local copy can be stale (dry run,
+    # failed upload, another bucket), and a wrong baseHash sends every client to the full bundle
+    BASE_HASH=$(recorded_hash "$i" "$PLATFORM" "$WORKSPACE") || BASE_HASH=""
+    if [ -f "$OLD_P" ] && [ "$(sha256 "$OLD_P" || true)" != "$BASE_HASH" ]; then rm -f "$OLD_P"; fi
+    if [ -n "$BASE_HASH" ] && [ ! -f "$OLD_P" ]; then
       step_progress "v$i: fetching bundle…"
       if download_remote "$BASE_FOLDER/$APP_VERSION/$FLAVOR_LOWER/$OLD_B.gz" "$OLD_P.gz"; then
         gunzip -c "$OLD_P.gz" > "$OLD_P" || rm -f "$OLD_P"
         rm -f "$OLD_P.gz"
       fi
+      if [ -f "$OLD_P" ] && [ "$(sha256 "$OLD_P" || true)" != "$BASE_HASH" ]; then rm -f "$OLD_P"; fi
     fi
     if [ ! -f "$OLD_P" ]; then
       PATCH_MISSING="${PATCH_MISSING:+$PATCH_MISSING, }v$i"
@@ -663,7 +722,7 @@ EOF
     "$BSDIFF" "$OLD_P" "$NEW_BUNDLE_PATH" "$OUTPUT/$PNAME"
     PATCH_SIZES+=("$i|$(file_size "$OUTPUT/$PNAME")")
     if [ "$PATCHES_JSON" != "[" ]; then PATCHES_JSON+=", "; fi
-    PATCHES_JSON+="{\"from\": $i, \"to\": $NEXT, \"file\": \"$PNAME\", \"baseHash\": \"$(sha256 "$OLD_P")\", \"bundleHash\": \"$NEW_HASH\"}"
+    PATCHES_JSON+="{\"from\": $i, \"to\": $NEXT, \"file\": \"$PNAME\", \"baseHash\": \"$BASE_HASH\", \"bundleHash\": \"$NEW_HASH\"}"
   done
   PATCHES_JSON+="]"
   case ${#PATCH_SIZES[@]} in
@@ -709,7 +768,7 @@ EOF
     kv "v${L%%|*} → v$NEXT" "${BOLD}$(human_size "${L#*|}")${RESET} patch  ${BOLD}${GREEN}$(awk -v p="${L#*|}" -v f="$FULL_BYTES" 'BEGIN { printf "−%.1f%%", 100 - p * 100 / f }')${RESET}"
   done
   kv "v1 → v$NEXT" "${BOLD}$(human_size "$FULL_BYTES")${RESET} full bundle ${DIM}(gzip · $(human_size "$RAW_BYTES") raw)${RESET}"
-  if [ -n "$PATCH_MISSING" ]; then kv "$PATCH_MISSING" "${DIM}no bundle on storage → full bundle${RESET}"; fi
+  if [ -n "$PATCH_MISSING" ]; then kv "$PATCH_MISSING" "${DIM}no verified bundle on storage → full bundle${RESET}"; fi
   if [ -n "$UP_ASSETS" ]; then kv "assets" "$UP_ASSETS"; fi
   local COMMIT=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)
   if [ -n "$COMMIT" ]; then
@@ -743,12 +802,11 @@ if [ "$FLAVOR_LOWER" = "prod" ]; then FLAVOR_LOWER="production"; fi
 # Read current version once to coordinate across platforms
 CURRENT_TOTAL=0
 if [ -f "$REGISTRY_SHARED" ]; then
-  CURRENT_TOTAL=$(node -e "
-    try {
-      const reg = JSON.parse(require('fs').readFileSync('$REGISTRY_SHARED','utf8'));
-      console.log(reg.apps['$APP_VERSION']?.flavors?.['$FLAVOR_LOWER']?.latestOtaVersion || 0);
-    } catch(e) { console.log(0); }
-  ")
+  CURRENT_TOTAL=$(node -e '
+    const [file, app, flavor] = process.argv.slice(1);
+    const reg = JSON.parse(require("fs").readFileSync(file, "utf8"));
+    console.log(reg.apps?.[app]?.flavors?.[flavor]?.latestOtaVersion || 0);
+  ' "$REGISTRY_SHARED" "$APP_VERSION" "$FLAVOR_LOWER") || exit 1
 fi
 
 # v1 is the store build: the first OTA build is v2

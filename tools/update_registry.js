@@ -65,7 +65,9 @@ if (fs.existsSync(registryPath)) {
   try {
     registry = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
   } catch (e) {
-    console.warn('  ⚠ Failed to parse existing registry, starting fresh');
+    // Starting fresh would publish a registry with only this flavor over the remote one
+    console.error(`  ❌ ${registryPath} is not valid JSON (${e.message}): re-run to sync it from storage`);
+    process.exit(1);
   }
 }
 

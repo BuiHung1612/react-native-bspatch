@@ -8,7 +8,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Called by build_ota.sh inside its Upload/Remote step: env (.env.<flavor> + .env.ota)
-# and the step_progress/step_fail/run_logged helpers are exported from there
+# and the step_progress/step_fail/run_logged/r2/put_registry helpers (+ REGISTRY_ETAG) are exported from there
 ROOT_DIR=$(pwd)
 
 BASE_FOLDER="${OTA_FOLDER:-ota}"
@@ -52,10 +52,9 @@ is_release_file() {
     [[ "$FNAME" == *"_${APP_VERSION}_"* ]] && [[ "$FNAME" == *"_${CHANNEL}."* || "$FNAME" == *"_${CHANNEL}_"* ]]
 }
 
-# ── Cloudflare R2 (S3 API, signed by curl --aws-sigv4; no CLI needed) ────────
+# ── Cloudflare R2 (S3 API, signed by curl --aws-sigv4 in build_ota.sh's r2; no CLI needed) ──
 : "${OTA_R2_ACCOUNT_ID:?set OTA_R2_ACCOUNT_ID}" "${OTA_R2_ACCESS_KEY_ID:?set OTA_R2_ACCESS_KEY_ID}" "${OTA_R2_SECRET_ACCESS_KEY:?set OTA_R2_SECRET_ACCESS_KEY}"
 R2_URL="https://${OTA_R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${OTA_R2_BUCKET}"
-r2() { curl -sS --aws-sigv4 "aws:amz:auto:s3" --user "$OTA_R2_ACCESS_KEY_ID:$OTA_R2_SECRET_ACCESS_KEY" "$@"; }
 # "patch_1.0.4_v4_to_v7_…" → "patch v4 → v7", "bundle_…_v7_…" → "bundle v7"
 pretty() {
     case "$1" in
@@ -67,12 +66,38 @@ pretty() {
     esac
 }
 TOTAL_BYTES=0
-r2_put() { # <file> <key> <cache-control> <label>
+# The live registry lists v$OTA_VERSION for this platform: its files are published, never replace them
+version_live() {
+    r2 -f "$R2_URL/$BASE_FOLDER/ota_registry.json" -o "$WORK/live.json" 2>/dev/null || return 1
+    node -e '
+      const [file, app, channel, platform, v] = process.argv.slice(1);
+      const g = JSON.parse(require("fs").readFileSync(file, "utf8")).apps?.[app]?.flavors?.[channel];
+      process.exit((g?.patches || []).some(e => e.platform === platform && e.toVersion === Number(v)) ? 0 : 1);
+    ' "$WORK/live.json" "$APP_VERSION" "$CHANNEL" "$PLATFORM" "$OTA_VERSION"
+}
+# Uploaded over 15 minutes ago: no publish still running wrote it
+leftover() {
+    local MODIFIED; MODIFIED=$(r2 -fI "$R2_URL/$1" | tr -d '\r' | sed -n 's/^[Ll]ast-[Mm]odified: //p')
+    [ -n "$MODIFIED" ] && node -e 'process.exit(Date.now() - Date.parse(process.argv[1]) > 15 * 60e3 ? 0 : 1)' "$MODIFIED"
+}
+r2_put() { # <file> <key> <cache-control> <label>; never overwrites a published version (If-None-Match)
     local SIZE; SIZE=$(file_size "$1")
     RUN_NOTE="↑ $4 · $(human_size "$SIZE")" run_logged "$WORK/curl.log" \
-        r2 -f -X PUT -T "$1" -H "Cache-Control: $3" "$R2_URL/$2" -o /dev/null \
-        || { step_fail "upload failed: $2"; cat "$WORK/curl.log"; exit 1; }
+        r2 -f -X PUT -T "$1" -H "Cache-Control: $3" -H "If-None-Match: *" "$R2_URL/$2" -o /dev/null \
+        || {
+            if ! grep -q 'error: 412' "$WORK/curl.log"; then step_fail "upload failed: $2"; cat "$WORK/curl.log"; exit 1; fi
+            if version_live; then step_fail "v$OTA_VERSION is already published: $2"; exit 1; fi
+            # Not in the registry: a failed publish's leftover (old) or a parallel publish uploading now (recent)
+            if ! leftover "$2"; then step_fail "v$OTA_VERSION is being published by another run: $2 (re-run after it)"; exit 1; fi
+            RUN_NOTE="↑ $4 · replacing an unpublished leftover" run_logged "$WORK/curl.log" \
+                r2 -f -X PUT -T "$1" -H "Cache-Control: $3" "$R2_URL/$2" -o /dev/null \
+                || { step_fail "upload failed: $2"; cat "$WORK/curl.log"; exit 1; }
+        }
     TOTAL_BYTES=$((TOTAL_BYTES + SIZE))
+}
+upload_registry() { # conditional on the synced version (put_registry): a concurrent change fails, never lost
+    put_registry "$REGISTRY_FILE" "$R2_URL/$BASE_FOLDER/ota_registry.json" || { step_fail "$PUT_ERROR"; exit 1; }
+    report REGISTRY_ETAG "$REGISTRY_ETAG"
 }
 RELEASE_PREFIX="$BASE_FOLDER/$APP_VERSION/$CHANNEL"
 IMMUTABLE="public, max-age=31536000, immutable"
@@ -80,6 +105,8 @@ IMMUTABLE="public, max-age=31536000, immutable"
 if [ "$CLEAN_REMOTE" = true ]; then
     # ponytail: one ListObjectsV2 page (1000 keys); a release+channel holds far fewer
     LISTING=$(r2 -f "$R2_URL?list-type=2&prefix=$RELEASE_PREFIX/") || { step_fail "listing $RELEASE_PREFIX/ failed"; exit 1; }
+    # Registry first: once it lists none of these files, deleting them (or failing halfway) breaks no client
+    upload_registry
     DELETED=0; BUNDLES=0; PATCHES=0; MANIFESTS=0
     for KEY in $(echo "$LISTING" | grep -o '<Key>[^<]*</Key>' | sed 's/<[^>]*>//g'); do
         r2 -f -X DELETE "$R2_URL/$KEY" -o /dev/null || { step_fail "delete failed: $KEY"; exit 1; }
@@ -87,8 +114,6 @@ if [ "$CLEAN_REMOTE" = true ]; then
         case "$KEY" in *.hbc) BUNDLES=$((BUNDLES + 1)) ;; *.patch) PATCHES=$((PATCHES + 1)) ;; *.json) MANIFESTS=$((MANIFESTS + 1)) ;; esac
         step_progress "deleting… $DELETED"
     done
-    # Registry last: clients never see a version whose files aren't uploaded yet
-    r2 -f -X PUT -T "$REGISTRY_FILE" -H "Cache-Control: no-cache" "$R2_URL/$BASE_FOLDER/ota_registry.json" -o /dev/null || { step_fail "upload failed: ota_registry.json"; exit 1; }
     report UP_SIZE "$DELETED deleted"
     report UP_NOTE "$BUNDLES bundles · $PATCHES patches · $MANIFESTS manifests · registry updated"
     exit 0
@@ -124,13 +149,19 @@ if [ ${#ASSETS[@]} -gt 0 ]; then
         KEY="$BASE_FOLDER/assets/$(basename "$FILE")"
         grep -qxF "$KEY" "$WORK/remote-assets" && continue
         step_progress "↑ asset $((NEW + 1)) · $(basename "$FILE")"
-        r2 -f -X PUT -T "$FILE" -H "Cache-Control: $IMMUTABLE" "$R2_URL/$KEY" -o /dev/null || { step_fail "upload failed: $KEY"; exit 1; }
-        NEW=$((NEW + 1)); NEW_BYTES=$((NEW_BYTES + $(file_size "$FILE")))
+        CODE=$(r2 -X PUT -T "$FILE" -H "Cache-Control: $IMMUTABLE" -H "If-None-Match: *" "$R2_URL/$KEY" -o /dev/null -w "%{http_code}") || CODE=0
+        case "$CODE" in
+            2??) NEW=$((NEW + 1)); NEW_BYTES=$((NEW_BYTES + $(file_size "$FILE"))) ;;
+            412) ;; # uploaded meanwhile: content-addressed, so the same bytes
+            *) step_fail "upload failed: $KEY (HTTP $CODE)"; exit 1 ;;
+        esac
     done
     report UP_ASSETS "$NEW new of ${#ASSETS[@]} · $(human_size "$NEW_BYTES")"; TOTAL_BYTES=$((TOTAL_BYTES + NEW_BYTES))
 fi
 
 # Registry last: clients never see a version whose files aren't uploaded yet
-r2_put "$REGISTRY_FILE" "$BASE_FOLDER/ota_registry.json" "no-cache" "registry"
+step_progress "↑ registry"
+upload_registry
+TOTAL_BYTES=$((TOTAL_BYTES + $(file_size "$REGISTRY_FILE")))
 report UP_SIZE "$(human_size "$TOTAL_BYTES")"
 report UP_DEST "R2 $OTA_R2_BUCKET"

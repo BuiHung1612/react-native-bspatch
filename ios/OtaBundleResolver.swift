@@ -39,6 +39,8 @@ public class OtaBundleResolver: NSObject {
     /// background reload, then swiped away) is indistinguishable from a crash
     private static let maxLaunchAttempts = 3
     private static let maxRollbackIterations = 10 // Safety limit to prevent infinite loops
+    /// The binary metadata was written against (Step 0), kept across rollback/factory reset
+    private static let binaryKeys = ["appVersion", "runtimeFingerprint", "appBuild"]
 
     /// Version this process booted (set by resolve), so markAsHealthy verifies only that one
     private static var launchedVersion: Int?
@@ -79,8 +81,14 @@ public class OtaBundleResolver: NSObject {
             // ── Step 0: Store update → OTA bundles were built for another native version ──
             let otaAppVersion = metadata["appVersion"] as? String ?? ""
             let installedAppVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
-            if !otaAppVersion.isEmpty && otaAppVersion != installedAppVersion {
-                NSLog("[OtaBundleResolver] Native app \(otaAppVersion) → \(installedAppVersion): discarding OTA state")
+            // Same versionName, new binary: the build number or native fingerprint moved
+            let otaBuild = metadata["appBuild"] as? String ?? ""
+            let otaFingerprint = metadata["runtimeFingerprint"] as? String ?? ""
+            let installedFingerprint = runtimeFingerprint()
+            if (!otaAppVersion.isEmpty && otaAppVersion != installedAppVersion)
+                || (!otaBuild.isEmpty && otaBuild != appBuild())
+                || (!otaFingerprint.isEmpty && !installedFingerprint.isEmpty && otaFingerprint != installedFingerprint) {
+                NSLog("[OtaBundleResolver] Native app \(otaAppVersion) (\(otaBuild)) → \(installedAppVersion) (\(appBuild())): discarding OTA state")
                 // JS bootstrap deletes ota_trash_* in the background
                 let trash = documentsDir.appendingPathComponent("ota_trash_\(Int(Date().timeIntervalSince1970 * 1000))")
                 try? FileManager.default.moveItem(at: otaDir, to: trash)
@@ -99,7 +107,8 @@ public class OtaBundleResolver: NSObject {
             if !lastLaunchOk && currentVersion > baseVersion && launchAttempts < maxLaunchAttempts
                 && FileManager.default.fileExists(atPath: currentBundle.path) {
                 metadata["launchAttempts"] = launchAttempts + 1
-                writeMetadata(url: metadataURL, metadata: metadata)
+                // Unrecorded attempt: a crashing bundle would retry forever → IPA bundle
+                guard writeMetadata(url: metadataURL, metadata: metadata) else { return nil }
                 NSLog("[OtaBundleResolver] Previous launch of V\(currentVersion) not verified → retry \(launchAttempts + 1)/\(maxLaunchAttempts)")
                 return currentBundle
             }
@@ -109,9 +118,10 @@ public class OtaBundleResolver: NSObject {
                 
                 // Remember the crashing version so JS never re-applies it
                 let failed = (metadata["failedVersions"] as? [Int] ?? []) + [currentVersion]
+                let old = metadata
                 metadata = performRollback(metadata: metadata, baseVersion: baseVersion, currentRollbackCount: rollbackCount, otaDir: otaDir)
                 metadata["failedVersions"] = failed
-                metadata["appVersion"] = otaAppVersion
+                for key in binaryKeys { metadata[key] = old[key] }
                 metadata["verifiedVersion"] = verifiedVersion
                 writeMetadata(url: metadataURL, metadata: metadata)
 
@@ -133,7 +143,7 @@ public class OtaBundleResolver: NSObject {
                 if newVersion != verifiedVersion {
                     metadata["lastLaunchSuccessful"] = false
                     metadata["launchAttempts"] = 1
-                    writeMetadata(url: metadataURL, metadata: metadata)
+                    guard writeMetadata(url: metadataURL, metadata: metadata) else { return nil }
                 }
 
                 NSLog("[OtaBundleResolver] Trying rollback bundle: \(rollbackBundle.path)")
@@ -159,7 +169,8 @@ public class OtaBundleResolver: NSObject {
             if currentVersion != verifiedVersion {
                 metadata["lastLaunchSuccessful"] = false
                 metadata["launchAttempts"] = 1
-                writeMetadata(url: metadataURL, metadata: metadata)
+                // Not marked pending: a crash would never roll back → IPA bundle
+                guard writeMetadata(url: metadataURL, metadata: metadata) else { return nil }
             }
 
             NSLog("[OtaBundleResolver] Loading OTA bundle: \(bundleURL.path)")
@@ -246,7 +257,7 @@ public class OtaBundleResolver: NSObject {
         ]
         // Keep: otherwise JS re-downloads a version that crashed on boot
         factory["failedVersions"] = old["failedVersions"]
-        factory["appVersion"] = old["appVersion"]
+        for key in binaryKeys { factory[key] = old[key] }
         writeMetadata(url: url, metadata: factory)
     }
 
@@ -286,12 +297,27 @@ public class OtaBundleResolver: NSObject {
         }
     }
 
-    private static func writeMetadata(url: URL, metadata: [String: Any]) {
+    @discardableResult
+    private static func writeMetadata(url: URL, metadata: [String: Any]) -> Bool {
         do {
             let data = try JSONSerialization.data(withJSONObject: metadata, options: .prettyPrinted)
             try data.write(to: url, options: .atomic)
+            return true
         } catch {
             NSLog("[OtaBundleResolver] Failed to write metadata: \(error.localizedDescription)")
+            return false
         }
+    }
+
+    /// CFBundleVersion, as getAppBuild reports it to JS
+    public static func appBuild() -> String {
+        return Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
+    }
+
+    /// Written into the .app by the build phase `setup` adds (tools/fingerprint.js)
+    public static func runtimeFingerprint() -> String {
+        guard let path = Bundle.main.path(forResource: "bspatch_fingerprint", ofType: "txt"),
+              let text = try? String(contentsOfFile: path, encoding: .utf8) else { return "" }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

@@ -68,14 +68,25 @@ const nativeHash = (dir) => {
   return hash.digest('hex').slice(0, 16);
 };
 
+/** A dependency's directory the way node resolves it: node_modules here or in a parent (hoisted monorepos) */
+const findPackage = (name) => {
+  for (let d = path.resolve(root); ; d = path.dirname(d)) {
+    const dir = path.join(d, 'node_modules', name);
+    if (fs.existsSync(path.join(dir, 'package.json'))) return dir;
+    if (d === path.dirname(d)) return null;
+  }
+};
+
 const inputs = [];
 for (const name of Object.keys(pkg.dependencies || {}).sort()) {
-  const dir = path.join(root, 'node_modules', name);
+  const dir = findPackage(name);
   let version;
   try {
     version = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).version;
   } catch {
-    continue; // not installed: can't be linked either
+    // Not installed: can't be linked either, but a fingerprint without it may not match the binary's
+    console.error(`react-native-bspatch: fingerprint skips ${name} (not found in node_modules)`);
+    continue;
   }
   if (name === 'react-native-bspatch') {
     // Its own native code, not its version: a JS-only release of this library ships by OTA
@@ -86,12 +97,13 @@ for (const name of Object.keys(pkg.dependencies || {}).sort()) {
 }
 
 if (platform === 'ios') {
-  // Skipped: COCOAPODS: (the CocoaPods version that wrote the file) and this library's own
-  // lines (its version and podspec checksum change with JS-only releases; nativeHash covers it)
+  // The pods and their versions only (`  - Name (1.2.3)` under PODS:): checksums and the
+  // CocoaPods version differ between machines, and this library's own line changes with
+  // JS-only releases (nativeHash covers it)
+  let pods = false;
   for (const line of read('ios/Podfile.lock').split('\n')) {
-    if (line.trim() && !line.startsWith('COCOAPODS:') && !line.includes('react-native-bspatch')) {
-      inputs.push(`pod ${line.trimEnd()}`);
-    }
+    if (/^\S/.test(line)) pods = line.startsWith('PODS:');
+    else if (pods && /^  - /.test(line) && !line.includes('react-native-bspatch')) inputs.push(`pod ${line.trimEnd()}`);
   }
 } else {
   for (const file of ['android/build.gradle', 'android/app/build.gradle', 'android/settings.gradle']) {

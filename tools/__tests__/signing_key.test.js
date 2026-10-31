@@ -96,4 +96,15 @@ r = run(root, { env: { OTA_PRIVATE_KEY: other } });
 assert.strictEqual(r.code, 1);
 assert.match(r.err, /App\.tsx/);
 
+// 8. One platform has the keys, the other lost them: --check reports it, patch re-embeds the same keys
+root = project();
+run(root);
+const keys = androidKey(root);
+fs.unlinkSync(path.join(root, 'android/app/src/main/res/values/bspatch_public_key.xml'));
+r = spawnSync('node', [SCRIPT, root, path.join(root, 'ota_registry.json'), '--check'], { env: { ...process.env, OTA_PRIVATE_KEY: '' } });
+assert.strictEqual(r.status, 2, r.stderr.toString());
+r = run(root);
+assert.strictEqual(r.code, 0, r.err);
+if (MAC) assert.strictEqual(androidKey(root), keys);
+
 console.log(`signing key: ok${MAC ? '' : ' (Info.plist checks skipped: no plutil)'}`);

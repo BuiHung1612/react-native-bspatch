@@ -33,6 +33,8 @@ extern "C" {
 @property (nonatomic, copy) NSString *destPath;
 /** Where a failed attempt leaves NSURLSession resume data for the next call */
 @property (nonatomic, copy) NSString *resumePath;
+/** Saved with the resume data: resuming it for another URL would finish the old file */
+@property (nonatomic, copy) NSString *url;
 @property (nonatomic, copy) RCTPromiseResolveBlock resolve;
 @property (nonatomic, copy) RCTPromiseRejectBlock reject;
 @property (nonatomic, copy) void (^onProgress)(int64_t received, int64_t total);
@@ -89,7 +91,7 @@ didFinishDownloadingToURL:(NSURL *)location
     NSError *e = error ?: self.error;
     NSData *resumeData = error.userInfo[NSURLSessionDownloadTaskResumeData];
     if (resumeData) {
-        [resumeData writeToFile:self.resumePath atomically:YES];
+        [@{@"url": self.url, @"data": resumeData} writeToFile:self.resumePath atomically:YES];
     }
     if (e) {
         self.reject(@"ERR_DOWNLOAD", e.localizedDescription, e);
@@ -134,14 +136,17 @@ static BOOL RNBsPatchGunzip(NSString *src, NSString *dst)
     char buffer[65536];
     int n;
     BOOL ok = YES;
+    long long total = 0;
     while ((n = gzread(in, buffer, sizeof(buffer))) > 0) {
         // gzdirect: zlib copies non-gzip input through as-is
         if (gzdirect(in) || fwrite(buffer, 1, n, out) != (size_t)n) {
             ok = NO;
             break;
         }
+        total += n;
     }
-    if (n < 0) ok = NO;
+    // An empty source never enters the loop: no output is a failure too, like Android
+    if (n < 0 || total == 0 || gzdirect(in)) ok = NO;
     if (gzclose_r(in) != Z_OK) ok = NO; // Z_BUF_ERROR: input ended mid-stream
     if (fclose(out) != 0) ok = NO;
     return ok;
@@ -360,18 +365,15 @@ RCT_EXPORT_METHOD(getAppVersion:(RCTPromiseResolveBlock)resolve
     return [keys isKindOfClass:[NSString class]] ? keys : @"";
 }
 
+// Shared with the resolver's Step 0 so JS stamps exactly what native compares
 - (NSString *)getAppBuild
 {
-    id build = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"];
-    return [build isKindOfClass:[NSString class]] ? build : @"";
+    return [OtaBundleResolver appBuild];
 }
 
-// Written into the .app by the build phase `setup` adds (tools/fingerprint.js)
 - (NSString *)getRuntimeFingerprint
 {
-    NSString *path = [[NSBundle mainBundle] pathForResource:@"bspatch_fingerprint" ofType:@"txt"];
-    NSString *fingerprint = path ? [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil] : nil;
-    return [fingerprint stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
+    return [OtaBundleResolver runtimeFingerprint];
 }
 
 - (void)getFreeDiskSpace:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject
@@ -437,6 +439,7 @@ RCT_EXPORT_METHOD(getAppVersion:(RCTPromiseResolveBlock)resolve
     RNBsPatchDownload *download = [RNBsPatchDownload new];
     download.destPath = destPath;
     download.resumePath = [destPath stringByAppendingString:@".resumedata"];
+    download.url = url;
     download.resolve = resolve;
     download.reject = reject;
     __weak RNBsPatch *weakSelf = self;
@@ -450,8 +453,10 @@ RCT_EXPORT_METHOD(getAppVersion:(RCTPromiseResolveBlock)resolve
     NSURLSession *session = [NSURLSession sessionWithConfiguration:config delegate:download delegateQueue:nil];
     // Single use: a failed attempt writes fresh resume data, invalid data fails this
     // attempt and the next one starts over
-    NSData *resumeData = [NSData dataWithContentsOfFile:download.resumePath];
+    NSDictionary *saved = [NSDictionary dictionaryWithContentsOfFile:download.resumePath];
     [NSFileManager.defaultManager removeItemAtPath:download.resumePath error:nil];
+    id resumeData = [saved[@"url"] isEqual:url] ? saved[@"data"] : nil;
+    if (![resumeData isKindOfClass:[NSData class]]) resumeData = nil;
     NSURLSessionDownloadTask *task = resumeData ? [session downloadTaskWithResumeData:resumeData] : nil;
     [task ?: [session downloadTaskWithRequest:request] resume];
 }
@@ -501,7 +506,8 @@ RCT_EXPORT_METHOD(getAppVersion:(RCTPromiseResolveBlock)resolve
         // rename() replaces a file atomically; a non-empty directory must go first
         if (rename(from.fileSystemRepresentation, to.fileSystemRepresentation) == 0) return YES;
         NSFileManager *fm = NSFileManager.defaultManager;
-        [fm removeItemAtPath:to error:nil];
+        // A missing source fails below without costing the destination
+        if ([fm fileExistsAtPath:from]) [fm removeItemAtPath:to error:nil];
         return [fm moveItemAtPath:from toPath:to error:error];
     });
 }

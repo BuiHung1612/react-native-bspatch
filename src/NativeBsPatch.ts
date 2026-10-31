@@ -71,8 +71,8 @@ export interface Spec extends TurboModule {
   getAppBuild(): string;
 
   /**
-   * Native runtime fingerprint stamped into this binary at build time (Info.plist
-   * `BsPatchRuntimeFingerprint` / Android resValue `bspatch_runtime_fingerprint`);
+   * Native runtime fingerprint stamped into this binary at build time (iOS: main-bundle
+   * resource `bspatch_fingerprint.txt` / Android resValue `bspatch_runtime_fingerprint`);
    * '' when the build hook didn't run. An OTA only installs on a matching binary.
    */
   getRuntimeFingerprint(): string;

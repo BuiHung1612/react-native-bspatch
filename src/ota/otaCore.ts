@@ -219,9 +219,15 @@ export const fetchOtaManifest = (config: OtaConfig): Promise<OtaPatch[]> =>
 
 const ASSET_STORE_DIR = `${OTA_DIR}/assets`;
 
-/** Relative path inside the version dir: no absolute paths, no `..` segments. */
+/**
+ * Relative path inside the version dir: no absolute paths, `..` segments, backslashes or
+ * control characters. Anything else (spaces, `@1,5x`, non-ASCII names) is a valid asset path.
+ */
 const isSafeRelativePath = (p: string): boolean =>
-    /^[A-Za-z0-9_\-.@/]+$/.test(p) && !p.startsWith('/') && !p.split('/').includes('..');
+    p.length > 0 &&
+    !/[\\\x00-\x1f\x7f]/.test(p) &&
+    !p.startsWith('/') &&
+    !p.split('/').includes('..');
 
 /**
  * Downloads this version's assets and places each one next to the bundle, at the
@@ -259,14 +265,19 @@ const downloadAndSyncAssets = async (
         }
         const manifest = JSON.parse(await fs.readFile(manifestPath));
         await fs.removePath(manifestPath).catch(() => {});
-        // Hash/ext/path become file names: reject anything unexpected
-        assets = (manifest.assets || []).filter(
+        assets = manifest.assets || [];
+        // Hash/ext/path become file names: reject anything unexpected. Fatal, not
+        // skipped: the bundle would go live with that image missing
+        const bad = assets.find(
             (a: any) =>
-                /^[a-f0-9]{64}$/i.test(a.hash) &&
-                /^[a-z0-9]+$/i.test(a.ext) &&
-                typeof a.originalPath === 'string' &&
-                isSafeRelativePath(a.originalPath),
+                !/^[a-f0-9]{64}$/i.test(a.hash) ||
+                !/^[a-z0-9]+$/i.test(a.ext) ||
+                typeof a.originalPath !== 'string' ||
+                !isSafeRelativePath(a.originalPath),
         );
+        if (bad) {
+            throw new Error(`invalid entry ${JSON.stringify(bad)}`);
+        }
     } catch (e) {
         // Fatal: activating the bundle without its assets leaves images blank
         throw new Error(`Failed to fetch asset manifest: ${(e as Error).message}`);
@@ -293,22 +304,29 @@ const downloadAndSyncAssets = async (
     let downloaded = 0;
     let failed = 0;
     let index = 0;
+    // Same content at two paths: one download per store file, never two writers on its .part
+    const fetches = new Map<string, Promise<void>>();
+    const fetchToStore = async (asset: OtaAsset, storePath: string): Promise<void> => {
+        if (await fs.exists(storePath)) return;
+        const url = await getStorage(config).getAssetUrl(asset.hash, asset.ext, config);
+        if (!url) throw new Error('no URL');
+        await downloadWithRetry(url, storePath, config, () => {});
+        if (!(await verifyHash(storePath, asset.hash))) {
+            await fs.removePath(storePath).catch(() => {});
+            throw new Error('hash mismatch');
+        }
+        downloaded++;
+    };
 
     const worker = async (): Promise<void> => {
         while (index < assets.length) {
             const asset = assets[index++];
             const storePath = getLocalAssetPath(asset.hash, asset.ext);
             try {
-                if (!(await fs.exists(storePath))) {
-                    const url = await getStorage(config).getAssetUrl(asset.hash, asset.ext, config);
-                    if (!url) throw new Error('no URL');
-                    await downloadWithRetry(url, storePath, config, () => {});
-                    if (!(await verifyHash(storePath, asset.hash))) {
-                        await fs.removePath(storePath).catch(() => {});
-                        throw new Error('hash mismatch');
-                    }
-                    downloaded++;
+                if (!fetches.has(storePath)) {
+                    fetches.set(storePath, fetchToStore(asset, storePath));
                 }
+                await fetches.get(storePath);
                 const dest = `${versionDir}/${asset.originalPath}`;
                 await ensureDir(dest.slice(0, dest.lastIndexOf('/')));
                 await fs.copyFile(storePath, dest);

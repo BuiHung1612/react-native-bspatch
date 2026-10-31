@@ -104,6 +104,10 @@ export type OtaMetadata = {
     lastLaunchSuccessful: boolean;
     /** Native app version the OTA bundles were built for; native resolver drops OTA state when it changes */
     appVersion?: string;
+    /** Runtime fingerprint of the binary the OTA bundles were installed on; native drops OTA state when it changes ('' = unknown) */
+    runtimeFingerprint?: string;
+    /** Build number (versionCode / CFBundleVersion) the OTA bundles were installed on; native drops OTA state when it changes ('' = unknown) */
+    appBuild?: string;
     /** Versions that crashed on boot and were rolled back; never re-applied */
     failedVersions?: number[];
     /** Last version that launched and rendered successfully; the native resolver never rolls it back */
