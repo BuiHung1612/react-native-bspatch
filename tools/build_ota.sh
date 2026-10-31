@@ -614,23 +614,18 @@ build_platform() {
 
   # Determine source bundle
   local BUILD_LOG="$WORKSPACE/bundle.log"
-  if [ "$PLATFORM" == "android" ]; then
-    step "Bundle JS" BUILD
-    # Gradle's config noise goes to a log; shown only on failure
-    if ! run_logged "$BUILD_LOG" bash -c 'cd "$1/android" && ./gradlew ":app:createBundle${2}ReleaseJsAndAssets" -Pkotlin.incremental=false --quiet' _ "$ROOT" "$FLAVOR_CAP"; then
-      step_fail "Gradle bundle failed"; tail -n 40 "$BUILD_LOG"; echo "  full log: $BUILD_LOG"; exit 1
-    fi
-    BUNDLE_SOURCE="$ROOT/android/app/build/generated/assets/react/${FLAVOR_LOWER}Release/index.android.bundle"
-  else
-    step "Bundle JS" BUILD
-    # Fresh dir: leftovers of deleted/renamed assets would land in the manifest
-    rm -rf "$OUTPUT/assets"
-    if ! run_logged "$BUILD_LOG" npx react-native bundle --platform ios --dev false --entry-file index.js \
-      --bundle-output "$WORKSPACE/source.bundle" --assets-dest "$OUTPUT/assets"; then
-      step_fail "bundle failed"; tail -n 40 "$BUILD_LOG"; echo "  full log: $BUILD_LOG"; exit 1
-    fi
-    BUNDLE_SOURCE="$WORKSPACE/source.bundle"
+  step "Bundle JS" BUILD
+  # Metro directly, not Gradle's createBundle task: that one passes --reset-cache (a cold
+  # transform of every module, ~30s more) and configures the whole Gradle project first.
+  # Same args as RN's release build otherwise: --minify false, hermesc optimizes below.
+  # ponytail: assumes the default react {} entry file / Metro config; custom ones need Gradle's task
+  # Fresh dir: leftovers of deleted/renamed assets would land in the manifest
+  rm -rf "$OUTPUT/assets"
+  if ! run_logged "$BUILD_LOG" npx react-native bundle --platform "$PLATFORM" --dev false --minify false --entry-file index.js \
+    --bundle-output "$WORKSPACE/source.bundle" --assets-dest "$OUTPUT/assets"; then
+    step_fail "bundle failed"; tail -n 40 "$BUILD_LOG"; echo "  full log: $BUILD_LOG"; exit 1
   fi
+  BUNDLE_SOURCE="$WORKSPACE/source.bundle"
   step_done "$(human_size "$(file_size "$BUNDLE_SOURCE")")"
 
   # Ensure Hermes bytecode format (for both iOS and Android OTA bundles)
@@ -648,7 +643,8 @@ build_platform() {
       step_fail "hermesc not found"; exit 1
     fi
     # -O matches what Xcode/Gradle use for release; -w: undeclared-global warnings are expected noise
-    if ! run_logged "$WORKSPACE/hermes.log" "$HERMESC_PATH" -emit-binary -O -w -out "$WORKSPACE/source.hbc" "$BUNDLE_SOURCE"; then
+    # -output-source-map keeps debug info out of the bytecode (~20% smaller), like Gradle's build
+    if ! run_logged "$WORKSPACE/hermes.log" "$HERMESC_PATH" -emit-binary -O -w -output-source-map -out "$WORKSPACE/source.hbc" "$BUNDLE_SOURCE"; then
       step_fail "hermesc failed"; tail -n 40 "$WORKSPACE/hermes.log"; exit 1
     fi
     mv "$WORKSPACE/source.hbc" "$BUNDLE_SOURCE"
@@ -658,8 +654,7 @@ build_platform() {
   step_done "$(human_size "$(file_size "$NEW_BUNDLE_PATH")")"
 
   # ── Assets ──
-  local ASSETS_SRC_DIR="$ROOT/android/app/build/generated/res/react/${FLAVOR_LOWER}Release"
-  if [ "$PLATFORM" == "ios" ]; then ASSETS_SRC_DIR="$OUTPUT/assets"; fi
+  local ASSETS_SRC_DIR="$OUTPUT/assets"
 
   local ASSET_JSON_LIST="["
   local FIRST=true
