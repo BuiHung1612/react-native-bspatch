@@ -35,6 +35,36 @@ const OtaContext = createContext<OtaState | undefined>(undefined);
 
 const DEFAULT_MIN_CHECK_INTERVAL_MS = 10 * 60 * 1000;
 
+// Screens holding a useOtaReloadBlock (e.g. checkout): a mandatory reload waits for them
+let reloadBlocks = 0;
+let deferredReload = false;
+function reloadMandatory() {
+  if (reloadBlocks > 0) {
+    deferredReload = true;
+    return;
+  }
+  NativeBsPatch.reloadBundle();
+}
+
+/**
+ * While mounted (and `blocked`), a mandatory update does not reload the app; it reloads
+ * when the last block is released. Use it on screens a reload must not interrupt (payment).
+ */
+export function useOtaReloadBlock(blocked = true) {
+  useEffect(() => {
+    if (!blocked) return;
+    reloadBlocks++;
+    return () => {
+      reloadBlocks--;
+      // In the background the AppState effect reloads on the next foreground instead
+      if (reloadBlocks === 0 && deferredReload && AppState.currentState === 'active') {
+        deferredReload = false;
+        NativeBsPatch.reloadBundle();
+      }
+    };
+  }, [blocked]);
+}
+
 /** Bytecode version the running Hermes reads (undefined off Hermes) */
 const hermesBytecodeVersion = (): number | undefined => {
   const v = (globalThis as any).HermesInternal?.getRuntimeProperties?.()?.['Bytecode Version'];
@@ -292,7 +322,7 @@ export function OtaProvider({
                 setIsMandatory(true);
                 // Only in the foreground: a reload in the background is rolled back (see the
                 // AppState effect); the effect reloads once the app comes back
-                if (AppState.currentState === 'active') NativeBsPatch.reloadBundle();
+                if (AppState.currentState === 'active') reloadMandatory();
               }
             }
           },
@@ -487,7 +517,7 @@ export function OtaProvider({
           bootstrapDone.current
         ) {
           if (isMandatoryRef.current) {
-            NativeBsPatch.reloadBundle();
+            reloadMandatory();
             return;
           }
           const mode = config.updateMode ?? OtaUpdateMode.MANUAL;

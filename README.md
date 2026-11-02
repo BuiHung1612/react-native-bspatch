@@ -356,6 +356,13 @@ const {
 } = useOta();
 ```
 
+### `useOtaReloadBlock(blocked?)` — hold off a mandatory reload
+
+```tsx
+// Checkout: a mandatory update waits until this screen unmounts (or blocked turns false)
+useOtaReloadBlock(isPaying);
+```
+
 ### `applyPatch(oldPath, newPath, patchPath)` — Low-level
 
 Applies a bsdiff patch directly. Used internally; available for advanced use cases.
