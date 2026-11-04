@@ -40,7 +40,7 @@ public class OtaBundleResolver: NSObject {
     private static let maxLaunchAttempts = 3
     private static let maxRollbackIterations = 10 // Safety limit to prevent infinite loops
     /// The binary metadata was written against (Step 0), kept across rollback/factory reset
-    private static let binaryKeys = ["appVersion", "runtimeFingerprint", "appBuild"]
+    private static let binaryKeys = ["appVersion", "runtimeFingerprint", "appBuild", "flavor"]
 
     /// Version this process booted (set by resolve), so markAsHealthy verifies only that one
     private static var launchedVersion: Int?
@@ -85,7 +85,10 @@ public class OtaBundleResolver: NSObject {
             let otaBuild = metadata["appBuild"] as? String ?? ""
             let otaFingerprint = metadata["runtimeFingerprint"] as? String ?? ""
             let installedFingerprint = runtimeFingerprint()
-            if (!otaAppVersion.isEmpty && otaAppVersion != installedAppVersion)
+            // No appBuild key at all = written before 5.0 (every 5.x writer stamps it): those
+            // bundles came from an older binary, possibly another flavor with the same appVersion
+            if metadata["appBuild"] == nil
+                || (!otaAppVersion.isEmpty && otaAppVersion != installedAppVersion)
                 || (!otaBuild.isEmpty && otaBuild != appBuild())
                 || (!otaFingerprint.isEmpty && !installedFingerprint.isEmpty && otaFingerprint != installedFingerprint) {
                 NSLog("[OtaBundleResolver] Native app \(otaAppVersion) (\(otaBuild)) → \(installedAppVersion) (\(appBuild())): discarding OTA state")

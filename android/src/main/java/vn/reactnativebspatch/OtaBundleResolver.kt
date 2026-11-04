@@ -41,7 +41,7 @@ object OtaBundleResolver {
     /** Unverified launches allowed before rollback: a kill before first render is indistinguishable from a crash */
     private const val MAX_LAUNCH_ATTEMPTS = 3
     /** The binary metadata was written against (Step 0), kept across rollback/factory reset */
-    private val BINARY_KEYS = listOf("appVersion", "runtimeFingerprint", "appBuild")
+    private val BINARY_KEYS = listOf("appVersion", "runtimeFingerprint", "appBuild", "flavor")
 
     /** Version this process booted (set by resolve), so markAsHealthy verifies only that one */
     @Volatile private var launchedVersion: Int? = null
@@ -81,7 +81,10 @@ object OtaBundleResolver {
             val otaBuild = metadata.optString("appBuild", "")
             val otaFingerprint = metadata.optString("runtimeFingerprint", "")
             val installedFingerprint = runtimeFingerprint(context)
-            if ((otaAppVersion.isNotEmpty() && otaAppVersion != installedAppVersion) ||
+            // No appBuild key at all = written before 5.0 (every 5.x writer stamps it): those
+            // bundles came from an older binary, possibly another flavor with the same versionName
+            if (!metadata.has("appBuild") ||
+                (otaAppVersion.isNotEmpty() && otaAppVersion != installedAppVersion) ||
                 (otaBuild.isNotEmpty() && otaBuild != appBuild(context)) ||
                 (otaFingerprint.isNotEmpty() && installedFingerprint.isNotEmpty() && otaFingerprint != installedFingerprint)) {
                 Log.i(TAG, "Native app $otaAppVersion ($otaBuild) → $installedAppVersion (${appBuild(context)}): discarding OTA state")
@@ -285,7 +288,8 @@ object OtaBundleResolver {
     }
 
     private fun copyBinaryKeys(from: JSONObject, to: JSONObject) {
-        for (key in BINARY_KEYS) from.optString(key, "").takeIf { it.isNotEmpty() }?.let { to.put(key, it) }
+        // Keep "" too: Step 0 reads a missing appBuild key as pre-5.0 metadata
+        for (key in BINARY_KEYS) if (from.has(key)) to.put(key, from.get(key))
     }
 
     /** versionCode, as getAppBuild reports it to JS */

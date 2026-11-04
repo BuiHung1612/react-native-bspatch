@@ -21,6 +21,7 @@ import { ineligibleReason, type EligibilityContext } from './eligibility';
 import { getInstallId } from './installId';
 import { applyOtaPatchInternal, fetchOtaManifest, selectUpdate, validateOtaConfig } from './otaCore';
 import { createOtaLogger, OtaEvent, type OtaLogEntry } from './otaLogger';
+import { normalizeChannel } from './storage/R2Storage';
 import { DOCUMENT_DIR, loadMetadata, markHealthy, nativeString, OTA_DIR } from './otaMetadata';
 import {
   OtaConfig,
@@ -460,6 +461,15 @@ export function OtaProvider({
       }).catch(() => {});
 
       const metadata = await loadMetadata(config.baseAppVersion);
+      // Staging and production builds share a bundle id and OTA numbering is per channel: a
+      // TestFlight/store swap with the same version + build keeps the other flavor's bundles
+      const channel = config.customServer?.channel;
+      if (metadata.flavor && channel && metadata.flavor !== normalizeChannel(channel)) {
+        console.warn(`[OtaProvider] OTA state from flavor ${metadata.flavor} on a ${channel} build → binary bundle`);
+        await NativeBsPatch.moveFile(OTA_DIR, `${DOCUMENT_DIR}/ota_trash_${Date.now()}`);
+        NativeBsPatch.reloadBundle();
+        return;
+      }
       runningVersionRef.current = metadata.currentVersion;
 
       // Display current version immediately

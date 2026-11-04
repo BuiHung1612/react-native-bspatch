@@ -108,6 +108,8 @@ export type OtaMetadata = {
     runtimeFingerprint?: string;
     /** Build number (versionCode / CFBundleVersion) the OTA bundles were installed on; native drops OTA state when it changes ('' = unknown) */
     appBuild?: string;
+    /** Normalized channel that installed currentVersion; bootstrap drops OTA state when it differs from config's */
+    flavor?: string;
     /** Versions that crashed on boot and were rolled back; never re-applied */
     failedVersions?: number[];
     /** Last version that launched and rendered successfully; the native resolver never rolls it back */

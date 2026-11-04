@@ -558,9 +558,11 @@ const runUpdatePipeline = async (
 
         // Native version, not config.appVersion: the native resolver compares against it on boot
         const nativeAppVersion = await NativeBsPatch.getAppVersion().catch(() => config.appVersion);
-        await updateMetadata(config.baseAppVersion, metadata =>
-            registerNewVersion(metadata, patch.toVersion, nativeAppVersion),
-        );
+        await updateMetadata(config.baseAppVersion, metadata => ({
+            ...registerNewVersion(metadata, patch.toVersion, nativeAppVersion),
+            // Flavors share a bundle id: bootstrap drops OTA state another flavor's build installed
+            flavor: normalizeChannel(config.customServer!.channel),
+        }));
 
         const totalMs = Date.now() - totalStart;
         log.emit(OtaEvent.PATCH_SUCCESS, {
